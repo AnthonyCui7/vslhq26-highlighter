@@ -36,15 +36,16 @@ from .defaults import (
     DEFAULT_LONGFORM_MERGE_GAP_SECONDS,
     DEFAULT_MAX_CHUNKS,
     DEFAULT_MAX_CLIP_SECONDS,
-    DEFAULT_OPENROUTER_MODEL,
     DEFAULT_OUTPUT_ROOT,
+    DEFAULT_REFRAME_FRAME_INTERVAL_SECONDS,
     DEFAULT_STREAM_URL,
     DEFAULT_STREAMLINK_QUALITY,
     DEFAULT_SUPABASE_CLIPS_BUCKET,
     DEFAULT_TARGET_LENGTH_MINUTES,
 )
-from .deepgram import transcribe_audio_file
+from .transcribe import transcribe_audio_file, transcription_backend_label
 from .llm import detect_clip_candidates
+from .providers import audio_providers, chain_label
 from .records import ProjectRecords
 from .reframe import plan_crop_track, render_vertical
 from .render import (
@@ -53,7 +54,7 @@ from .render import (
     render_clip_from_segments,
     trim_clip,
 )
-from .research import research_content_context
+from .research import research_backend_label, research_content_context
 from .scoring import ClipScoringCoordinator
 from .shots import shot_detector_from_env, snap_window
 from .stitch import stitch_clips
@@ -79,7 +80,6 @@ def main() -> None:
     streamlink_quality = args.streamlink_quality
     deepgram_model = args.deepgram_model
     llm_enabled = not args.no_llm and not _truthy_env("NO_LLM")
-    llm_model = DEFAULT_OPENROUTER_MODEL
     llm_reasoning_effort = args.llm_reasoning_effort
     llm_marker_seconds = args.llm_marker_seconds
     llm_concurrency = args.llm_concurrency
@@ -99,6 +99,7 @@ def main() -> None:
         and not args.no_reframe
         and not _truthy_env("NO_REFRAME")
     )
+    reframe_interval = args.reframe_interval
     clips_bucket = os.environ.get("SUPABASE_CLIPS_BUCKET", DEFAULT_SUPABASE_CLIPS_BUCKET)
     output_root = Path(args.output_root or os.environ.get("OUTPUT_ROOT", DEFAULT_OUTPUT_ROOT))
     min_clip_score = args.min_clip_score  # None -> resolved from the project row below
@@ -126,6 +127,8 @@ def main() -> None:
         raise RuntimeError("CHUNK_SECONDS must be more than twice LLM_CONTEXT_SECONDS")
     if args.source_type not in ("auto", "livestream", "video"):
         raise RuntimeError("SOURCE_TYPE must be one of: auto, livestream, video")
+    if reframe_interval is not None and reframe_interval < 0:
+        raise RuntimeError("REFRAME_INTERVAL must be 0 or greater")
     if min_clip_score is not None and not 0 <= min_clip_score <= 1:
         raise RuntimeError("MIN_CLIP_SCORE must be between 0 and 1")
     if args.project_id and local_only:
@@ -186,6 +189,18 @@ def main() -> None:
             if source_minutes is not None:
                 print(f"Source runs ~{source_minutes:.0f} min; calibrating selectivity to it.")
 
+        # Resolve the scoring model chain up front so a missing configuration
+        # fails before capture and the run records what actually scores it.
+        llm_providers = (
+            audio_providers(
+                title="highlighter pipeline",
+                openrouter_reasoning_effort=llm_reasoning_effort,
+            )
+            if llm_enabled
+            else None
+        )
+        scoring_backend = chain_label(llm_providers) if llm_providers else None
+
         ingest_settings = {
             "pipeline": pipeline_mode,
             "user_instructions": user_instructions,
@@ -193,6 +208,7 @@ def main() -> None:
             "chunk_seconds": chunk_seconds,
             "max_chunks": max_chunks,
             "streamlink_quality": streamlink_quality,
+            "transcription_backend": transcription_backend_label(),
             "deepgram_model": deepgram_model,
             "min_clip_score": min_clip_score,
             "source_minutes": source_minutes,
@@ -203,6 +219,7 @@ def main() -> None:
             "reframe": {
                 "enabled": reframe_enabled,
                 "style": "blurpad-square" if reframe_enabled else None,
+                "frame_interval_seconds": reframe_interval if reframe_enabled else None,
             },
             "clip_stitching": {
                 "merge_gap_seconds": merge_gap_seconds,
@@ -210,8 +227,8 @@ def main() -> None:
             },
             "llm": {
                 "enabled": llm_enabled,
-                "backend": "openrouter-gemini-audio",
-                "model": llm_model,
+                "backend": scoring_backend,
+                "model": llm_providers[0].model if llm_providers else None,
                 "reasoning_effort": llm_reasoning_effort,
                 "marker_seconds": llm_marker_seconds,
                 "concurrency": llm_concurrency,
@@ -219,7 +236,7 @@ def main() -> None:
             },
             "research": {
                 "enabled": research_enabled,
-                "backend": "openrouter-web-search" if research_enabled else None,
+                "backend": research_backend_label() if research_enabled else None,
             },
             "clips": {
                 "bucket": clips_bucket if db is not None or not local_only else None,
@@ -357,7 +374,7 @@ def main() -> None:
 
         content_research_context = None
         if research_enabled:
-            print("Researching content context (single web-grounded agent)")
+            print(f"Researching content context ({research_backend_label()})")
             try:
                 content_research_context = research_content_context(
                     source_context=source_context,
@@ -473,6 +490,7 @@ def main() -> None:
                 first_segment_start_seconds=needed[0] * chunk_seconds,
                 rendered_log=rendered_log,
                 reframe_enabled=reframe_enabled,
+                reframe_interval=reframe_interval,
                 scene_cuts=_cuts_near_window(
                     chunk_cuts, chunk_seconds, decision["start_seconds"], decision["end_seconds"]
                 )
@@ -530,8 +548,6 @@ def main() -> None:
                 except OSError as exc:
                     print(f"Could not delete local segment {path}: {exc}")
 
-        scoring_backend = f"OpenRouter BYOK Gemini audio ({llm_model})"
-
         def _score_chunk(
             chunk: dict,
             context_before: list[dict],
@@ -563,7 +579,6 @@ def main() -> None:
                 visible_end_seconds=visible_end,
                 context_words_before=context_before,
                 context_words_after=context_after,
-                model=llm_model,
                 reasoning_effort=llm_reasoning_effort,
                 marker_seconds=llm_marker_seconds,
                 pipeline_mode=pipeline_mode,
@@ -650,7 +665,7 @@ def main() -> None:
             f"Capturing {source_url} ({platform} {source_type}, via {downloader}) in {chunk_seconds}s chunks"
             f"{f' ({max_chunks} chunk max)' if max_chunks > 0 else ''}"
             f" for a {pipeline_mode}-form edit"
-            f"{f'; scoring clips via OpenRouter BYOK Gemini audio ({llm_model})' if llm_enabled else '; LLM scoring disabled'}"
+            f"{f'; scoring clips via {scoring_backend}' if llm_enabled else '; LLM scoring disabled'}"
             f"{f'; archiving source to s3://{storage.bucket}/{archive_prefix}' if storage else ''}."
         )
     except Exception as exc:
@@ -1121,8 +1136,8 @@ def _store_chunk(
     words = [_with_absolute_times(word, start_seconds) for word in transcript["words"]]
     metadata = {
         "audio_path": os.path.relpath(audio_path),
-        "deepgram_request_id": transcript["metadata"].get("request_id"),
-        "deepgram": transcript["metadata"],
+        "transcription_backend": transcript.get("backend"),
+        "transcription": transcript["metadata"],
     }
     if scene_cuts is not None:
         metadata["scene_cuts"] = scene_cuts
@@ -1211,6 +1226,7 @@ def _render_and_store_clip(
     first_segment_start_seconds: float,
     rendered_log: list[dict],
     reframe_enabled: bool = False,
+    reframe_interval: float | None = None,
     scene_cuts: list[float] | None = None,
     research_context: dict | None = None,
 ) -> None:
@@ -1243,6 +1259,7 @@ def _render_and_store_clip(
                 decision=decision,
                 scene_cuts=scene_cuts,
                 research_context=research_context,
+                frame_interval_seconds=reframe_interval,
             )
             if reframed is not None:
                 vertical_path, crop_track = reframed
@@ -1313,6 +1330,7 @@ def _reframe_clip(
     decision: dict,
     scene_cuts: list[float] | None,
     research_context: dict | None,
+    frame_interval_seconds: float | None = None,
 ) -> tuple[Path, dict] | None:
     """Best-effort blur-pad vertical next to the rendered clip. Returns
     (vertical_path, crop_track) or None — a reframe failure keeps the 16:9."""
@@ -1330,6 +1348,11 @@ def _reframe_clip(
             title=decision["title"],
             description=decision["description"],
             research_context=research_context,
+            frame_interval_seconds=(
+                frame_interval_seconds
+                if frame_interval_seconds is not None
+                else DEFAULT_REFRAME_FRAME_INTERVAL_SECONDS
+            ),
         )
         vertical_path = clip_path.with_name(f"{clip_path.stem}_vertical.mp4")
         render_vertical(
@@ -1559,6 +1582,13 @@ def _parse_args() -> argparse.Namespace:
         default=False,
         help="Short mode: skip the auto-reframe pass that renders a blur-pad 9:16 "
         "vertical next to each clip (also via NO_REFRAME=1).",
+    )
+    parser.add_argument(
+        "--reframe-interval",
+        type=float,
+        default=float_env("REFRAME_INTERVAL", DEFAULT_REFRAME_FRAME_INTERVAL_SECONDS),
+        help="Seconds between the frames sampled for the auto-reframe framing call; "
+        "0 samples only the opener and scene cuts (also via REFRAME_INTERVAL).",
     )
     parser.add_argument(
         "--llm-reasoning-effort",

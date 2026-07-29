@@ -27,18 +27,16 @@ from typing import Any
 from .config import load_env
 from .defaults import (
     DEFAULT_LLM_REASONING_EFFORT,
-    DEFAULT_OPENROUTER_MODEL,
     DEFAULT_OUTPUT_ROOT,
     DEFAULT_SUPABASE_CLIPS_BUCKET,
     DEFAULT_TARGET_LENGTH_MINUTES,
 )
 from .llm import (
-    OPENROUTER_BASE_URL,
-    OPENROUTER_VERTEX_PROVIDER,
     _encode_audio_context_mp3,
     _timestamp_markers,
     detect_clip_candidates,
 )
+from .providers import Provider, audio_providers
 from .records import ProjectRecords
 from .render import extract_thumbnail, render_clip_from_video_url, trim_clip
 from .research import research_content_context
@@ -309,38 +307,56 @@ def _run_agent(
     state: dict[str, Any],
     records: ProjectRecords,
     request: str,
-    model: str = DEFAULT_OPENROUTER_MODEL,
     reasoning_effort: str = DEFAULT_LLM_REASONING_EFFORT,
 ) -> tuple[dict[str, Any], list[str]]:
-    """Run the tool loop until apply_edit lands. Returns (edit, tools_used);
-    raises when the agent cannot produce a valid edit."""
-    try:
-        from openai import OpenAI
-    except ImportError as exc:
-        raise RuntimeError("The revision loop requires the 'openai' package") from exc
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENROUTER_API_KEY is required for the revision loop")
+    """Run the tool loop until apply_edit lands, trying each provider in the
+    audio chain with a fresh loop (histories do not survive a provider swap).
+    Returns (edit, tools_used); raises when no provider produced a valid edit."""
+    providers = audio_providers(
+        title="highlighter revise",
+        openrouter_reasoning_effort=reasoning_effort or DEFAULT_LLM_REASONING_EFFORT,
+    )
+    last_error: Exception = RuntimeError("No revision provider is configured")
+    for index, provider in enumerate(providers):
+        try:
+            return _run_agent_attempt(
+                provider=provider, state=state, records=records, request=request
+            )
+        except Exception as exc:
+            last_error = exc
+            if index + 1 < len(providers):
+                print(
+                    f"{provider.label} revision attempt failed; retrying with "
+                    f"{providers[index + 1].label}: {exc}"
+                )
+    raise last_error
 
+
+def _run_agent_attempt(
+    *,
+    provider: Provider,
+    state: dict[str, Any],
+    records: ProjectRecords,
+    request: str,
+) -> tuple[dict[str, Any], list[str]]:
     messages: list[Any] = [
         {"role": "system", "content": REVISE_SYSTEM_PROMPT},
         {"role": "user", "content": _opening_message(state, request)},
     ]
+    if provider.name == "azure":
+        # The gpt-audio deployments reject any request whose input contains no
+        # audio at all, and the opening turns have none until listen_audio
+        # runs; seed the conversation with the source's first minute so every
+        # turn carries audio.
+        orientation = _orientation_audio_parts(state)
+        if orientation:
+            messages.append({"role": "user", "content": orientation})
     tools_used: list[str] = []
 
-    with OpenAI(
-        base_url=OPENROUTER_BASE_URL,
-        api_key=api_key,
-        timeout=300.0,
-        default_headers={
-            "HTTP-Referer": "http://localhost",
-            "X-OpenRouter-Title": "highlighter revise",
-        },
-    ) as client:
+    with provider.client(timeout=300.0) as client:
         for turn in range(MAX_AGENT_TURNS):
             forcing = turn >= MAX_AGENT_TURNS - 2
             response = client.chat.completions.create(
-                model=model,
                 messages=messages,
                 tools=TOOLS,
                 # The last turns force the commit; a named tool_choice is
@@ -350,14 +366,7 @@ def _run_agent(
                     if forcing
                     else "auto"
                 ),
-                temperature=0,
-                extra_body={
-                    "provider": {
-                        "order": [OPENROUTER_VERTEX_PROVIDER],
-                        "allow_fallbacks": False,
-                    },
-                    "reasoning": {"effort": reasoning_effort or DEFAULT_LLM_REASONING_EFFORT},
-                },
+                **provider.request_kwargs(),
             )
             if not response.choices:
                 raise RuntimeError("Revision agent response did not include choices")
@@ -418,6 +427,50 @@ def _run_agent(
     raise RuntimeError(
         f"The revision agent did not produce a valid edit within {MAX_AGENT_TURNS} turns"
     )
+
+
+def _orientation_audio_parts(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """The source's opening minute as input_audio content parts; [] when the
+    chunk audio is missing (the Azure attempt then fails over to the next
+    provider on its first request)."""
+    try:
+        chunk = state["chunks"][0]
+        audio_path = _resolve_media_path(
+            (chunk.get("metadata") or {}).get("audio_path"), state["project_dir"], "audio"
+        )
+        if not audio_path:
+            return []
+        end = min(chunk["start_seconds"] + 60.0, chunk["end_seconds"])
+        mp3 = _encode_audio_context_mp3(
+            audio_context=[
+                {
+                    "path": audio_path,
+                    "start_seconds": chunk["start_seconds"],
+                    "end_seconds": chunk["end_seconds"],
+                }
+            ],
+            visible_start_seconds=chunk["start_seconds"],
+            visible_end_seconds=end,
+        )
+        return [
+            {
+                "type": "text",
+                "text": (
+                    f"Source audio {chunk['start_seconds']:.0f}s-{end:.0f}s for "
+                    "orientation; use listen_audio for the windows you need."
+                ),
+            },
+            {
+                "type": "input_audio",
+                "input_audio": {
+                    "data": base64.b64encode(mp3).decode("ascii"),
+                    "format": "mp3",
+                },
+            },
+        ]
+    except Exception as exc:
+        print(f"Orientation audio unavailable (continuing): {exc}")
+        return []
 
 
 def _opening_message(state: dict[str, Any], request: str) -> str:

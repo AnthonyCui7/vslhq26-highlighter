@@ -1,6 +1,5 @@
 import base64
 import json
-import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -9,13 +8,16 @@ from typing import Any
 from .defaults import (
     DEFAULT_LLM_MARKER_SECONDS,
     DEFAULT_LLM_REASONING_EFFORT,
-    DEFAULT_OPENROUTER_MODEL,
     DEFAULT_TARGET_LENGTH_MINUTES,
 )
+from .providers import (
+    OPENROUTER_BASE_URL,
+    OPENROUTER_VERTEX_PROVIDER,
+    Provider,
+    audio_providers,
+    run_with_fallback,
+)
 
-
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_VERTEX_PROVIDER = "google-vertex"
 CLIPPER_AUDIO_BITRATE = "32k"
 CLIPPER_AUDIO_SAMPLE_RATE = "16000"
 
@@ -298,7 +300,6 @@ def detect_clip_candidates(
     visible_end_seconds: int | None = None,
     context_words_before: list[dict[str, Any]] | None = None,
     context_words_after: list[dict[str, Any]] | None = None,
-    model: str = DEFAULT_OPENROUTER_MODEL,
     reasoning_effort: str = DEFAULT_LLM_REASONING_EFFORT,
     marker_seconds: int = DEFAULT_LLM_MARKER_SECONDS,
     pipeline_mode: str = "short",
@@ -322,27 +323,32 @@ def detect_clip_candidates(
     visible_start = start_seconds if visible_start_seconds is None else visible_start_seconds
     visible_end = end_seconds if visible_end_seconds is None else visible_end_seconds
 
-    clip_model = DEFAULT_OPENROUTER_MODEL
-    decision = _detect_clip_candidates_openrouter(
-        transcript=transcript,
-        words=words,
-        chunk_index=chunk_index,
-        start_seconds=start_seconds,
-        end_seconds=end_seconds,
-        visible_start_seconds=visible_start,
-        visible_end_seconds=visible_end,
-        context_words_before=context_words_before or [],
-        context_words_after=context_words_after or [],
-        model=clip_model,
-        reasoning_effort=reasoning_effort,
-        marker_seconds=marker_seconds,
-        pipeline_mode=pipeline_mode,
-        user_instructions=user_instructions,
-        target_length=target_length,
-        research_context=research_context,
-        audio_context=audio_context or [],
-        scene_cuts=scene_cuts,
-        source_minutes=source_minutes,
+    providers = audio_providers(
+        title="highlighter pipeline",
+        openrouter_reasoning_effort=reasoning_effort or DEFAULT_LLM_REASONING_EFFORT,
+    )
+    decision, provider = run_with_fallback(
+        providers,
+        lambda candidate_provider: _request_clip_candidates(
+            provider=candidate_provider,
+            transcript=transcript,
+            words=words,
+            chunk_index=chunk_index,
+            start_seconds=start_seconds,
+            end_seconds=end_seconds,
+            visible_start_seconds=visible_start,
+            visible_end_seconds=visible_end,
+            context_words_before=context_words_before or [],
+            context_words_after=context_words_after or [],
+            marker_seconds=marker_seconds,
+            pipeline_mode=pipeline_mode,
+            user_instructions=user_instructions,
+            target_length=target_length,
+            research_context=research_context,
+            audio_context=audio_context or [],
+            scene_cuts=scene_cuts,
+            source_minutes=source_minutes,
+        ),
     )
     return _normalize_candidates(
         decision,
@@ -351,13 +357,14 @@ def detect_clip_candidates(
         chunk_end_seconds=end_seconds,
         visible_start_seconds=visible_start,
         visible_end_seconds=visible_end,
-        model=clip_model,
+        model=provider.model,
         reasoning_effort=reasoning_effort or DEFAULT_LLM_REASONING_EFFORT,
     )
 
 
-def _detect_clip_candidates_openrouter(
+def _request_clip_candidates(
     *,
+    provider: Provider,
     transcript: str,
     words: list[dict[str, Any]],
     chunk_index: int,
@@ -367,8 +374,6 @@ def _detect_clip_candidates_openrouter(
     visible_end_seconds: int,
     context_words_before: list[dict[str, Any]],
     context_words_after: list[dict[str, Any]],
-    model: str,
-    reasoning_effort: str,
     marker_seconds: int,
     pipeline_mode: str,
     user_instructions: str | None,
@@ -378,14 +383,7 @@ def _detect_clip_candidates_openrouter(
     scene_cuts: list[float] | None,
     source_minutes: float | None,
 ) -> dict[str, Any]:
-    try:
-        from openai import APIStatusError, OpenAI
-    except ImportError as exc:
-        raise RuntimeError("OpenRouter Gemini audio scoring requires the 'openai' package") from exc
-
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENROUTER_API_KEY is required for Gemini audio clip scoring")
+    from openai import APIStatusError
 
     user_prompt = _build_user_prompt(
         transcript=transcript,
@@ -402,6 +400,11 @@ def _detect_clip_candidates_openrouter(
         research_context=research_context,
         scene_cuts=scene_cuts,
     )
+    if not provider.supports_json_schema:
+        user_prompt += (
+            "\n\nReturn ONLY a JSON object matching this schema, with no markdown fences:\n"
+            + json.dumps(CLIP_RESPONSE_SCHEMA)
+        )
     user_content: list[dict[str, Any]] = [{"type": "text", "text": user_prompt}]
     audio_b64 = _audio_context_base64(
         audio_context=audio_context,
@@ -417,17 +420,8 @@ def _detect_clip_candidates_openrouter(
         )
 
     try:
-        with OpenAI(
-            base_url=OPENROUTER_BASE_URL,
-            api_key=api_key,
-            timeout=240.0,
-            default_headers={
-                "HTTP-Referer": "http://localhost",
-                "X-OpenRouter-Title": "highlighter pipeline",
-            },
-        ) as client:
+        with provider.client(timeout=240.0) as client:
             response = client.chat.completions.create(
-                model=model,
                 messages=[
                     {
                         "role": "system",
@@ -439,35 +433,32 @@ def _detect_clip_candidates_openrouter(
                     },
                     {"role": "user", "content": user_content},
                 ],
-                temperature=0,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "clip_candidates",
-                        "schema": CLIP_RESPONSE_SCHEMA,
-                    },
-                },
+                **(
+                    {
+                        "response_format": {
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": "clip_candidates",
+                                "schema": CLIP_RESPONSE_SCHEMA,
+                            },
+                        }
+                    }
+                    if provider.supports_json_schema
+                    else {}
+                ),
                 user=f"chunk-{chunk_index}",
-                extra_body={
-                    "provider": {
-                        "order": [OPENROUTER_VERTEX_PROVIDER],
-                        "allow_fallbacks": False,
-                    },
-                    "reasoning": {
-                        "effort": reasoning_effort or DEFAULT_LLM_REASONING_EFFORT,
-                    },
-                },
+                **provider.request_kwargs(),
             )
     except APIStatusError as exc:
         raise RuntimeError(
-            f"OpenRouter Gemini request failed: {exc.response.text[:4000]}"
+            f"{provider.label} request failed: {exc.response.text[:4000]}"
         ) from exc
 
     if not response.choices:
-        raise RuntimeError("OpenRouter Gemini response did not include choices")
+        raise RuntimeError(f"{provider.label} response did not include choices")
     content = response.choices[0].message.content
     if not content:
-        raise RuntimeError("OpenRouter Gemini response did not include text content")
+        raise RuntimeError(f"{provider.label} response did not include text content")
     return _json_from_text(content)
 
 

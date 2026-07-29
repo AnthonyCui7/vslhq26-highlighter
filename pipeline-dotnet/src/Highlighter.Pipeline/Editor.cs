@@ -114,13 +114,8 @@ public static class Editor
         string? targetLength,
         JsonObject? researchContext = null,
         string? userInstructions = null,
-        string model = Defaults.DEFAULT_OPENROUTER_MODEL,
         string reasoningEffort = Defaults.DEFAULT_LLM_REASONING_EFFORT)
     {
-        var apiKey = Config.Env("OPENROUTER_API_KEY");
-        if (string.IsNullOrEmpty(apiKey))
-            throw new PipelineError("OPENROUTER_API_KEY is required for the long-form editor");
-
         var (indexedCandidates, droppedFromPrompt) = CapCandidates(candidates);
         if (droppedFromPrompt > 0)
         {
@@ -133,58 +128,18 @@ public static class Editor
             sourceMinutes: sourceMinutes,
             targetLength: targetLength);
 
-        var body = new JsonObject
-        {
-            ["model"] = model,
-            ["messages"] = new JsonArray
-            {
-                new JsonObject { ["role"] = "system", ["content"] = EDITOR_SYSTEM_PROMPT },
-                new JsonObject
-                {
-                    ["role"] = "user",
-                    ["content"] = BuildUserPrompt(
-                        indexedCandidates,
-                        arithmetic: arithmetic,
-                        researchContext: researchContext,
-                        userInstructions: userInstructions),
-                },
-            },
-            ["temperature"] = 0,
-            ["response_format"] = new JsonObject
-            {
-                ["type"] = "json_schema",
-                ["json_schema"] = new JsonObject
-                {
-                    ["name"] = "longform_edit",
-                    ["schema"] = EditResponseSchema(),
-                },
-            },
-            ["provider"] = new JsonObject
-            {
-                ["order"] = new JsonArray(OpenRouterClient.OPENROUTER_VERTEX_PROVIDER),
-                ["allow_fallbacks"] = false,
-            },
-            ["reasoning"] = new JsonObject
-            {
-                ["effort"] = string.IsNullOrEmpty(reasoningEffort)
-                    ? Defaults.DEFAULT_LLM_REASONING_EFFORT
-                    : reasoningEffort,
-            },
-        };
-
-        JsonObject response;
-        using (var client = new OpenRouterClient(
-                   apiKey, timeoutSeconds: 300.0, title: "highlighter editor"))
-        {
-            response = client.ChatCompletions(body);
-        }
-
-        if (response["choices"] is not JsonArray choices || choices.Count == 0)
-            throw new PipelineError("Long-form editor response did not include choices");
-        var content = JsonUtil.StrOrNull(choices[0]?["message"]?["content"]);
-        if (string.IsNullOrEmpty(content))
-            throw new PipelineError("Long-form editor response did not include text content");
-        var decision = Llm.JsonFromText(content);
+        var userPrompt = BuildUserPrompt(
+            indexedCandidates,
+            arithmetic: arithmetic,
+            researchContext: researchContext,
+            userInstructions: userInstructions);
+        var providers = Providers.EditorProviders(
+            title: "highlighter editor",
+            openrouterReasoningEffort: string.IsNullOrEmpty(reasoningEffort)
+                ? Defaults.DEFAULT_LLM_REASONING_EFFORT
+                : reasoningEffort);
+        var (decision, provider) = Providers.RunWithFallback(
+            providers, candidateProvider => RequestEdit(candidateProvider, userPrompt));
 
         var offered = indexedCandidates.ToDictionary(pair => pair.Index, pair => pair.Candidate);
         var selections = new JsonArray();
@@ -197,10 +152,45 @@ public static class Editor
                 ? JsonUtil.Str(decision["edit_notes"])
                 : "",
             ["arithmetic"] = arithmetic,
-            ["model"] = model,
+            ["model"] = provider.Model,
             ["candidates_considered"] = indexedCandidates.Count,
             ["candidates_dropped_from_prompt"] = droppedFromPrompt,
         };
+    }
+
+    private static JsonObject RequestEdit(ChatProvider provider, string userPrompt)
+    {
+        var body = new JsonObject
+        {
+            ["messages"] = new JsonArray
+            {
+                new JsonObject { ["role"] = "system", ["content"] = EDITOR_SYSTEM_PROMPT },
+                new JsonObject { ["role"] = "user", ["content"] = userPrompt },
+            },
+            ["response_format"] = new JsonObject
+            {
+                ["type"] = "json_schema",
+                ["json_schema"] = new JsonObject
+                {
+                    ["name"] = "longform_edit",
+                    ["schema"] = EditResponseSchema(),
+                },
+            },
+        };
+        provider.ApplyRequestOptions(body);
+
+        JsonObject response;
+        using (var client = provider.Client(timeoutSeconds: 300.0))
+        {
+            response = client.ChatCompletions(body);
+        }
+
+        if (response["choices"] is not JsonArray choices || choices.Count == 0)
+            throw new PipelineError($"{provider.Label} editor response did not include choices");
+        var content = JsonUtil.StrOrNull(choices[0]?["message"]?["content"]);
+        if (string.IsNullOrEmpty(content))
+            throw new PipelineError($"{provider.Label} editor response did not include text content");
+        return Llm.JsonFromText(content);
     }
 
     /// <summary>Cap the prompt to the strongest MAX_PROMPT_CANDIDATES, keeping

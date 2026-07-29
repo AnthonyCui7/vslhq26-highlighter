@@ -5,47 +5,51 @@ namespace Highlighter.Pipeline;
 
 /// <summary>Raised for non-success HTTP statuses — the port of the openai SDK's
 /// APIStatusError, carrying the response body for callers that quote it.</summary>
-public class OpenRouterStatusException : Exception
+public class ChatCompletionsStatusException : Exception
 {
     public int StatusCode { get; }
     public string ResponseText { get; }
 
-    public OpenRouterStatusException(int statusCode, string responseText)
-        : base($"OpenRouter request failed with status {statusCode}")
+    public ChatCompletionsStatusException(int statusCode, string responseText)
+        : base($"Chat completions request failed with status {statusCode}")
     {
         StatusCode = statusCode;
         ResponseText = responseText;
     }
 }
 
-/// <summary>Chat-completions client for OpenRouter over raw HTTP.
+/// <summary>Chat-completions client over raw HTTP for any OpenAI-compatible
+/// endpoint — OpenRouter, or an Azure OpenAI resource's /openai/v1 surface.
 ///
-/// The Python pipeline calls OpenRouter through the openai SDK; this port
-/// speaks the same wire protocol directly so OpenRouter-specific request
-/// fields (provider pinning, reasoning effort, plugins) are plain JSON rather
-/// than SDK extension points. It also reproduces the SDK behavior the Python
-/// code silently relies on: two retries with exponential backoff on
-/// 408/429/5xx, connection errors, and timeouts.</summary>
-public sealed class OpenRouterClient : IDisposable
+/// The Python pipeline calls these endpoints through the openai SDK; this port
+/// speaks the same wire protocol directly so provider-specific request fields
+/// (OpenRouter provider pinning and reasoning, Azure reasoning_effort and
+/// modalities) are plain JSON rather than SDK extension points. It also
+/// reproduces the SDK behavior the Python code silently relies on: two retries
+/// with exponential backoff on 408/429/5xx, connection errors, and timeouts.</summary>
+public sealed class ChatCompletionsClient : IDisposable
 {
-    public const string OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
-    public const string OPENROUTER_VERTEX_PROVIDER = "google-vertex";
-
     private const int MaxRetries = 2;
 
     private readonly HttpClient _http;
+    private readonly string _baseUrl;
 
-    public OpenRouterClient(string apiKey, double timeoutSeconds, string title)
+    public ChatCompletionsClient(
+        string baseUrl,
+        string apiKey,
+        double timeoutSeconds,
+        IReadOnlyDictionary<string, string>? headers = null)
     {
+        _baseUrl = baseUrl.TrimEnd('/');
         _http = new HttpClient { Timeout = TimeSpan.FromSeconds(timeoutSeconds) };
         _http.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", $"Bearer {apiKey}");
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("HTTP-Referer", "http://localhost");
-        _http.DefaultRequestHeaders.TryAddWithoutValidation("X-OpenRouter-Title", title);
+        foreach (var (name, value) in headers ?? new Dictionary<string, string>())
+            _http.DefaultRequestHeaders.TryAddWithoutValidation(name, value);
     }
 
     /// <summary>POST /chat/completions; returns the parsed response object.
-    /// Throws OpenRouterStatusException for a non-retryable (or retry-exhausted)
-    /// HTTP error status.</summary>
+    /// Throws ChatCompletionsStatusException for a non-retryable (or
+    /// retry-exhausted) HTTP error status.</summary>
     public JsonObject ChatCompletions(JsonObject body)
     {
         var payload = JsonUtil.Dumps(body);
@@ -54,7 +58,7 @@ public sealed class OpenRouterClient : IDisposable
             try
             {
                 using var request = new HttpRequestMessage(
-                    HttpMethod.Post, OPENROUTER_BASE_URL + "/chat/completions")
+                    HttpMethod.Post, _baseUrl + "/chat/completions")
                 {
                     Content = new StringContent(payload, Encoding.UTF8, "application/json"),
                 };
@@ -66,7 +70,7 @@ public sealed class OpenRouterClient : IDisposable
                 var status = (int)response.StatusCode;
                 var retryable = status == 408 || status == 429 || status >= 500;
                 if (!retryable || attempt >= MaxRetries)
-                    throw new OpenRouterStatusException(status, text);
+                    throw new ChatCompletionsStatusException(status, text);
             }
             catch (HttpRequestException) when (attempt < MaxRetries)
             {

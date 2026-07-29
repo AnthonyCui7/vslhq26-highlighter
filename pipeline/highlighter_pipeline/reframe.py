@@ -1,10 +1,10 @@
 """Auto-reframe rendered short-form clips to a 9:16 vertical.
 
-One Gemini call per clip decides where the sharp region sits: the model sees a
-sampled frame from each shot (plus the clip's opening frame), the scene-cut
-timings, and the clip's editorial context, and returns a small set of
-horizontal crop centers — a starting framing, then a new center whenever the
-speaker or action moves. Spans that cannot be cropped honestly (side-by-side
+One framing call per clip decides where the sharp region sits: the model sees
+frames sampled every few seconds (plus one just after each scene cut, and the
+clip's opening frame), the scene-cut timings, and the clip's editorial
+context, and returns a small set of horizontal crop centers — a starting
+framing, then a new center whenever the speaker or action moves. Spans that cannot be cropped honestly (side-by-side
 call layouts, wide action) are flagged wide and show the whole 16:9 frame
 fitted to the canvas width instead. Rendering is deterministic: a full-height
 square crop at those centers (or the fitted wide frame) fills the width of a
@@ -14,26 +14,30 @@ and below. Framing is static between keyframes — hard cuts, no tracking.
 
 import base64
 import json
-import os
 import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
 
-from .defaults import DEFAULT_OPENROUTER_MODEL
-from .llm import OPENROUTER_BASE_URL, OPENROUTER_VERTEX_PROVIDER, _json_from_text
+from .defaults import DEFAULT_REFRAME_FRAME_INTERVAL_SECONDS
+from .llm import _json_from_text
+from .providers import Provider, editor_providers, run_with_fallback
 from .render import extract_thumbnail
 
 CANVAS_WIDTH = 720
 CANVAS_HEIGHT = 1280
 BLUR_SIGMA = 25
-# One frame per shot is plenty; more frames anchor worse, not better.
-MAX_SAMPLE_FRAMES = 10
+# Periodic frames plus one per shot; enough to catch a subject drifting
+# within a long static shot.
+MAX_SAMPLE_FRAMES = 24
+# A periodic frame this close to a cut frame shows the same moment twice.
+PERIODIC_FRAME_MIN_GAP_SECONDS = 2.0
 # Crop moves closer together than this read as jitter, not reframing.
 MIN_KEYFRAME_SPACING_SECONDS = 1.5
 MIN_CENTER_DELTA = 0.03
-# Framing is a perceptual where's-the-subject call; deep reasoning only adds
-# latency per clip.
+# Framing is a perceptual where's-the-subject call; on the Gemini link of the
+# chain, deep reasoning only adds latency per clip. (The Azure deployment
+# always runs at its own AZURE_REASONING_EFFORT.)
 REFRAME_REASONING_EFFORT = "low"
 
 
@@ -42,9 +46,9 @@ short. The vertical canvas shows a full-height square crop of the source at
 full canvas width; a blurred fill covers the rest. Your only decision is where
 that square sits horizontally over time.
 
-You get one sampled frame per shot (each labeled with its timestamp in seconds
-from the start of the clip), the clip's scene-cut timings, and editorial
-context about what happens in it. Return crop keyframes: a starting center_x
+You get frames sampled every few seconds and just after each shot change (each
+labeled with its timestamp in seconds from the start of the clip), the clip's
+scene-cut timings, and editorial context about what happens in it. Return crop keyframes: a starting center_x
 at 0 seconds, then a new keyframe ONLY when the subject clearly sits somewhere
 else in the frame — typically because the shot changed. center_x is the
 horizontal center of the square as a fraction of the source width (0 = left
@@ -119,23 +123,14 @@ def plan_crop_track(
     title: str,
     description: str,
     research_context: dict[str, Any] | None = None,
-    model: str = DEFAULT_OPENROUTER_MODEL,
+    frame_interval_seconds: float = DEFAULT_REFRAME_FRAME_INTERVAL_SECONDS,
 ) -> dict[str, Any]:
-    """One Gemini call deciding the crop keyframes for a rendered clip.
+    """One framing call deciding the crop keyframes for a rendered clip.
 
     scene_cuts are clip-relative seconds. Returns {keyframes, notes, model}
     with keyframes validated (first at 0, sorted, de-jittered); raises on
     failure — the caller keeps the 16:9 clip."""
-    try:
-        from openai import OpenAI
-    except ImportError as exc:
-        raise RuntimeError("Auto-reframing requires the 'openai' package") from exc
-
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENROUTER_API_KEY is required for auto-reframing")
-
-    sample_times = _sample_times(clip_duration_seconds, scene_cuts)
+    sample_times = _sample_times(clip_duration_seconds, scene_cuts, frame_interval_seconds)
     cut_list = (
         ", ".join(f"{cut:.1f}" for cut in scene_cuts) if scene_cuts else "none detected"
     )
@@ -152,7 +147,7 @@ def plan_crop_track(
                     "Content research context:",
                     json.dumps(research_context or {}, indent=2),
                     "",
-                    "Sampled frames follow, one per shot.",
+                    "Sampled frames follow.",
                 ]
             ),
         }
@@ -170,53 +165,65 @@ def plan_crop_track(
                 }
             )
 
-        with OpenAI(
-            base_url=OPENROUTER_BASE_URL,
-            api_key=api_key,
-            timeout=120.0,
-            default_headers={
-                "HTTP-Referer": "http://localhost",
-                "X-OpenRouter-Title": "highlighter reframe",
-            },
-        ) as client:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": REFRAME_SYSTEM_PROMPT},
-                    {"role": "user", "content": content},
-                ],
-                temperature=0,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {"name": "crop_track", "schema": REFRAME_RESPONSE_SCHEMA},
-                },
-                extra_body={
-                    "provider": {
-                        "order": [OPENROUTER_VERTEX_PROVIDER],
-                        "allow_fallbacks": False,
-                    },
-                    "reasoning": {"effort": REFRAME_REASONING_EFFORT},
-                },
-            )
-
-    if not response.choices or not response.choices[0].message.content:
-        raise RuntimeError("Reframe response did not include content")
-    decision = _json_from_text(response.choices[0].message.content)
+    providers = editor_providers(
+        title="highlighter reframe",
+        openrouter_reasoning_effort=REFRAME_REASONING_EFFORT,
+    )
+    decision, provider = run_with_fallback(
+        providers, lambda candidate_provider: _request_crop_track(candidate_provider, content)
+    )
     return {
         "keyframes": _validate_keyframes(decision.get("keyframes"), clip_duration_seconds),
         "notes": str(decision.get("notes") or ""),
-        "model": model,
+        "model": provider.model,
     }
 
 
-def _sample_times(duration_seconds: float, scene_cuts: list[float]) -> list[float]:
-    """One frame just after the clip start and just after each cut, capped at
-    MAX_SAMPLE_FRAMES by evenly thinning the cut frames (the opener stays)."""
+def _request_crop_track(
+    provider: Provider, content: list[dict[str, Any]]
+) -> dict[str, Any]:
+    with provider.client(timeout=120.0) as client:
+        response = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": REFRAME_SYSTEM_PROMPT},
+                {"role": "user", "content": content},
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "crop_track", "schema": REFRAME_RESPONSE_SCHEMA},
+            },
+            **provider.request_kwargs(),
+        )
+
+    if not response.choices or not response.choices[0].message.content:
+        raise RuntimeError(f"{provider.label} reframe response did not include content")
+    return _json_from_text(response.choices[0].message.content)
+
+
+def _sample_times(
+    duration_seconds: float,
+    scene_cuts: list[float],
+    frame_interval_seconds: float = DEFAULT_REFRAME_FRAME_INTERVAL_SECONDS,
+) -> list[float]:
+    """One frame just after the clip start and just after each cut, plus one
+    every frame_interval_seconds (periodic frames next to a cut frame are
+    skipped), capped at MAX_SAMPLE_FRAMES by evenly thinning (the opener
+    stays)."""
     times = [min(0.2, max(0.0, duration_seconds / 2))]
     for cut in sorted(scene_cuts):
         at_seconds = cut + 0.3
         if 0.5 < at_seconds < duration_seconds - 0.1:
             times.append(round(at_seconds, 2))
+    if frame_interval_seconds > 0:
+        at_seconds = frame_interval_seconds
+        while at_seconds < duration_seconds - 0.1:
+            if all(
+                abs(at_seconds - existing) >= PERIODIC_FRAME_MIN_GAP_SECONDS
+                for existing in times
+            ):
+                times.append(round(at_seconds, 2))
+            at_seconds += frame_interval_seconds
+    times.sort()
     if len(times) > MAX_SAMPLE_FRAMES:
         rest = times[1:]
         step = len(rest) / (MAX_SAMPLE_FRAMES - 1)

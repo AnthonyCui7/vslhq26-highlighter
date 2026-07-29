@@ -6,11 +6,11 @@ namespace Highlighter.Pipeline;
 ///
 /// Auto-reframe rendered short-form clips to a 9:16 vertical.
 ///
-/// One Gemini call per clip decides where the sharp region sits: the model sees a
-/// sampled frame from each shot (plus the clip's opening frame), the scene-cut
-/// timings, and the clip's editorial context, and returns a small set of
-/// horizontal crop centers — a starting framing, then a new center whenever the
-/// speaker or action moves. Spans that cannot be cropped honestly (side-by-side
+/// One framing call per clip decides where the sharp region sits: the model
+/// sees frames sampled every few seconds (plus one just after each scene cut,
+/// and the clip's opening frame), the scene-cut timings, and the clip's
+/// editorial context, and returns a small set of horizontal crop centers — a
+/// starting framing, then a new center whenever the speaker or action moves. Spans that cannot be cropped honestly (side-by-side
 /// call layouts, wide action) are flagged wide and show the whole 16:9 frame
 /// fitted to the canvas width instead. Rendering is deterministic: a full-height
 /// square crop at those centers (or the fitted wide frame) fills the width of a
@@ -21,13 +21,17 @@ public static class Reframe
     public const int CANVAS_WIDTH = 720;
     public const int CANVAS_HEIGHT = 1280;
     public const int BLUR_SIGMA = 25;
-    // One frame per shot is plenty; more frames anchor worse, not better.
-    public const int MAX_SAMPLE_FRAMES = 10;
+    // Periodic frames plus one per shot; enough to catch a subject drifting
+    // within a long static shot.
+    public const int MAX_SAMPLE_FRAMES = 24;
+    // A periodic frame this close to a cut frame shows the same moment twice.
+    public const double PERIODIC_FRAME_MIN_GAP_SECONDS = 2.0;
     // Crop moves closer together than this read as jitter, not reframing.
     public const double MIN_KEYFRAME_SPACING_SECONDS = 1.5;
     public const double MIN_CENTER_DELTA = 0.03;
-    // Framing is a perceptual where's-the-subject call; deep reasoning only adds
-    // latency per clip.
+    // Framing is a perceptual where's-the-subject call; on the Gemini link of
+    // the chain, deep reasoning only adds latency per clip. (The Azure
+    // deployment always runs at its own AZURE_REASONING_EFFORT.)
     public const string REFRAME_REASONING_EFFORT = "low";
 
     public const string REFRAME_SYSTEM_PROMPT =
@@ -37,9 +41,9 @@ public static class Reframe
         full canvas width; a blurred fill covers the rest. Your only decision is where
         that square sits horizontally over time.
 
-        You get one sampled frame per shot (each labeled with its timestamp in seconds
-        from the start of the clip), the clip's scene-cut timings, and editorial
-        context about what happens in it. Return crop keyframes: a starting center_x
+        You get frames sampled every few seconds and just after each shot change (each
+        labeled with its timestamp in seconds from the start of the clip), the clip's
+        scene-cut timings, and editorial context about what happens in it. Return crop keyframes: a starting center_x
         at 0 seconds, then a new keyframe ONLY when the subject clearly sits somewhere
         else in the frame — typically because the shot changed. center_x is the
         horizontal center of the square as a fraction of the source width (0 = left
@@ -111,7 +115,7 @@ public static class Reframe
     public static JsonObject ReframeResponseSchema() =>
         JsonUtil.ParseObject(REFRAME_RESPONSE_SCHEMA_JSON);
 
-    /// <summary>One Gemini call deciding the crop keyframes for a rendered clip.
+    /// <summary>One framing call deciding the crop keyframes for a rendered clip.
     ///
     /// sceneCuts are clip-relative seconds. Returns {keyframes, notes, model}
     /// with keyframes validated (first at 0, sorted, de-jittered); throws on
@@ -123,13 +127,9 @@ public static class Reframe
         string title,
         string description,
         JsonObject? researchContext = null,
-        string model = Defaults.DEFAULT_OPENROUTER_MODEL)
+        double frameIntervalSeconds = Defaults.DEFAULT_REFRAME_FRAME_INTERVAL_SECONDS)
     {
-        var apiKey = Config.Env("OPENROUTER_API_KEY");
-        if (string.IsNullOrEmpty(apiKey))
-            throw new PipelineError("OPENROUTER_API_KEY is required for auto-reframing");
-
-        var sampleTimes = SampleTimes(clipDurationSeconds, sceneCuts);
+        var sampleTimes = SampleTimes(clipDurationSeconds, sceneCuts, frameIntervalSeconds);
         var cutList = sceneCuts.Count > 0
             ? string.Join(", ", sceneCuts.Select(cut => Py.F(cut, 1)))
             : "none detected";
@@ -148,12 +148,11 @@ public static class Reframe
                     "Content research context:",
                     JsonUtil.DumpsIndented(researchContext ?? new JsonObject()),
                     "",
-                    "Sampled frames follow, one per shot.",
+                    "Sampled frames follow.",
                 }),
             },
         };
 
-        JsonObject response;
         using (var tmp = new TempDir(prefix: "reframe-"))
         {
             for (var index = 0; index < sampleTimes.Count; index++)
@@ -177,44 +176,13 @@ public static class Reframe
                     },
                 });
             }
-
-            var body = new JsonObject
-            {
-                ["model"] = model,
-                ["messages"] = new JsonArray
-                {
-                    new JsonObject { ["role"] = "system", ["content"] = REFRAME_SYSTEM_PROMPT },
-                    new JsonObject { ["role"] = "user", ["content"] = content },
-                },
-                ["temperature"] = 0,
-                ["response_format"] = new JsonObject
-                {
-                    ["type"] = "json_schema",
-                    ["json_schema"] = new JsonObject
-                    {
-                        ["name"] = "crop_track",
-                        ["schema"] = ReframeResponseSchema(),
-                    },
-                },
-                ["provider"] = new JsonObject
-                {
-                    ["order"] = new JsonArray(OpenRouterClient.OPENROUTER_VERTEX_PROVIDER),
-                    ["allow_fallbacks"] = false,
-                },
-                ["reasoning"] = new JsonObject { ["effort"] = REFRAME_REASONING_EFFORT },
-            };
-
-            using var client = new OpenRouterClient(
-                apiKey, timeoutSeconds: 120.0, title: "highlighter reframe");
-            response = client.ChatCompletions(body);
         }
 
-        var contentText = response["choices"] is JsonArray choices && choices.Count > 0
-            ? JsonUtil.StrOrNull(choices[0]?["message"]?["content"])
-            : null;
-        if (string.IsNullOrEmpty(contentText))
-            throw new PipelineError("Reframe response did not include content");
-        var decision = Llm.JsonFromText(contentText);
+        var providers = Providers.EditorProviders(
+            title: "highlighter reframe",
+            openrouterReasoningEffort: REFRAME_REASONING_EFFORT);
+        var (decision, provider) = Providers.RunWithFallback(
+            providers, candidateProvider => RequestCropTrack(candidateProvider, content));
         var keyframes = new JsonArray();
         foreach (var keyframe in ValidateKeyframes(decision["keyframes"], clipDurationSeconds))
             keyframes.Add(keyframe);
@@ -222,13 +190,53 @@ public static class Reframe
         {
             ["keyframes"] = keyframes,
             ["notes"] = JsonUtil.Truthy(decision["notes"]) ? JsonUtil.Str(decision["notes"]) : "",
-            ["model"] = model,
+            ["model"] = provider.Model,
         };
     }
 
-    /// <summary>One frame just after the clip start and just after each cut, capped at
-    /// MAX_SAMPLE_FRAMES by evenly thinning the cut frames (the opener stays).</summary>
-    public static List<double> SampleTimes(double durationSeconds, IReadOnlyList<double> sceneCuts)
+    private static JsonObject RequestCropTrack(ChatProvider provider, JsonArray content)
+    {
+        var body = new JsonObject
+        {
+            ["messages"] = new JsonArray
+            {
+                new JsonObject { ["role"] = "system", ["content"] = REFRAME_SYSTEM_PROMPT },
+                new JsonObject { ["role"] = "user", ["content"] = content.DeepClone() },
+            },
+            ["response_format"] = new JsonObject
+            {
+                ["type"] = "json_schema",
+                ["json_schema"] = new JsonObject
+                {
+                    ["name"] = "crop_track",
+                    ["schema"] = ReframeResponseSchema(),
+                },
+            },
+        };
+        provider.ApplyRequestOptions(body);
+
+        JsonObject response;
+        using (var client = provider.Client(timeoutSeconds: 120.0))
+        {
+            response = client.ChatCompletions(body);
+        }
+
+        var contentText = response["choices"] is JsonArray choices && choices.Count > 0
+            ? JsonUtil.StrOrNull(choices[0]?["message"]?["content"])
+            : null;
+        if (string.IsNullOrEmpty(contentText))
+            throw new PipelineError($"{provider.Label} reframe response did not include content");
+        return Llm.JsonFromText(contentText);
+    }
+
+    /// <summary>One frame just after the clip start and just after each cut, plus one
+    /// every frameIntervalSeconds (periodic frames next to a cut frame are
+    /// skipped), capped at MAX_SAMPLE_FRAMES by evenly thinning (the opener
+    /// stays).</summary>
+    public static List<double> SampleTimes(
+        double durationSeconds,
+        IReadOnlyList<double> sceneCuts,
+        double frameIntervalSeconds = Defaults.DEFAULT_REFRAME_FRAME_INTERVAL_SECONDS)
     {
         var times = new List<double> { Math.Min(0.2, Math.Max(0.0, durationSeconds / 2)) };
         foreach (var cut in sceneCuts.OrderBy(cut => cut))
@@ -237,6 +245,19 @@ public static class Reframe
             if (0.5 < atSeconds && atSeconds < durationSeconds - 0.1)
                 times.Add(Py.Round(atSeconds, 2));
         }
+        if (frameIntervalSeconds > 0)
+        {
+            for (var atSeconds = frameIntervalSeconds;
+                 atSeconds < durationSeconds - 0.1;
+                 atSeconds += frameIntervalSeconds)
+            {
+                var candidate = atSeconds;
+                if (times.All(existing =>
+                        Math.Abs(candidate - existing) >= PERIODIC_FRAME_MIN_GAP_SECONDS))
+                    times.Add(Py.Round(candidate, 2));
+            }
+        }
+        times.Sort();
         if (times.Count > MAX_SAMPLE_FRAMES)
         {
             var rest = times.Skip(1).ToList();

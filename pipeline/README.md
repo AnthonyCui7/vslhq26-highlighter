@@ -1,8 +1,9 @@
 # pipeline
 
 Core Highlighter processing pipeline: capture a livestream or VOD, transcribe
-it in chunks with Deepgram, detect clip-worthy moments with an audio-capable
-LLM, render clip MP4s with ffmpeg, and persist the results.
+it in chunks with Azure AI Speech (Deepgram as fallback), detect clip-worthy
+moments with an audio-capable LLM behind per-role provider chains over Azure
+OpenAI and OpenRouter, render clip MP4s with ffmpeg, and persist the results.
 
 ```bash
 # From the repo root — the end-to-end runner (see tests/run_pipeline.py --help):
@@ -34,8 +35,20 @@ Key modules:
 - `capture.py` — streamlink (live Twitch) / yt-dlp (everything else) piped into
   ffmpeg: 16 kHz mono WAV chunks for transcription, plus optional codec-copied
   source segments for clip rendering.
-- `deepgram.py` — chunk transcription (word-level timestamps).
-- `llm.py` — clip-candidate detection over transcript + audio via OpenRouter.
+- `transcribe.py` — chunk transcription: Azure AI Speech fast transcription
+  first (`AZURE_SPEECH_KEY` + `AZURE_SPEECH_REGION`/`AZURE_SPEECH_ENDPOINT`),
+  falling back per chunk to `deepgram.py` (`DEEPGRAM_API_KEY`); both return the
+  same word-timestamped shape.
+- `providers.py` — the model seam every LLM call goes through: an ordered
+  chain per role. The editor role (text/vision: pass 2, reframe, the research
+  attempt) runs the Azure deployment first when configured, then OpenRouter
+  Gemini; the audio role (pass-1 scoring, the revision agent) runs OpenRouter
+  Gemini first, then the Azure deployment. Azure env vars: `AZURE_EDITOR_*` /
+  `AZURE_AUDIO_*`, or the shared `AZURE_OPENAI_ENDPOINT`/`AZURE_OPENAI_API_KEY`
+  with `AZURE_OPENAI_EDIT_DEPLOYMENT`/`AZURE_OPENAI_AUDIO_DEPLOYMENT`.
+  Reasoning deployments run at the highest effort their family accepts
+  (`AZURE_REASONING_EFFORT` to override).
+- `llm.py` — clip-candidate detection over transcript + audio.
 - `shots.py` — TransNetV2 shot-boundary detection per segment: scene cuts feed
   the editor prompts and snap final clip boundaries to the source's own edit
   points. Optional dependency: `pip install 'highlighter-pipeline[shots]'`
@@ -46,9 +59,12 @@ Key modules:
   access to the transcript, audio, scene cuts, and research; reruns pipeline
   stages on demand and assembles each new version from existing renders (or
   fresh source fetches) into a `longform_edits` row.
-- `reframe.py` — short-form auto-reframe: one framing call per clip picks the
-  horizontal crop centers; ffmpeg renders the blur-pad 9:16 vertical.
-- `research.py` — content research layer (stub; will be a LangGraph workflow).
+- `reframe.py` — short-form auto-reframe: one framing call per clip (frames
+  sampled every 5s plus one after each scene cut; `--reframe-interval`) picks
+  the horizontal crop centers; ffmpeg renders the blur-pad 9:16 vertical.
+- `research.py` — content research layer: one call per run, the Azure editor
+  deployment first when configured, falling back to a single web-grounded
+  Claude Sonnet 5 call through OpenRouter's web search.
 - `scoring.py` — concurrent scoring coordinator + boundary stitching/merging.
 - `render.py` — ffmpeg clip rendering, trims, and thumbnails.
 - `reclip.py` — re-cut a new clip window from an archived source.

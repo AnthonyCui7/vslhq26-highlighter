@@ -23,6 +23,7 @@ public class IngestArgs
     public bool NoLlm;
     public bool NoShots;
     public bool NoReframe;
+    public double ReframeInterval = Defaults.DEFAULT_REFRAME_FRAME_INTERVAL_SECONDS;
     public string LlmReasoningEffort = Defaults.DEFAULT_LLM_REASONING_EFFORT;
     public int LlmMarkerSeconds = Defaults.DEFAULT_LLM_MARKER_SECONDS;
     public int LlmConcurrency = Defaults.DEFAULT_LLM_CONCURRENCY;
@@ -43,6 +44,8 @@ public class IngestArgs
             MaxChunks = Config.IntEnv("MAX_CHUNKS", Defaults.DEFAULT_MAX_CHUNKS),
             StreamlinkQuality = Config.Env("STREAMLINK_QUALITY", Defaults.DEFAULT_STREAMLINK_QUALITY),
             DeepgramModel = Config.Env("DEEPGRAM_MODEL", Defaults.DEFAULT_DEEPGRAM_MODEL),
+            ReframeInterval = Config.FloatEnv("REFRAME_INTERVAL")
+                ?? Defaults.DEFAULT_REFRAME_FRAME_INTERVAL_SECONDS,
             LlmReasoningEffort = Config.Env(
                 "OPENROUTER_REASONING_EFFORT", Defaults.DEFAULT_LLM_REASONING_EFFORT),
             LlmMarkerSeconds = Config.IntEnv(
@@ -110,6 +113,9 @@ public class IngestArgs
                     break;
                 case "--no-reframe":
                     args.NoReframe = true;
+                    break;
+                case "--reframe-interval":
+                    args.ReframeInterval = Argv.Float(Next(), "--reframe-interval");
                     break;
                 case "--llm-reasoning-effort":
                     args.LlmReasoningEffort = Next();

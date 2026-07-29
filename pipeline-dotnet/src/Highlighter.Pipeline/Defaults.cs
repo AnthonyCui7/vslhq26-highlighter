@@ -15,6 +15,9 @@ public static class Defaults
     public const int DEFAULT_LLM_CONTEXT_SECONDS = 10;
     public const double DEFAULT_CLIP_MERGE_GAP_SECONDS = 1.0;
     public const double DEFAULT_MAX_CLIP_SECONDS = 120;
+    // Auto-reframe frame sampling: one frame every this many seconds, plus one
+    // just after each scene cut (0 disables the periodic frames).
+    public const double DEFAULT_REFRAME_FRAME_INTERVAL_SECONDS = 5.0;
     // Shot-boundary detection (TransNetV2) and cut-aligned boundary snapping.
     public const int DEFAULT_SHOT_FPS = 25;
     public const double DEFAULT_SHOT_SNAP_TOLERANCE_SECONDS = 1.5;
@@ -25,6 +28,12 @@ public static class Defaults
     public const double DEFAULT_LONGFORM_MAX_CLIP_SECONDS = 900;
     public const string DEFAULT_TARGET_LENGTH_MINUTES = "7-15";
     public const string DEFAULT_RESEARCH_MODEL = "anthropic/claude-sonnet-5";
+    // Azure AI integration: Azure Speech transcription runs first with Deepgram
+    // as the fallback, and the Azure OpenAI deployments sit in every model chain
+    // (see Providers.cs for the per-role order). Reasoning-capable deployments
+    // run at the highest effort their family accepts (AZURE_REASONING_EFFORT
+    // overrides).
+    public const string DEFAULT_AZURE_SPEECH_LOCALE = "en-US";
     public const string DEFAULT_OUTPUT_ROOT = "outputs";
     // Empty by default: livestream source archiving to S3 is opt-in via S3_BUCKET.
     public const string DEFAULT_S3_BUCKET = "";

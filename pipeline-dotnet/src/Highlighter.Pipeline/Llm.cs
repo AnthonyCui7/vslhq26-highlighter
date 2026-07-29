@@ -3,7 +3,7 @@ using System.Text.Json.Nodes;
 namespace Highlighter.Pipeline;
 
 /// <summary>Port of highlighter_pipeline/llm.py: the clip-scoring prompts and
-/// the OpenRouter Gemini audio call.</summary>
+/// the audio scoring call on the audio provider chain.</summary>
 public static class Llm
 {
     public const string CLIPPER_AUDIO_BITRATE = "32k";
@@ -306,7 +306,6 @@ public static class Llm
         int? visibleEndSeconds = null,
         IReadOnlyList<JsonObject>? contextWordsBefore = null,
         IReadOnlyList<JsonObject>? contextWordsAfter = null,
-        string model = Defaults.DEFAULT_OPENROUTER_MODEL,
         string reasoningEffort = Defaults.DEFAULT_LLM_REASONING_EFFORT,
         int markerSeconds = Defaults.DEFAULT_LLM_MARKER_SECONDS,
         string pipelineMode = "short",
@@ -321,27 +320,32 @@ public static class Llm
         var visibleStart = visibleStartSeconds ?? startSeconds;
         var visibleEnd = visibleEndSeconds ?? endSeconds;
 
-        var clipModel = Defaults.DEFAULT_OPENROUTER_MODEL;
-        var decision = DetectClipCandidatesOpenRouter(
-            transcript: transcript,
-            words: words,
-            chunkIndex: chunkIndex,
-            startSeconds: startSeconds,
-            endSeconds: endSeconds,
-            visibleStartSeconds: visibleStart,
-            visibleEndSeconds: visibleEnd,
-            contextWordsBefore: contextWordsBefore ?? new List<JsonObject>(),
-            contextWordsAfter: contextWordsAfter ?? new List<JsonObject>(),
-            model: clipModel,
-            reasoningEffort: reasoningEffort,
-            markerSeconds: markerSeconds,
-            pipelineMode: pipelineMode,
-            userInstructions: userInstructions,
-            targetLength: targetLength,
-            researchContext: researchContext,
-            audioContext: audioContext ?? new List<JsonObject>(),
-            sceneCuts: sceneCuts,
-            sourceMinutes: sourceMinutes);
+        var providers = Providers.AudioProviders(
+            title: "highlighter pipeline",
+            openrouterReasoningEffort: string.IsNullOrEmpty(reasoningEffort)
+                ? Defaults.DEFAULT_LLM_REASONING_EFFORT
+                : reasoningEffort);
+        var (decision, provider) = Providers.RunWithFallback(
+            providers,
+            candidateProvider => RequestClipCandidates(
+                provider: candidateProvider,
+                transcript: transcript,
+                words: words,
+                chunkIndex: chunkIndex,
+                startSeconds: startSeconds,
+                endSeconds: endSeconds,
+                visibleStartSeconds: visibleStart,
+                visibleEndSeconds: visibleEnd,
+                contextWordsBefore: contextWordsBefore ?? new List<JsonObject>(),
+                contextWordsAfter: contextWordsAfter ?? new List<JsonObject>(),
+                markerSeconds: markerSeconds,
+                pipelineMode: pipelineMode,
+                userInstructions: userInstructions,
+                targetLength: targetLength,
+                researchContext: researchContext,
+                audioContext: audioContext ?? new List<JsonObject>(),
+                sceneCuts: sceneCuts,
+                sourceMinutes: sourceMinutes));
         return NormalizeCandidates(
             decision,
             chunkIndex: chunkIndex,
@@ -349,13 +353,14 @@ public static class Llm
             chunkEndSeconds: endSeconds,
             visibleStartSeconds: visibleStart,
             visibleEndSeconds: visibleEnd,
-            model: clipModel,
+            model: provider.Model,
             reasoningEffort: string.IsNullOrEmpty(reasoningEffort)
                 ? Defaults.DEFAULT_LLM_REASONING_EFFORT
                 : reasoningEffort);
     }
 
-    private static JsonObject DetectClipCandidatesOpenRouter(
+    private static JsonObject RequestClipCandidates(
+        ChatProvider provider,
         string transcript,
         IReadOnlyList<JsonObject> words,
         int chunkIndex,
@@ -365,8 +370,6 @@ public static class Llm
         int visibleEndSeconds,
         IReadOnlyList<JsonObject> contextWordsBefore,
         IReadOnlyList<JsonObject> contextWordsAfter,
-        string model,
-        string reasoningEffort,
         int markerSeconds,
         string pipelineMode,
         string? userInstructions,
@@ -376,10 +379,6 @@ public static class Llm
         List<double>? sceneCuts,
         double? sourceMinutes)
     {
-        var apiKey = Config.Env("OPENROUTER_API_KEY");
-        if (string.IsNullOrEmpty(apiKey))
-            throw new PipelineError("OPENROUTER_API_KEY is required for Gemini audio clip scoring");
-
         var userPrompt = BuildUserPrompt(
             transcript: transcript,
             words: words,
@@ -394,6 +393,12 @@ public static class Llm
             userInstructions: userInstructions,
             researchContext: researchContext,
             sceneCuts: sceneCuts);
+        if (!provider.SupportsJsonSchema)
+        {
+            userPrompt +=
+                "\n\nReturn ONLY a JSON object matching this schema, with no markdown fences:\n"
+                + JsonUtil.Dumps(ClipResponseSchema());
+        }
         var userContent = new JsonArray
         {
             new JsonObject { ["type"] = "text", ["text"] = userPrompt },
@@ -413,7 +418,6 @@ public static class Llm
 
         var body = new JsonObject
         {
-            ["model"] = model,
             ["messages"] = new JsonArray
             {
                 new JsonObject
@@ -424,8 +428,11 @@ public static class Llm
                 },
                 new JsonObject { ["role"] = "user", ["content"] = userContent },
             },
-            ["temperature"] = 0,
-            ["response_format"] = new JsonObject
+            ["user"] = $"chunk-{chunkIndex}",
+        };
+        if (provider.SupportsJsonSchema)
+        {
+            body["response_format"] = new JsonObject
             {
                 ["type"] = "json_schema",
                 ["json_schema"] = new JsonObject
@@ -433,40 +440,28 @@ public static class Llm
                     ["name"] = "clip_candidates",
                     ["schema"] = ClipResponseSchema(),
                 },
-            },
-            ["user"] = $"chunk-{chunkIndex}",
-            ["provider"] = new JsonObject
-            {
-                ["order"] = new JsonArray(OpenRouterClient.OPENROUTER_VERTEX_PROVIDER),
-                ["allow_fallbacks"] = false,
-            },
-            ["reasoning"] = new JsonObject
-            {
-                ["effort"] = string.IsNullOrEmpty(reasoningEffort)
-                    ? Defaults.DEFAULT_LLM_REASONING_EFFORT
-                    : reasoningEffort,
-            },
-        };
+            };
+        }
+        provider.ApplyRequestOptions(body);
 
         JsonObject response;
         try
         {
-            using var client = new OpenRouterClient(
-                apiKey, timeoutSeconds: 240.0, title: "highlighter pipeline");
+            using var client = provider.Client(timeoutSeconds: 240.0);
             response = client.ChatCompletions(body);
         }
-        catch (OpenRouterStatusException exc)
+        catch (ChatCompletionsStatusException exc)
         {
             var text = exc.ResponseText;
             throw new PipelineError(
-                $"OpenRouter Gemini request failed: {text[..Math.Min(4000, text.Length)]}", exc);
+                $"{provider.Label} request failed: {text[..Math.Min(4000, text.Length)]}", exc);
         }
 
         if (response["choices"] is not JsonArray choices || choices.Count == 0)
-            throw new PipelineError("OpenRouter Gemini response did not include choices");
+            throw new PipelineError($"{provider.Label} response did not include choices");
         var content = JsonUtil.StrOrNull(choices[0]?["message"]?["content"]);
         if (string.IsNullOrEmpty(content))
-            throw new PipelineError("OpenRouter Gemini response did not include text content");
+            throw new PipelineError($"{provider.Label} response did not include text content");
         return JsonFromText(content);
     }
 

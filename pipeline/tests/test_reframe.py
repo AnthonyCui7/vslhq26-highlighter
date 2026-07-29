@@ -135,12 +135,21 @@ def test_crop_expression_clamps_positions_into_frame():
     assert expression == "if(lt(t,5),0,560)"  # 560 = 1280 - 720
 
 
-def test_sample_times_opener_only_without_cuts():
-    assert _sample_times(58.0, []) == [0.2]
+def test_sample_times_opener_only_when_periodic_disabled():
+    assert _sample_times(58.0, [], frame_interval_seconds=0) == [0.2]
 
 
-def test_sample_times_one_frame_after_each_cut_capped():
-    cuts = [float(cut) for cut in range(2, 40, 2)]
+def test_sample_times_periodic_frames_by_default():
+    assert _sample_times(18.0, []) == [0.2, 5.0, 10.0, 15.0]
+
+
+def test_sample_times_periodic_skips_frames_next_to_a_cut_frame():
+    # The cut frame at 6.3 shadows the periodic frame at 5.0.
+    assert _sample_times(18.0, [6.0]) == [0.2, 6.3, 10.0, 15.0]
+
+
+def test_sample_times_capped_with_opener_kept():
+    cuts = [float(cut) for cut in range(2, 60, 2)]
     times = _sample_times(60.0, cuts)
     assert len(times) == MAX_SAMPLE_FRAMES
     assert times[0] == 0.2

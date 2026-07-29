@@ -10,6 +10,9 @@ DEFAULT_LLM_CONCURRENCY = 8
 DEFAULT_LLM_CONTEXT_SECONDS = 10
 DEFAULT_CLIP_MERGE_GAP_SECONDS = 1.0
 DEFAULT_MAX_CLIP_SECONDS = 120
+# Auto-reframe frame sampling: one frame every this many seconds, plus one
+# just after each scene cut (0 disables the periodic frames).
+DEFAULT_REFRAME_FRAME_INTERVAL_SECONDS = 5.0
 # Shot-boundary detection (TransNetV2) and cut-aligned boundary snapping.
 DEFAULT_SHOT_FPS = 25
 DEFAULT_SHOT_SNAP_TOLERANCE_SECONDS = 1.5
@@ -20,6 +23,12 @@ DEFAULT_LONGFORM_MERGE_GAP_SECONDS = 1.0
 DEFAULT_LONGFORM_MAX_CLIP_SECONDS = 900
 DEFAULT_TARGET_LENGTH_MINUTES = "7-15"
 DEFAULT_RESEARCH_MODEL = "anthropic/claude-sonnet-5"
+# Azure AI integration: Azure Speech transcription runs first with Deepgram
+# as the fallback, and the Azure OpenAI deployments sit in every model chain
+# (see providers.py for the per-role order). Reasoning-capable deployments
+# run at the highest effort their family accepts (AZURE_REASONING_EFFORT
+# overrides).
+DEFAULT_AZURE_SPEECH_LOCALE = "en-US"
 DEFAULT_OUTPUT_ROOT = "outputs"
 # Empty by default: livestream source archiving to S3 is opt-in via S3_BUCKET.
 DEFAULT_S3_BUCKET = ""

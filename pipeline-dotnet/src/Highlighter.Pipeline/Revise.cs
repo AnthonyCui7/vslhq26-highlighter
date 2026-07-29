@@ -320,34 +320,73 @@ public static class Revise
             .ToList();
     }
 
-    /// <summary>Run the tool loop until apply_edit lands. Returns (edit, toolsUsed);
-    /// throws when the agent cannot produce a valid edit.</summary>
+    /// <summary>Run the tool loop until apply_edit lands, trying each provider in
+    /// the audio chain with a fresh loop (histories do not survive a provider
+    /// swap). Returns (edit, toolsUsed); throws when no provider produced a
+    /// valid edit.</summary>
     public static (JsonObject Edit, List<string> ToolsUsed) RunAgent(
         ReviseState state,
         ProjectRecords records,
         string request,
-        string model = Defaults.DEFAULT_OPENROUTER_MODEL,
         string reasoningEffort = Defaults.DEFAULT_LLM_REASONING_EFFORT)
     {
-        var apiKey = Config.Env("OPENROUTER_API_KEY");
-        if (string.IsNullOrEmpty(apiKey))
-            throw new PipelineError("OPENROUTER_API_KEY is required for the revision loop");
+        var providers = Providers.AudioProviders(
+            title: "highlighter revise",
+            openrouterReasoningEffort: string.IsNullOrEmpty(reasoningEffort)
+                ? Defaults.DEFAULT_LLM_REASONING_EFFORT
+                : reasoningEffort);
+        Exception lastError = new PipelineError("No revision provider is configured");
+        for (var index = 0; index < providers.Count; index++)
+        {
+            try
+            {
+                return RunAgentAttempt(
+                    provider: providers[index], state: state, records: records, request: request);
+            }
+            catch (Exception exc)
+            {
+                lastError = exc;
+                if (index + 1 < providers.Count)
+                {
+                    Console.WriteLine(
+                        $"{providers[index].Label} revision attempt failed; retrying with "
+                        + $"{providers[index + 1].Label}: {exc.Message}");
+                }
+            }
+        }
+        throw lastError;
+    }
 
+    private static (JsonObject Edit, List<string> ToolsUsed) RunAgentAttempt(
+        ChatProvider provider, ReviseState state, ProjectRecords records, string request)
+    {
         var messages = new JsonArray
         {
             new JsonObject { ["role"] = "system", ["content"] = REVISE_SYSTEM_PROMPT },
             new JsonObject { ["role"] = "user", ["content"] = OpeningMessage(state, request) },
         };
+        if (provider.Name == "azure")
+        {
+            // The gpt-audio deployments reject any request whose input contains no
+            // audio at all, and the opening turns have none until listen_audio
+            // runs; seed the conversation with the source's first minute so every
+            // turn carries audio.
+            var orientation = OrientationAudioParts(state);
+            if (orientation.Count > 0)
+            {
+                var orientationContent = new JsonArray();
+                foreach (var part in orientation) orientationContent.Add(part);
+                messages.Add(new JsonObject { ["role"] = "user", ["content"] = orientationContent });
+            }
+        }
         var toolsUsed = new List<string>();
 
-        using var client = new OpenRouterClient(
-            apiKey, timeoutSeconds: 300.0, title: "highlighter revise");
+        using var client = provider.Client(timeoutSeconds: 300.0);
         for (var turn = 0; turn < MAX_AGENT_TURNS; turn++)
         {
             var forcing = turn >= MAX_AGENT_TURNS - 2;
             var body = new JsonObject
             {
-                ["model"] = model,
                 ["messages"] = (JsonArray)messages.DeepClone(),
                 ["tools"] = Tools(),
                 // The last turns force the commit; a named tool_choice is
@@ -359,19 +398,8 @@ public static class Revise
                         ["function"] = new JsonObject { ["name"] = "apply_edit" },
                     }
                     : "auto",
-                ["temperature"] = 0,
-                ["provider"] = new JsonObject
-                {
-                    ["order"] = new JsonArray(OpenRouterClient.OPENROUTER_VERTEX_PROVIDER),
-                    ["allow_fallbacks"] = false,
-                },
-                ["reasoning"] = new JsonObject
-                {
-                    ["effort"] = string.IsNullOrEmpty(reasoningEffort)
-                        ? Defaults.DEFAULT_LLM_REASONING_EFFORT
-                        : reasoningEffort,
-                },
             };
+            provider.ApplyRequestOptions(body);
             var response = client.ChatCompletions(body);
             if (response["choices"] is not JsonArray choices || choices.Count == 0)
                 throw new PipelineError("Revision agent response did not include choices");
@@ -467,6 +495,61 @@ public static class Revise
 
         throw new PipelineError(
             $"The revision agent did not produce a valid edit within {MAX_AGENT_TURNS} turns");
+    }
+
+    /// <summary>The source's opening minute as input_audio content parts; empty
+    /// when the chunk audio is missing (the Azure attempt then fails over to the
+    /// next provider on its first request).</summary>
+    private static List<JsonObject> OrientationAudioParts(ReviseState state)
+    {
+        try
+        {
+            if (state.Chunks.Count == 0) return new List<JsonObject>();
+            var chunk = state.Chunks[0];
+            var audioPath = ResolveMediaPath(
+                JsonUtil.StrOrNull((chunk["metadata"] as JsonObject)?["audio_path"]),
+                state.ProjectDir,
+                "audio");
+            if (audioPath is null) return new List<JsonObject>();
+            var chunkStart = JsonUtil.Double(chunk["start_seconds"]);
+            var chunkEnd = JsonUtil.Double(chunk["end_seconds"]);
+            var end = Math.Min(chunkStart + 60.0, chunkEnd);
+            var mp3 = Llm.EncodeAudioContextMp3(
+                audioContext: new List<JsonObject>
+                {
+                    new()
+                    {
+                        ["path"] = audioPath,
+                        ["start_seconds"] = chunkStart,
+                        ["end_seconds"] = chunkEnd,
+                    },
+                },
+                visibleStartSeconds: chunkStart,
+                visibleEndSeconds: end);
+            return new List<JsonObject>
+            {
+                new()
+                {
+                    ["type"] = "text",
+                    ["text"] = $"Source audio {Py.F(chunkStart, 0)}s-{Py.F(end, 0)}s for "
+                        + "orientation; use listen_audio for the windows you need.",
+                },
+                new()
+                {
+                    ["type"] = "input_audio",
+                    ["input_audio"] = new JsonObject
+                    {
+                        ["data"] = Convert.ToBase64String(mp3),
+                        ["format"] = "mp3",
+                    },
+                },
+            };
+        }
+        catch (Exception exc)
+        {
+            Console.WriteLine($"Orientation audio unavailable (continuing): {exc.Message}");
+            return new List<JsonObject>();
+        }
     }
 
     private static string OpeningMessage(ReviseState state, string request)

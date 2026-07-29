@@ -178,15 +178,34 @@ public class ReframeTests
     }
 
     [Fact]
-    public void SampleTimesOpenerOnlyWithoutCuts()
+    public void SampleTimesOpenerOnlyWhenPeriodicDisabled()
     {
-        Assert.Equal(new List<double> { 0.2 }, Reframe.SampleTimes(58.0, new List<double>()));
+        Assert.Equal(
+            new List<double> { 0.2 },
+            Reframe.SampleTimes(58.0, new List<double>(), frameIntervalSeconds: 0));
     }
 
     [Fact]
-    public void SampleTimesOneFrameAfterEachCutCapped()
+    public void SampleTimesPeriodicFramesByDefault()
     {
-        var cuts = Enumerable.Range(0, 19).Select(i => (double)(2 + i * 2)).ToList();
+        Assert.Equal(
+            new List<double> { 0.2, 5.0, 10.0, 15.0 },
+            Reframe.SampleTimes(18.0, new List<double>()));
+    }
+
+    [Fact]
+    public void SampleTimesPeriodicSkipsFramesNextToACutFrame()
+    {
+        // The cut frame at 6.3 shadows the periodic frame at 5.0.
+        Assert.Equal(
+            new List<double> { 0.2, 6.3, 10.0, 15.0 },
+            Reframe.SampleTimes(18.0, new List<double> { 6.0 }));
+    }
+
+    [Fact]
+    public void SampleTimesCappedWithOpenerKept()
+    {
+        var cuts = Enumerable.Range(0, 29).Select(i => (double)(2 + i * 2)).ToList();
         var times = Reframe.SampleTimes(60.0, cuts);
         Assert.Equal(Reframe.MAX_SAMPLE_FRAMES, times.Count);
         Assert.Equal(0.2, times[0]);

@@ -37,7 +37,6 @@ public static class Ingest
         var streamlinkQuality = args.StreamlinkQuality;
         var deepgramModel = args.DeepgramModel;
         var llmEnabled = !args.NoLlm && !TruthyEnv("NO_LLM");
-        var llmModel = Defaults.DEFAULT_OPENROUTER_MODEL;
         var llmReasoningEffort = args.LlmReasoningEffort;
         var llmMarkerSeconds = args.LlmMarkerSeconds;
         var llmConcurrency = args.LlmConcurrency;
@@ -55,6 +54,7 @@ public static class Ingest
             && pipelineMode == "short"
             && !args.NoReframe
             && !TruthyEnv("NO_REFRAME");
+        var reframeInterval = args.ReframeInterval;
         var clipsBucket = Config.Env("SUPABASE_CLIPS_BUCKET", Defaults.DEFAULT_SUPABASE_CLIPS_BUCKET);
         var outputRoot = args.OutputRoot
             ?? Config.Env("OUTPUT_ROOT", Defaults.DEFAULT_OUTPUT_ROOT);
@@ -91,6 +91,8 @@ public static class Ingest
         }
         if (args.SourceType is not ("auto" or "livestream" or "video"))
             throw new PipelineError("SOURCE_TYPE must be one of: auto, livestream, video");
+        if (reframeInterval < 0)
+            throw new PipelineError("REFRAME_INTERVAL must be 0 or greater");
         if (minClipScore is double score && !(0 <= score && score <= 1))
             throw new PipelineError("MIN_CLIP_SCORE must be between 0 and 1");
         if (args.ProjectId is not null && localOnly)
@@ -198,6 +200,17 @@ public static class Ingest
                         $"Source runs ~{Py.F(sourceMinutes.Value, 0)} min; calibrating selectivity to it.");
             }
 
+            // Resolve the scoring model chain up front so a missing configuration
+            // fails before capture and the run records what actually scores it.
+            var llmProviders = llmEnabled
+                ? Providers.AudioProviders(
+                    title: "highlighter pipeline",
+                    openrouterReasoningEffort: llmReasoningEffort)
+                : null;
+            var scoringBackend = llmProviders is not null
+                ? Providers.ChainLabel(llmProviders)
+                : null;
+
             ingestSettings = new JsonObject
             {
                 ["pipeline"] = pipelineMode,
@@ -206,6 +219,7 @@ public static class Ingest
                 ["chunk_seconds"] = chunkSeconds,
                 ["max_chunks"] = maxChunks,
                 ["streamlink_quality"] = streamlinkQuality,
+                ["transcription_backend"] = Transcribe.TranscriptionBackendLabel(),
                 ["deepgram_model"] = deepgramModel,
                 ["min_clip_score"] = minClipScore,
                 ["source_minutes"] = sourceMinutes,
@@ -218,6 +232,7 @@ public static class Ingest
                 {
                     ["enabled"] = reframeEnabled,
                     ["style"] = reframeEnabled ? "blurpad-square" : null,
+                    ["frame_interval_seconds"] = reframeEnabled ? reframeInterval : (double?)null,
                 },
                 ["clip_stitching"] = new JsonObject
                 {
@@ -227,8 +242,8 @@ public static class Ingest
                 ["llm"] = new JsonObject
                 {
                     ["enabled"] = llmEnabled,
-                    ["backend"] = "openrouter-gemini-audio",
-                    ["model"] = llmModel,
+                    ["backend"] = scoringBackend,
+                    ["model"] = llmProviders is not null ? llmProviders[0].Model : null,
                     ["reasoning_effort"] = llmReasoningEffort,
                     ["marker_seconds"] = llmMarkerSeconds,
                     ["concurrency"] = llmConcurrency,
@@ -237,7 +252,7 @@ public static class Ingest
                 ["research"] = new JsonObject
                 {
                     ["enabled"] = researchEnabled,
-                    ["backend"] = researchEnabled ? "openrouter-web-search" : null,
+                    ["backend"] = researchEnabled ? Research.ResearchBackendLabel() : null,
                 },
                 ["clips"] = new JsonObject
                 {
@@ -409,7 +424,8 @@ public static class Ingest
 
             if (researchEnabled)
             {
-                Console.WriteLine("Researching content context (single web-grounded agent)");
+                Console.WriteLine(
+                    $"Researching content context ({Research.ResearchBackendLabel()})");
                 try
                 {
                     contentResearchContext = Research.ResearchContentContext(
@@ -552,6 +568,7 @@ public static class Ingest
                     firstSegmentStartSeconds: needed[0] * (double)chunkSeconds,
                     renderedLog: renderedLog,
                     reframeEnabled: reframeEnabled,
+                    reframeInterval: reframeInterval,
                     sceneCuts: reframeEnabled
                         ? CutsNearWindowLocked(
                             JsonUtil.Double(decision["start_seconds"]),
@@ -637,8 +654,6 @@ public static class Ingest
                 }
             }
 
-            var scoringBackend = $"OpenRouter BYOK Gemini audio ({llmModel})";
-
             (List<JsonObject>, string) ScoreChunk(
                 JsonObject chunk,
                 List<JsonObject> contextBefore,
@@ -676,7 +691,6 @@ public static class Ingest
                     visibleEndSeconds: visibleEnd,
                     contextWordsBefore: contextBefore,
                     contextWordsAfter: contextAfter,
-                    model: llmModel,
                     reasoningEffort: llmReasoningEffort,
                     markerSeconds: llmMarkerSeconds,
                     pipelineMode: pipelineMode,
@@ -798,7 +812,7 @@ public static class Ingest
                 + (maxChunks > 0 ? $" ({maxChunks} chunk max)" : "")
                 + $" for a {pipelineMode}-form edit"
                 + (llmEnabled
-                    ? $"; scoring clips via OpenRouter BYOK Gemini audio ({llmModel})"
+                    ? $"; scoring clips via {scoringBackend}"
                     : "; LLM scoring disabled")
                 + (storage is not null
                     ? $"; archiving source to s3://{storage.Bucket}/{archivePrefix}"
@@ -1405,7 +1419,7 @@ public static class Ingest
         List<double>? sceneCuts = null)
     {
         Console.WriteLine($"Transcribing chunk {chunkIndex} ({startSeconds}s-{endSeconds}s)");
-        var transcript = Deepgram.TranscribeAudioFile(audioPath, model: deepgramModel);
+        var transcript = Transcribe.TranscribeAudioFile(audioPath, model: deepgramModel);
         var words = new JsonArray();
         foreach (var word in JsonUtil.Objects(transcript["words"]))
             words.Add(WithAbsoluteTimes(word, startSeconds));
@@ -1413,8 +1427,8 @@ public static class Ingest
         var metadata = new JsonObject
         {
             ["audio_path"] = Path.GetRelativePath(Directory.GetCurrentDirectory(), audioPath),
-            ["deepgram_request_id"] = JsonUtil.C(transcriptMetadata["request_id"]),
-            ["deepgram"] = JsonUtil.CloneObj(transcriptMetadata),
+            ["transcription_backend"] = JsonUtil.C(transcript["backend"]),
+            ["transcription"] = JsonUtil.CloneObj(transcriptMetadata),
         };
         if (sceneCuts is not null)
             metadata["scene_cuts"] = JsonUtil.Arr(sceneCuts.Select(cut => (JsonNode?)cut));
@@ -1508,6 +1522,7 @@ public static class Ingest
         double firstSegmentStartSeconds,
         List<JsonObject> renderedLog,
         bool reframeEnabled = false,
+        double reframeInterval = Defaults.DEFAULT_REFRAME_FRAME_INTERVAL_SECONDS,
         List<double>? sceneCuts = null,
         JsonObject? researchContext = null)
     {
@@ -1541,7 +1556,8 @@ public static class Ingest
                     clipPath: outputPath,
                     decision: decision,
                     sceneCuts: sceneCuts,
-                    researchContext: researchContext);
+                    researchContext: researchContext,
+                    frameIntervalSeconds: reframeInterval);
                 if (reframed is not null)
                 {
                     var (path, cropTrack) = reframed.Value;
@@ -1627,7 +1643,8 @@ public static class Ingest
         string clipPath,
         JsonObject decision,
         List<double>? sceneCuts,
-        JsonObject? researchContext)
+        JsonObject? researchContext,
+        double frameIntervalSeconds = Defaults.DEFAULT_REFRAME_FRAME_INTERVAL_SECONDS)
     {
         try
         {
@@ -1644,7 +1661,8 @@ public static class Ingest
                 sceneCuts: relativeCuts,
                 title: JsonUtil.Str(decision["title"]),
                 description: JsonUtil.Str(decision["description"]),
-                researchContext: researchContext);
+                researchContext: researchContext,
+                frameIntervalSeconds: frameIntervalSeconds);
             var verticalPath = Path.Combine(
                 Path.GetDirectoryName(clipPath)!,
                 $"{Path.GetFileNameWithoutExtension(clipPath)}_vertical.mp4");

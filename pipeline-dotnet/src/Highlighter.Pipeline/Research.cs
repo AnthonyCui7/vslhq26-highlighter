@@ -4,13 +4,14 @@ namespace Highlighter.Pipeline;
 
 /// <summary>Port of highlighter_pipeline/research.py.
 ///
-/// Content research layer: one web-grounded LLM agent.
+/// Content research layer: one research call per run.
 ///
-/// A single Claude Sonnet 5 call through OpenRouter with the web-search plugin
-/// builds editorial context before clipping starts: target audience, content genre
-/// and current trends, successful clip formats and thumbnails, and the creator's
-/// background. The structured, source-cited result feeds the clip-selection model
-/// as researchContext (Llm threads it into the scoring prompt).</summary>
+/// The Azure OpenAI editor deployment takes the first attempt when configured;
+/// otherwise (or on any failure) the call runs as a single web-grounded Claude
+/// Sonnet 5 request through OpenRouter's web-search plugin. Either way the
+/// result is the same structured, source-cited editorial context that feeds
+/// the clip-selection model as researchContext (Llm threads it into the
+/// scoring prompt).</summary>
 public static class Research
 {
     private const string CONTENT_RESEARCH_SCHEMA_JSON =
@@ -92,7 +93,15 @@ public static class Research
           no commentary before or after.
         """;
 
-    /// <summary>Run one web-grounded research call and return an object matching
+    public static string ResearchBackendLabel()
+    {
+        var provider = Providers.AzureEditorProvider();
+        return provider is not null
+            ? $"{provider.Label} (fallback: web-grounded {Defaults.DEFAULT_RESEARCH_MODEL})"
+            : $"web-grounded {Defaults.DEFAULT_RESEARCH_MODEL}";
+    }
+
+    /// <summary>Run the research call and return an object matching
     /// CONTENT_RESEARCH_SCHEMA. Throws on failure; callers treat research as
     /// best-effort and continue without it.</summary>
     public static JsonObject ResearchContentContext(
@@ -101,10 +110,30 @@ public static class Research
         string? userInstructions = null,
         string model = Defaults.DEFAULT_RESEARCH_MODEL)
     {
-        var apiKey = Config.Env("OPENROUTER_API_KEY");
-        if (string.IsNullOrEmpty(apiKey))
-            throw new PipelineError("OPENROUTER_API_KEY is required for content research");
+        var prompt = ResearchPrompt(
+            sourceContext: sourceContext,
+            pipelineMode: pipelineMode,
+            userInstructions: userInstructions);
+        var provider = Providers.AzureEditorProvider();
+        if (provider is not null)
+        {
+            try
+            {
+                return RequestAzureResearch(provider, prompt);
+            }
+            catch (Exception exc)
+            {
+                Console.WriteLine(
+                    $"{provider.Label} research failed; falling back to "
+                    + $"web-grounded {model}: {exc.Message}");
+            }
+        }
+        return WebGroundedResearch(prompt, model);
+    }
 
+    private static string ResearchPrompt(
+        JsonObject sourceContext, string pipelineMode, string? userInstructions)
+    {
         var goal = pipelineMode == "short"
             ? "The editor is cutting short-form vertical clips (TikTok/Reels/Shorts/X) from this source."
             : "The editor is cutting one long-form edit (a YouTube-ready video) from this source.";
@@ -130,6 +159,51 @@ public static class Research
             "Return only a JSON object matching this schema:",
             JsonUtil.DumpsIndented(ContentResearchSchema()),
         });
+        return string.Join("\n", promptParts);
+    }
+
+    private static JsonObject RequestAzureResearch(ChatProvider provider, string prompt)
+    {
+        var body = new JsonObject
+        {
+            ["messages"] = new JsonArray
+            {
+                new JsonObject { ["role"] = "system", ["content"] = RESEARCH_SYSTEM_PROMPT },
+                new JsonObject { ["role"] = "user", ["content"] = prompt },
+            },
+            ["response_format"] = new JsonObject
+            {
+                ["type"] = "json_schema",
+                ["json_schema"] = new JsonObject
+                {
+                    ["name"] = "content_research",
+                    ["schema"] = ContentResearchSchema(),
+                },
+            },
+        };
+        provider.ApplyRequestOptions(body);
+
+        JsonObject response;
+        using (var client = provider.Client(timeoutSeconds: 300.0))
+        {
+            response = client.ChatCompletions(body);
+        }
+        var content = response["choices"] is JsonArray choices && choices.Count > 0
+            ? JsonUtil.StrOrNull(choices[0]?["message"]?["content"])
+            : null;
+        if (string.IsNullOrEmpty(content))
+            throw new PipelineError($"{provider.Label} research response did not include content");
+        var context = JsonFromText(content) as JsonObject
+            ?? throw new PipelineError($"{provider.Label} research response was not a JSON object");
+        if (!context.ContainsKey("sources")) context["sources"] = new JsonArray();
+        return context;
+    }
+
+    private static JsonObject WebGroundedResearch(string prompt, string model)
+    {
+        var apiKey = Config.Env("OPENROUTER_API_KEY");
+        if (string.IsNullOrEmpty(apiKey))
+            throw new PipelineError("OPENROUTER_API_KEY is required for content research");
 
         var body = new JsonObject
         {
@@ -137,7 +211,7 @@ public static class Research
             ["messages"] = new JsonArray
             {
                 new JsonObject { ["role"] = "system", ["content"] = RESEARCH_SYSTEM_PROMPT },
-                new JsonObject { ["role"] = "user", ["content"] = string.Join("\n", promptParts) },
+                new JsonObject { ["role"] = "user", ["content"] = prompt },
             },
             ["temperature"] = 0.3,
             ["max_tokens"] = 8000,
@@ -148,8 +222,15 @@ public static class Research
         };
 
         JsonObject response;
-        using (var client = new OpenRouterClient(
-                   apiKey, timeoutSeconds: 300.0, title: "highlighter research"))
+        using (var client = new ChatCompletionsClient(
+                   Providers.OPENROUTER_BASE_URL,
+                   apiKey,
+                   timeoutSeconds: 300.0,
+                   headers: new Dictionary<string, string>
+                   {
+                       ["HTTP-Referer"] = "http://localhost",
+                       ["X-OpenRouter-Title"] = "highlighter research",
+                   }))
         {
             response = client.ChatCompletions(body);
         }
@@ -174,7 +255,7 @@ public static class Research
             stripped = stripped.Trim('`').Trim();
             if (stripped.StartsWith("json")) stripped = stripped[4..].Trim();
         }
-        // Web-plugin responses sometimes lead with prose despite instructions;
+        // Web-grounded responses sometimes lead with prose despite instructions;
         // fall back to the outermost JSON object.
         try
         {

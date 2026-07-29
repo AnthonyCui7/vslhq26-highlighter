@@ -16,9 +16,10 @@ tests/Highlighter.Pipeline.Tests/  xUnit ports of all pipeline/tests/ suites
 ```
 
 External dependencies stay identical to the Python pipeline: `ffmpeg`/`ffprobe`,
-`yt-dlp`, `streamlink` on PATH; Deepgram, OpenRouter, Supabase, and optionally S3
-via the same env vars (the monorepo root `.env` is discovered by walking up from
-the working directory, exactly like the Python `load_env`).
+`yt-dlp`, `streamlink` on PATH; Azure AI Speech (Deepgram fallback), the Azure
+OpenAI deployments and OpenRouter in the same per-role chains, Supabase, and
+optionally S3 via the same env vars (the monorepo root `.env` is discovered by
+walking up from the working directory, exactly like the Python `load_env`).
 
 ## Build & run
 

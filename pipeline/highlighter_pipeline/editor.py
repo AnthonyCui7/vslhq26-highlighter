@@ -11,19 +11,14 @@ stitching every pass-1 selection, so pass 2 can only improve a run.
 """
 
 import json
-import os
 from typing import Any
 
 from .defaults import (
     DEFAULT_LLM_REASONING_EFFORT,
-    DEFAULT_OPENROUTER_MODEL,
     DEFAULT_TARGET_LENGTH_MINUTES,
 )
-from .llm import (
-    OPENROUTER_BASE_URL,
-    OPENROUTER_VERTEX_PROVIDER,
-    parse_target_minutes,
-)
+from .llm import parse_target_minutes
+from .providers import Provider, editor_providers, run_with_fallback
 
 # Above this, the weakest candidates are dropped from the prompt: a model
 # wading through hundreds of mediocre candidates anchors worse than one
@@ -115,22 +110,12 @@ def select_longform_segments(
     target_length: str | None,
     research_context: dict[str, Any] | None = None,
     user_instructions: str | None = None,
-    model: str = DEFAULT_OPENROUTER_MODEL,
     reasoning_effort: str = DEFAULT_LLM_REASONING_EFFORT,
 ) -> dict[str, Any]:
     """Run the global editor call over pass-1 candidates (chronologically
     sorted dicts with start_seconds/end_seconds/title/description/score/
     reason). Returns {selections, edit_notes, arithmetic, model, ...}; raises
     on failure — the caller falls back to stitching every candidate."""
-    try:
-        from openai import OpenAI
-    except ImportError as exc:
-        raise RuntimeError("The long-form editor requires the 'openai' package") from exc
-
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENROUTER_API_KEY is required for the long-form editor")
-
     indexed_candidates, dropped_from_prompt = _cap_candidates(candidates)
     if dropped_from_prompt:
         print(
@@ -143,58 +128,50 @@ def select_longform_segments(
         target_length=target_length,
     )
 
-    with OpenAI(
-        base_url=OPENROUTER_BASE_URL,
-        api_key=api_key,
-        timeout=300.0,
-        default_headers={
-            "HTTP-Referer": "http://localhost",
-            "X-OpenRouter-Title": "highlighter editor",
-        },
-    ) as client:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": EDITOR_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": _build_user_prompt(
-                        indexed_candidates,
-                        arithmetic=arithmetic,
-                        research_context=research_context,
-                        user_instructions=user_instructions,
-                    ),
-                },
-            ],
-            temperature=0,
-            response_format={
-                "type": "json_schema",
-                "json_schema": {"name": "longform_edit", "schema": EDIT_RESPONSE_SCHEMA},
-            },
-            extra_body={
-                "provider": {
-                    "order": [OPENROUTER_VERTEX_PROVIDER],
-                    "allow_fallbacks": False,
-                },
-                "reasoning": {"effort": reasoning_effort or DEFAULT_LLM_REASONING_EFFORT},
-            },
-        )
-
-    if not response.choices:
-        raise RuntimeError("Long-form editor response did not include choices")
-    content = response.choices[0].message.content
-    if not content:
-        raise RuntimeError("Long-form editor response did not include text content")
-    decision = _json_from_text(content)
+    user_prompt = _build_user_prompt(
+        indexed_candidates,
+        arithmetic=arithmetic,
+        research_context=research_context,
+        user_instructions=user_instructions,
+    )
+    providers = editor_providers(
+        title="highlighter editor",
+        openrouter_reasoning_effort=reasoning_effort or DEFAULT_LLM_REASONING_EFFORT,
+    )
+    decision, provider = run_with_fallback(
+        providers, lambda candidate_provider: _request_edit(candidate_provider, user_prompt)
+    )
 
     return {
         "selections": _validate_selections(decision, candidates, dict(indexed_candidates)),
         "edit_notes": str(decision.get("edit_notes") or ""),
         "arithmetic": arithmetic,
-        "model": model,
+        "model": provider.model,
         "candidates_considered": len(indexed_candidates),
         "candidates_dropped_from_prompt": dropped_from_prompt,
     }
+
+
+def _request_edit(provider: Provider, user_prompt: str) -> dict[str, Any]:
+    with provider.client(timeout=300.0) as client:
+        response = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": EDITOR_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "longform_edit", "schema": EDIT_RESPONSE_SCHEMA},
+            },
+            **provider.request_kwargs(),
+        )
+
+    if not response.choices:
+        raise RuntimeError(f"{provider.label} editor response did not include choices")
+    content = response.choices[0].message.content
+    if not content:
+        raise RuntimeError(f"{provider.label} editor response did not include text content")
+    return _json_from_text(content)
 
 
 def _cap_candidates(
