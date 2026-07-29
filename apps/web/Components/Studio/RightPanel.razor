@@ -1,0 +1,53 @@
+@inherits StudioComponent
+
+<div class="anim-fade-up flex min-h-0 w-[288px] shrink-0 flex-col border-l border-line bg-panel" style="animation-delay:120ms">
+    <div class="flex gap-0.5 border-b border-line px-2.5 py-2">
+        @foreach (var (key, label) in new[] { ("inspector", "Inspector"), ("agent", "Agent") })
+        {
+            <div @onclick="() => S.SetPanel(key)" class="flex-1 cursor-pointer rounded py-[5px] text-center text-xs font-semibold hover:text-fg @(S.Panel == key ? "bg-well text-fg" : "bg-transparent text-muted")">@label</div>
+        }
+    </div>
+
+    @if (S.Panel == "inspector")
+    {
+        <div class="anim-fade-up flex flex-1 flex-col overflow-y-auto px-4 py-3.5">
+            <div class="pb-2.5 font-mono text-[9.5px] tracking-[0.1em] text-faint">CUT · SETUP (V1)</div>
+            @foreach (var sl in SampleData.InspectorSliders)
+            {
+                <div class="pb-4">
+                    <div class="mb-[7px] flex justify-between text-xs"><span class="font-semibold text-soft">@sl.Label</span><span class="font-mono text-[11px] text-muted">@sl.Val</span></div>
+                    <div class="relative h-[3px] rounded-[2px] bg-well">
+                        <div class="absolute bottom-0 left-0 top-0" style="width:@sl.Pct; background:@sl.Fill"></div>
+                        <div class="absolute -top-1 h-[11px] w-[11px] -translate-x-[5px] rounded-full bg-fg" style="left:@sl.Pct"></div>
+                    </div>
+                </div>
+            }
+            <div class="flex flex-col gap-3 border-t border-line pt-3.5">
+                <div class="flex items-center justify-between text-xs"><span class="font-semibold text-soft">Reframe</span><span class="flex overflow-hidden rounded border border-line2"><span class="cursor-pointer bg-well px-[9px] py-[3px] font-semibold text-fg">Auto</span><span class="cursor-pointer border-l border-line2 px-[9px] py-[3px] text-muted hover:text-fg">Manual</span></span></div>
+                <div class="flex items-center justify-between text-xs"><span class="font-semibold text-soft">Snap to source cuts</span><span class="relative h-[17px] w-[30px] cursor-pointer rounded-[9px] bg-accent"><span class="absolute right-0.5 top-0.5 h-[13px] w-[13px] rounded-full bg-ink"></span></span></div>
+                <div class="flex items-center justify-between text-xs"><span class="font-semibold text-soft">Loudness normalize</span><span class="font-mono text-[11px] text-muted">−14 LUFS</span></div>
+            </div>
+        </div>
+    }
+
+    @if (S.Panel == "agent")
+    {
+        <div class="flex flex-1 flex-col gap-2.5 overflow-y-auto p-3">
+            <div class="anim-fade-up rounded-[7px] border border-well bg-card2 px-[13px] py-[11px]">
+                <div class="mb-1.5 font-mono text-[9.5px] tracking-[0.1em] text-accent">AGENT</div>
+                <div class="text-xs leading-[1.6] text-soft">Cut from <span class="text-fg">1:22:04</span>. Strong arc: setup, reversal, payoff at 0:31. Out-point snapped to a source cut.</div>
+            </div>
+            <div class="anim-fade-up max-w-[88%] self-end rounded-[7px] bg-well px-3 py-[9px] text-xs leading-[1.55] text-fg" style="animation-delay:60ms">start it 2 seconds earlier, I want the lead-in laugh</div>
+            <div class="anim-fade-up rounded-[7px] border border-well bg-card2 px-[13px] py-[11px]" style="animation-delay:120ms">
+                <div class="mb-1.5 font-mono text-[9.5px] tracking-[0.1em] text-accent">AGENT</div>
+                <div class="text-xs leading-[1.6] text-soft">Done. In-point moved to <span class="text-fg">1:22:02.1</span>. Captions re-timed. <span class="text-muted">1 change on the timeline.</span></div>
+            </div>
+        </div>
+        <div class="anim-fade-up border-t border-line p-2.5">
+            <div class="flex items-center gap-2 rounded-[7px] border border-line2 bg-card2 p-[3px] pl-[11px]">
+                <input placeholder="Ask for a change…" class="flex-1 border-none bg-transparent py-[7px] font-sans text-xs text-fg outline-none" />
+                <span class="cursor-pointer rounded bg-accent px-[9px] py-[5px] text-[11px] font-bold text-ink hover:bg-accent-soft active:scale-90">↑</span>
+            </div>
+        </div>
+    }
+</div>

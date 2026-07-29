@@ -1,0 +1,30 @@
+@inherits StudioComponent
+
+<div class="anim-rise absolute inset-0 z-40 flex flex-col bg-[#111010]" data-screen-label="Editor">
+
+    @* Editor chrome *@
+    <div class="flex h-11 shrink-0 items-center gap-3 border-b border-line bg-bar px-3.5">
+        <div @onclick="S.CloseEditor" class="flex cursor-pointer items-center gap-[7px] rounded-[5px] px-[9px] py-[5px] text-[12.5px] text-muted hover:bg-elevate hover:text-fg">✕ <span>Close</span></div>
+        <div class="h-4 w-px bg-line2"></div>
+        <div class="text-[13px] font-semibold">@S.ActiveClipTitle</div>
+        <div class="text-[11px] text-faint">@S.ProjectTitle · autosaved</div>
+        <div class="ml-auto flex items-center gap-2">
+            <div class="flex overflow-hidden rounded-[5px] border border-line2">
+                <div class="cursor-pointer px-[9px] py-1 text-[12.5px] leading-none text-muted hover:bg-elevate hover:text-fg">↺</div>
+                <div class="cursor-pointer border-l border-line2 px-[9px] py-1 text-[12.5px] leading-none text-muted hover:bg-elevate hover:text-fg">↻</div>
+            </div>
+            <div class="cursor-pointer rounded-[5px] border border-line2 px-2.5 py-[5px] font-mono text-[11.5px] text-muted hover:text-fg">1080 × 1920 ▾</div>
+            <div class="cursor-pointer rounded-[5px] border border-line2 px-3 py-[5px] text-[12.5px] text-soft hover:border-[#4A4638] hover:text-fg active:scale-[0.98]">Export</div>
+            <div class="cursor-pointer rounded-[5px] bg-accent px-[13px] py-[5px] text-[12.5px] font-bold text-ink hover:bg-accent-soft active:scale-95">Publish</div>
+        </div>
+    </div>
+
+    @* Editor body *@
+    <div class="flex min-h-0 flex-1">
+        <MediaBin />
+        <ProgramMonitor />
+        <RightPanel />
+    </div>
+
+    <TimelinePanel />
+</div>

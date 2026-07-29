@@ -1,0 +1,44 @@
+@inherits StudioComponent
+
+<div class="anim-fade-up flex min-w-0 flex-1 flex-col bg-[#0D0C0B]" style="animation-delay:90ms">
+    <div class="flex min-h-0 flex-1 items-center justify-center p-[18px] [container-type:size]">
+        <div class="relative aspect-[9/16] h-[min(100%,177.7cqw)] overflow-hidden border border-line bg-[repeating-linear-gradient(-45deg,#191817_0_12px,#1D1B19_12px_24px)]">
+            <div class="absolute inset-0 flex items-center justify-center">
+                <span class="font-mono text-[10px] text-dim">program · 9:16</span>
+            </div>
+            <div class="absolute bottom-[12%] left-[8%] right-[8%] text-center">
+                @if (S.CapStyle == "boxed")
+                {
+                    <span class="anim-fade-up rounded-[3px] bg-ink px-[7px] py-[3px] text-[15px] font-extrabold leading-[1.55] text-fg [box-decoration-break:clone] [-webkit-box-decoration-break:clone]">nobody budgets for the <span class="text-accent">retry storm</span></span>
+                }
+                @if (S.CapStyle == "plain")
+                {
+                    <span class="anim-fade-up text-[15px] font-extrabold leading-[1.55] text-fg [text-shadow:0_1px_3px_#141312,0_0_12px_#141312]">nobody budgets for the <span class="text-accent">retry storm</span></span>
+                }
+                @if (S.CapStyle == "karaoke")
+                {
+                    <span class="anim-fade-up text-[15px] font-extrabold leading-[1.55] text-muted [text-shadow:0_1px_3px_#141312]"><span class="text-accent">nobody budgets</span> for the retry storm</span>
+                }
+            </div>
+        </div>
+    </div>
+    <div class="flex min-w-0 items-center gap-2.5 px-3.5 pb-3 pt-2">
+        <span class="min-w-0 shrink overflow-hidden font-mono text-[13px] tracking-[0.03em] text-accent">00:00:12:04</span>
+        <div class="flex min-w-0 flex-1 items-center justify-center gap-2.5">
+            <span title="Mark in" class="cursor-pointer font-mono text-[11px] text-faint hover:text-fg">⟦</span>
+            <span class="cursor-pointer text-[13px] text-muted hover:text-fg">⏮</span>
+            <span class="cursor-pointer text-[13px] text-muted hover:text-fg">◀</span>
+            <span @onclick="S.TogglePlay" class="flex h-8 w-8 cursor-pointer items-center justify-center rounded-full bg-fg text-xs text-ink hover:bg-white active:scale-90">@S.PlayIcon</span>
+            <span class="cursor-pointer text-[13px] text-muted hover:text-fg">▶</span>
+            <span class="cursor-pointer text-[13px] text-muted hover:text-fg">⏭</span>
+            <span title="Mark out" class="cursor-pointer font-mono text-[11px] text-faint hover:text-fg">⟧</span>
+        </div>
+        <div class="flex min-w-0 shrink items-center justify-end gap-2 overflow-hidden">
+            <div class="flex h-4 shrink-0 items-end gap-0.5">
+                <div class="h-full w-[3px] bg-[linear-gradient(to_top,#5E6E33_0_62%,#D9F24B_62%_78%,#242220_78%)]"></div>
+                <div class="h-full w-[3px] bg-[linear-gradient(to_top,#5E6E33_0_48%,#D9F24B_48%_60%,#242220_60%)]"></div>
+            </div>
+            <span class="whitespace-nowrap font-mono text-[11px] text-faint">00:00:42:00</span>
+        </div>
+    </div>
+</div>

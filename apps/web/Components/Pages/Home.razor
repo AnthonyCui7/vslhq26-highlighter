@@ -1,0 +1,25 @@
+@page "/"
+@rendermode InteractiveServer
+@inherits StudioComponent
+
+<PageTitle>Highlighter</PageTitle>
+
+<div class="relative flex h-screen min-h-[820px] w-full flex-col overflow-hidden bg-ink font-sans text-fg" data-screen-label="Highlighter">
+    <TopBar />
+    @if (S.IsProjects)
+    {
+        <ProjectsView />
+    }
+    @if (S.IsProject)
+    {
+        <ProjectDetailView />
+    }
+    @if (S.EditorOpen)
+    {
+        <EditorOverlay />
+    }
+    @if (S.ModalOpen)
+    {
+        <NewProjectModal />
+    }
+</div>

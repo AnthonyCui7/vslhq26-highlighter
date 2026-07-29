@@ -1,0 +1,56 @@
+@inherits StudioComponent
+
+<div @onclick="S.CloseNewJob" class="anim-fade-in absolute inset-0 z-[60] flex items-center justify-center bg-[rgba(10,9,8,0.7)]">
+    <div @onclick:stopPropagation class="anim-scale-in w-[520px] rounded-[10px] border border-line3 bg-card2 px-7 py-[26px] shadow-[0_24px_60px_rgba(0,0,0,0.5)]">
+        <div class="flex items-center justify-between">
+            <div class="text-[17px] font-bold">New project</div>
+            <span @onclick="S.CloseNewJob" class="cursor-pointer px-1.5 py-0.5 text-[15px] text-muted hover:text-fg">✕</span>
+        </div>
+        <div class="mt-5">
+            <div class="mb-[7px] text-xs font-semibold text-muted">Source</div>
+            <input placeholder="Paste a VOD or livestream URL" class="box-border w-full rounded-md border border-line3 bg-ink px-[13px] py-[11px] font-sans text-[13.5px] text-fg outline-none" />
+            <div class="mt-1.5 text-[11px] leading-[1.5] text-faint">Livestreams are edited as they run. The finished cut lands when the stream ends.</div>
+        </div>
+        <div class="mt-4">
+            <div class="mb-[7px] text-xs font-semibold text-muted">Output</div>
+            <div class="grid grid-cols-3 gap-2">
+                <div @onclick='() => S.SetMode("short")' class="cursor-pointer rounded-md border px-[13px] py-3 @(S.Mode == "short" ? "border-accent bg-[#22241A]" : "border-line3 bg-transparent")">
+                    <div class="text-[13px] font-bold text-fg">Highlights</div>
+                    <div class="mt-[3px] text-[11.5px] leading-[1.45] text-muted">9:16 clips of the best moments</div>
+                </div>
+                <div @onclick='() => S.SetMode("long")' class="cursor-pointer rounded-md border px-[13px] py-3 @(S.Mode == "long" ? "border-accent bg-[#22241A]" : "border-line3 bg-transparent")">
+                    <div class="text-[13px] font-bold text-fg">Long-form</div>
+                    <div class="mt-[3px] text-[11.5px] leading-[1.45] text-muted">One edited cut at a target length</div>
+                </div>
+                <div @onclick='() => S.SetMode("both")' class="relative cursor-pointer rounded-md border px-[13px] py-3 @(S.Mode == "both" ? "border-accent bg-[#22241A]" : "border-line3 bg-transparent")">
+                    <div class="text-[13px] font-bold text-fg">Both</div>
+                    <div class="mt-[3px] text-[11.5px] leading-[1.45] text-muted">Highlights and a long-form cut</div>
+                </div>
+            </div>
+            @if (S.ShowTargetLength)
+            {
+                <div class="anim-fade-up mt-3 rounded-md border border-line3 px-[15px] py-[13px]">
+                    <div class="flex items-baseline justify-between">
+                        <div class="text-xs font-semibold text-soft">Target length</div>
+                        <div class="font-mono text-[11px] text-accent">20 – 30 min</div>
+                    </div>
+                    <div class="relative mt-3 h-[3px] rounded-[2px] bg-well">
+                        <div class="absolute bottom-0 left-[28%] right-[52%] top-0 bg-accent"></div>
+                        <div class="absolute -top-1 left-[28%] h-[11px] w-[11px] -translate-x-[5px] cursor-ew-resize rounded-full bg-fg"></div>
+                        <div class="absolute -top-1 left-[48%] h-[11px] w-[11px] -translate-x-[5px] cursor-ew-resize rounded-full bg-fg"></div>
+                    </div>
+                    <div class="mt-2 flex justify-between font-mono text-[9.5px] text-faint"><span>5 min</span><span>60 min</span></div>
+                    <div class="mt-[9px] text-[11px] leading-[1.55] text-faint">A guideline, not a hard limit.</div>
+                </div>
+            }
+        </div>
+        <div class="mt-4">
+            <div class="mb-[7px] text-xs font-semibold text-muted">Guide the edit <span class="font-normal text-faint">· optional</span></div>
+            <textarea placeholder="e.g. focus on the debate segments, keep it documentary-paced" class="box-border h-16 w-full resize-none rounded-md border border-line3 bg-ink px-[13px] py-2.5 font-sans text-[13px] leading-[1.5] text-fg outline-none"></textarea>
+        </div>
+        <div class="mt-[22px] flex justify-end gap-2.5">
+            <div @onclick="S.CloseNewJob" class="cursor-pointer rounded-md px-3.5 py-[9px] text-[13px] text-muted hover:text-fg">Cancel</div>
+            <div @onclick="S.CloseNewJob" class="cursor-pointer rounded-md bg-accent px-5 py-[9px] text-[13px] font-bold text-ink hover:bg-accent-soft active:scale-[0.97]">Start project</div>
+        </div>
+    </div>
+</div>

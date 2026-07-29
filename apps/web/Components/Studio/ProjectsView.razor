@@ -1,0 +1,40 @@
+@inherits StudioComponent
+
+<div class="flex-1 overflow-y-auto" data-screen-label="Projects">
+    <div class="mx-auto max-w-[1080px] px-10 pb-12 pt-8">
+        <div class="anim-fade-up text-[22px] font-bold tracking-[-0.01em]">Projects</div>
+        <div class="mt-[22px] grid grid-cols-3 gap-4">
+            <div @onclick="S.OpenNewJob" class="anim-fade-up group flex min-h-full cursor-pointer flex-col items-center justify-center gap-2.5 rounded-lg border border-dashed border-[#33302C] text-muted hover:border-accent hover:text-fg">
+                <span class="flex h-9 w-9 items-center justify-center rounded-full border border-[#33302C] text-base transition-transform duration-150 group-hover:scale-110">+</span>
+                <span class="text-[13px] font-semibold">New project</span>
+            </div>
+            @foreach (var (p, i) in SampleData.Projects.Select((p, i) => (p, i)))
+            {
+                <div @onclick="() => S.OpenProject(i)" class="anim-fade-up cursor-pointer overflow-hidden rounded-lg border border-well bg-card hover:-translate-y-[2px] hover:border-[#4A4638]" style="animation-delay:@(40 * (i + 1))ms">
+                    <div class="relative flex aspect-video items-center justify-center bg-[repeating-linear-gradient(-45deg,#1C1B19_0_10px,#201E1C_10px_20px)]">
+                        <span class="font-mono text-[10px] text-dim">source frame</span>
+                        <span class="absolute bottom-2 right-2 rounded-[3px] bg-[rgba(20,19,18,0.85)] px-1.5 py-0.5 font-mono text-[10.5px] text-fg">@p.Dur</span>
+                        @if (p.Processing)
+                        {
+                            <div class="absolute inset-x-0 bottom-0 h-[3px] bg-[rgba(20,19,18,0.6)]"><div class="h-full w-[78%] bg-accent"></div></div>
+                        }
+                    </div>
+                    <div class="px-3.5 pb-3.5 pt-[13px]">
+                        <div class="text-[13.5px] font-semibold leading-[1.35]">@p.Title</div>
+                        <div class="mt-[9px] flex items-center gap-2 text-[11.5px] text-muted">
+                            <span class="rounded-[3px] border border-line2 px-[5px] py-px font-mono text-[10px] text-muted">@p.Kind</span>
+                            <span>@p.Outputs</span>
+                            <span class="ml-auto flex items-center gap-[5px] @(p.Processing ? "text-accent" : "text-muted")">
+                                @if (p.Processing)
+                                {
+                                    <span class="h-1.5 w-1.5 animate-pulse-dc rounded-full bg-accent"></span>
+                                }
+                                @p.Status
+                            </span>
+                        </div>
+                    </div>
+                </div>
+            }
+        </div>
+    </div>
+</div>

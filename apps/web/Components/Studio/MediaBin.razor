@@ -1,0 +1,49 @@
+@inherits StudioComponent
+
+<div class="anim-fade-up flex min-h-0 w-[252px] shrink-0 flex-col border-r border-line bg-panel" style="animation-delay:60ms">
+    <div class="flex gap-0.5 border-b border-line px-2.5 py-2">
+        @foreach (var (key, label) in new[] { ("media", "Media"), ("caps", "Captions") })
+        {
+            <div @onclick="() => S.SetBinTab(key)" class="flex-1 cursor-pointer rounded py-[5px] text-center text-xs font-semibold hover:text-fg @(S.BinTab == key ? "bg-well text-fg" : "bg-transparent text-muted")">@label</div>
+        }
+    </div>
+
+    @if (S.BinTab == "media")
+    {
+        <div class="anim-fade-up flex-1 overflow-y-auto p-2">
+            <div class="px-1.5 pb-1 pt-1.5 font-mono text-[9.5px] tracking-[0.1em] text-faint">SOURCE</div>
+            <div class="flex cursor-pointer items-center gap-2.5 rounded-[5px] p-1.5 hover:bg-elevate">
+                <div class="aspect-video w-[52px] shrink-0 rounded-[3px] bg-[repeating-linear-gradient(-45deg,#1C1B19_0_6px,#201E1C_6px_12px)]"></div>
+                <div class="min-w-0"><div class="truncate text-xs font-semibold">Ep. 47 master</div><div class="mt-0.5 font-mono text-[9.5px] text-faint">2:01:44 · 1080p</div></div>
+            </div>
+            <div class="px-1.5 pb-1 pt-3 font-mono text-[9.5px] tracking-[0.1em] text-faint">TIMELINE MEDIA</div>
+            @foreach (var b in SampleData.BinItems)
+            {
+                <div class="flex cursor-pointer items-center gap-2.5 rounded-[5px] p-1.5 hover:bg-elevate">
+                    <div class="flex aspect-video w-[52px] shrink-0 items-center justify-center rounded-[3px] font-mono text-[8px] text-dim" style="background:@b.Thumb">@b.Glyph</div>
+                    <div class="min-w-0"><div class="truncate text-xs font-semibold">@b.Name</div><div class="mt-0.5 font-mono text-[9.5px] text-faint">@b.Meta</div></div>
+                </div>
+            }
+        </div>
+    }
+
+    @if (S.BinTab == "caps")
+    {
+        <div class="anim-fade-up flex-1 overflow-y-auto p-1.5">
+            @foreach (var (cap, i) in SampleData.Captions.Select((c, i) => (c, i)))
+            {
+                <div @onclick="() => S.SelectCaption(i)" class="flex cursor-pointer gap-2.5 rounded-[5px] px-[9px] py-[7px] hover:bg-elevate @(S.ActiveCaption == i ? "bg-well" : "bg-transparent")">
+                    <span class="shrink-0 pt-0.5 font-mono text-[10px] @(S.ActiveCaption == i ? "text-accent" : "text-faint")">@cap.T</span>
+                    <span class="text-xs leading-[1.5] @(S.ActiveCaption == i ? "text-fg" : "text-[#A8A399]")">@cap.Text</span>
+                </div>
+            }
+        </div>
+        <div class="anim-fade-up flex items-center gap-1.5 border-t border-line px-3 py-2.5">
+            <span class="font-mono text-[9.5px] tracking-[0.08em] text-faint">STYLE</span>
+            @foreach (var k in new[] { "boxed", "plain", "karaoke" })
+            {
+                <span @onclick="() => S.SetCapStyle(k)" class="cursor-pointer rounded border px-[9px] py-[3px] text-[11px] hover:text-fg @(S.CapStyle == k ? "border-accent text-accent" : "border-line2 text-muted")">@(char.ToUpper(k[0]) + k[1..])</span>
+            }
+        </div>
+    }
+</div>
