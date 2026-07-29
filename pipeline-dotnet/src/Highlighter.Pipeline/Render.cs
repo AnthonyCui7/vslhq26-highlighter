@@ -3,11 +3,14 @@ namespace Highlighter.Pipeline;
 /// <summary>Port of highlighter_pipeline/render.py.</summary>
 public static class Render
 {
-    public static string ClipFilename(int chunkIndex, double startSeconds, double endSeconds)
+    /// <summary>A combined run passes suffix ("_short"/"_long") so the two
+    /// forks never collide on a filename when they pick the same window.</summary>
+    public static string ClipFilename(
+        int chunkIndex, double startSeconds, double endSeconds, string suffix = "")
     {
         var startMs = (int)Math.Round(startSeconds * 1000, MidpointRounding.ToEven);
         var endMs = (int)Math.Round(endSeconds * 1000, MidpointRounding.ToEven);
-        return $"clip_{chunkIndex:00000}_{startMs}_{endMs}.mp4";
+        return $"clip_{chunkIndex:00000}_{startMs}_{endMs}{suffix}.mp4";
     }
 
     public static void RenderClipFromVideoUrl(
@@ -154,8 +157,8 @@ public static class Render
         });
     }
 
-    /// <summary>Extract a single JPEG frame (~480px wide) from a rendered clip.</summary>
-    public static void ExtractThumbnail(string clipPath, string outputPath, double atSeconds)
+    /// <summary>Extract a single JPEG frame (maxWidth wide at most) from a rendered clip.</summary>
+    public static void ExtractThumbnail(string clipPath, string outputPath, double atSeconds, int maxWidth = 480)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(outputPath))!);
         RunChecked(new List<string>
@@ -172,7 +175,7 @@ public static class Render
             "-frames:v",
             "1",
             "-vf",
-            "scale='min(480,iw)':-2",
+            $"scale='min({maxWidth},iw)':-2",
             "-q:v",
             "4",
             outputPath,

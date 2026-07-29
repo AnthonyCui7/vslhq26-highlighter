@@ -85,6 +85,20 @@ def _write_project(tmp_path: Path, *, longform_rows=(), with_longform_mp4=False)
             "metadata": {"source": "llm", "render": {"local_path": "clips/kept.mp4"}},
         },
         {
+            "start_seconds": 20.0,
+            "end_seconds": 45.0,
+            "title": "Short-fork clip",
+            "status": "rendered",
+            "metadata": {"source": "llm", "pipeline": "short"},
+        },
+        {
+            "start_seconds": 65.0,
+            "end_seconds": 85.0,
+            "title": "Long tagged",
+            "status": "rendered",
+            "metadata": {"source": "llm", "pipeline": "long"},
+        },
+        {
             "start_seconds": 100.0,
             "end_seconds": 130.0,
             "title": "Failed render",
@@ -117,8 +131,13 @@ def test_load_state_versions_and_candidate_filtering(tmp_path):
     )
     assert state["current_version"] == 3
 
-    # Only rendered LLM candidates survive; cuts and word spans flatten.
-    assert [candidate["title"] for candidate in state["candidates"]] == ["Kept"]
+    # Only rendered long-form LLM candidates survive (an untagged row is an
+    # older long-form run; a combined run's short clips are excluded); cuts
+    # and word spans flatten.
+    assert [candidate["title"] for candidate in state["candidates"]] == [
+        "Kept",
+        "Long tagged",
+    ]
     assert state["cuts"] == [12.0]
     assert state["word_spans"] == [(1.0, 1.5)]
     assert state["source_end_seconds"] == 180

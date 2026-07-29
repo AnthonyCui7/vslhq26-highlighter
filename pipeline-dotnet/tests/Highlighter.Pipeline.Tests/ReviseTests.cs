@@ -168,6 +168,22 @@ public class ReviseTests : IDisposable
             },
             new JsonObject
             {
+                ["start_seconds"] = 20.0,
+                ["end_seconds"] = 45.0,
+                ["title"] = "Short-fork clip",
+                ["status"] = "rendered",
+                ["metadata"] = new JsonObject { ["source"] = "llm", ["pipeline"] = "short" },
+            },
+            new JsonObject
+            {
+                ["start_seconds"] = 65.0,
+                ["end_seconds"] = 85.0,
+                ["title"] = "Long tagged",
+                ["status"] = "rendered",
+                ["metadata"] = new JsonObject { ["source"] = "llm", ["pipeline"] = "long" },
+            },
+            new JsonObject
+            {
                 ["start_seconds"] = 100.0,
                 ["end_seconds"] = 130.0,
                 ["title"] = "Failed render",
@@ -211,9 +227,11 @@ public class ReviseTests : IDisposable
             }));
         Assert.Equal(3, state.CurrentVersion);
 
-        // Only rendered LLM candidates survive; cuts and word spans flatten.
+        // Only rendered long-form LLM candidates survive (an untagged row is an
+        // older long-form run; a combined run's short clips are excluded); cuts
+        // and word spans flatten.
         Assert.Equal(
-            new[] { "Kept" },
+            new[] { "Kept", "Long tagged" },
             state.Candidates.Select(candidate => JsonUtil.Str(candidate["title"])).ToArray());
         Assert.Equal(new List<double> { 12.0 }, state.Cuts);
         Assert.Equal(new List<(double, double)> { (1.0, 1.5) }, state.WordSpans);

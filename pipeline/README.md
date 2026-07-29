@@ -1,24 +1,32 @@
 # pipeline
 
 Core Highlighter processing pipeline: capture a livestream or VOD, transcribe
-it in chunks with Azure AI Speech (Deepgram as fallback), detect clip-worthy
-moments with an audio-capable LLM behind per-role provider chains over Azure
-OpenAI and OpenRouter, render clip MP4s with ffmpeg, and persist the results.
+it in chunks with Azure AI Speech, detect clip-worthy moments with an
+audio-capable LLM through the pipeline's Azure OpenAI-anchored model layer,
+render clip MP4s with ffmpeg, and persist the results.
 
 ```bash
 # From the repo root — the end-to-end runner (see tests/run_pipeline.py --help):
 python tests/run_pipeline.py short https://www.twitch.tv/<channel>
 python tests/run_pipeline.py long "https://www.youtube.com/watch?v=XXXX" --target-minutes 10
+python tests/run_pipeline.py both "https://www.youtube.com/watch?v=XXXX"
 
 # Or invoke the module directly; see --help for all flags
 python -m highlighter_pipeline.ingest <url> --pipeline short --max-chunks 4
 ```
 
 Modes: `--pipeline short` renders independent short-form clips, each with a
-blur-pad 9:16 vertical variant (`--no-reframe` to skip); `--pipeline long`
-selects long-form segments with a different editor prompt and stitches them
-chronologically into `longform/longform.mp4`. Both accept `--instructions`
-(editorial guidance) and run a web-grounded content research agent first
+blur-pad 9:16 vertical variant (`--no-reframe` to skip) plus a burned-caption
+copy of that vertical when pycaps is installed (`--no-captions` to skip);
+`--pipeline long` selects long-form segments with a different editor prompt,
+stitches them chronologically into `longform/longform.mp4`, titles the video
+in pass 2, and generates three concept thumbnails (`--no-thumbnails` to skip);
+`--pipeline both` runs the two editorial forks in parallel off one shared
+capture/transcription/shot-detection pass, producing the short clips and the
+long-form edit in a single project.
+Every mode takes a livestream or a VOD — a livestream's long-form edit is cut
+when the stream ends. All accept `--instructions` (editorial guidance) and run
+a per-mode-specialized web-grounded content research call first
 (`--no-research` to skip). Results land in `outputs/projects/<id>/` mirroring
 the Supabase shape, and in Supabase unless `--local-only`.
 
@@ -30,23 +38,44 @@ before committing the next version (`longform_v2.mp4`, `longform_v3.mp4`, ...):
 highlighter-revise <project-id> "tighten the middle and cut the sponsor talk"
 ```
 
+Publish a finished clip or long-form edit through upload-post.com (create a
+profile there, link the social accounts, and set `UPLOAD_POST_API_KEY` +
+`UPLOAD_POST_USER`). Short clips post the captioned vertical by default
+(`--plain` for the clean one); a longform target takes `--thumbnail 1|2|3` (a
+generated variant) or a path to your own image; `x` rides along as a
+model-written promo post linking the published video; `--dry-run` prints what
+would be posted without calling the API:
+
+```bash
+highlighter-publish <project-id> longform --platforms youtube,x --thumbnail 2
+highlighter-publish <project-id> clip_00003_10000_20500_short.mp4 --platforms tiktok,instagram
+```
+
+Burned captions use the `pycaps` CLI (not on PyPI; runs auto-skip with a log
+line when it's missing):
+
+```bash
+pip install "git+https://github.com/francozanardi/pycaps.git#egg=pycaps[base]"
+python3 -m playwright install chromium
+```
+
 Key modules:
 
 - `capture.py` — streamlink (live Twitch) / yt-dlp (everything else) piped into
   ffmpeg: 16 kHz mono WAV chunks for transcription, plus optional codec-copied
   source segments for clip rendering.
-- `transcribe.py` — chunk transcription: Azure AI Speech fast transcription
-  first (`AZURE_SPEECH_KEY` + `AZURE_SPEECH_REGION`/`AZURE_SPEECH_ENDPOINT`),
-  falling back per chunk to `deepgram.py` (`DEEPGRAM_API_KEY`); both return the
-  same word-timestamped shape.
-- `providers.py` — the model seam every LLM call goes through: an ordered
-  chain per role. The editor role (text/vision: pass 2, reframe, the research
-  attempt) runs the Azure deployment first when configured, then OpenRouter
-  Gemini; the audio role (pass-1 scoring, the revision agent) runs OpenRouter
-  Gemini first, then the Azure deployment. Azure env vars: `AZURE_EDITOR_*` /
-  `AZURE_AUDIO_*`, or the shared `AZURE_OPENAI_ENDPOINT`/`AZURE_OPENAI_API_KEY`
-  with `AZURE_OPENAI_EDIT_DEPLOYMENT`/`AZURE_OPENAI_AUDIO_DEPLOYMENT`.
-  Reasoning deployments run at the highest effort their family accepts
+- `transcribe.py` — chunk transcription with Azure AI Speech fast
+  transcription (`AZURE_SPEECH_KEY` +
+  `AZURE_SPEECH_REGION`/`AZURE_SPEECH_ENDPOINT`), returning word-timestamped
+  output.
+- `providers.py` — the model seam every LLM call goes through, built around
+  the project's Azure OpenAI deployments: the gpt-5 editor deployment
+  (text/vision: pass 2, reframe, research, thumbnail concepts) and the
+  gpt-audio deployment (the audio-capable scoring roles). Azure env vars:
+  `AZURE_EDITOR_*` / `AZURE_AUDIO_*`, or the shared
+  `AZURE_OPENAI_ENDPOINT`/`AZURE_OPENAI_API_KEY` with
+  `AZURE_OPENAI_EDIT_DEPLOYMENT`/`AZURE_OPENAI_AUDIO_DEPLOYMENT`. Reasoning
+  deployments run at the highest effort their family accepts
   (`AZURE_REASONING_EFFORT` to override).
 - `llm.py` — clip-candidate detection over transcript + audio.
 - `shots.py` — TransNetV2 shot-boundary detection per segment: scene cuts feed
@@ -62,9 +91,21 @@ Key modules:
 - `reframe.py` — short-form auto-reframe: one framing call per clip (frames
   sampled every 5s plus one after each scene cut; `--reframe-interval`) picks
   the horizontal crop centers; ffmpeg renders the blur-pad 9:16 vertical.
-- `research.py` — content research layer: one call per run, the Azure editor
-  deployment first when configured, falling back to a single web-grounded
-  Claude Sonnet 5 call through OpenRouter's web search.
+- `captions.py` — burned captions on the verticals: the chunk word timings are
+  reshaped into Whisper's JSON and handed to the pycaps CLI, which renders a
+  captioned copy next to each clean vertical (`clips.captioned_url`).
+- `thumbnails.py` — long-form thumbnails: one editor-model call designs three
+  distinct concepts from the research + title + kept segments, then the
+  Azure-hosted image deployment (gpt-image-2) renders each over real frames
+  from the stitched video; a random variant becomes the `longform_edits`
+  thumbnail and all three are kept for the publish-time pick.
+- `publish.py` — social publishing via upload-post.com: multipart video posts
+  to TikTok/Instagram/YouTube, an LLM-drafted X promo post with the published
+  link, and a `publications` row per successful post.
+- `research.py` — content research layer: one structured, source-cited call
+  per editorial fork on the editor deployment, with the prompt and schema
+  specialized per mode (short form: clip formats, hooks, platform norms; long
+  form: structure, pacing, retention).
 - `scoring.py` — concurrent scoring coordinator + boundary stitching/merging.
 - `render.py` — ffmpeg clip rendering, trims, and thumbnails.
 - `reclip.py` — re-cut a new clip window from an archived source.

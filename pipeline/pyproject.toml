@@ -9,9 +9,13 @@ dependencies = ["openai"]
 # TransNetV2 shot-boundary detection (scene cuts + boundary snapping).
 shots = ["transnetv2-pytorch", "numpy"]
 
+[tool.setuptools.package-data]
+highlighter_pipeline = ["caption_templates/*/*"]
+
 [project.scripts]
 highlighter-db-smoke = "highlighter_pipeline.db_smoke:main"
 highlighter-ingest = "highlighter_pipeline.ingest:main"
 highlighter-reclip = "highlighter_pipeline.reclip:main"
 highlighter-revise = "highlighter_pipeline.revise:main"
 highlighter-cleanup = "highlighter_pipeline.cleanup:main"
+highlighter-publish = "highlighter_pipeline.publish:main"

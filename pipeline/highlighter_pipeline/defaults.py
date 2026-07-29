@@ -23,6 +23,8 @@ DEFAULT_LONGFORM_MERGE_GAP_SECONDS = 1.0
 DEFAULT_LONGFORM_MAX_CLIP_SECONDS = 900
 DEFAULT_TARGET_LENGTH_MINUTES = "7-15"
 DEFAULT_RESEARCH_MODEL = "anthropic/claude-sonnet-5"
+DEFAULT_THUMBNAIL_MODEL = "google/gemini-3.1-flash-image"
+DEFAULT_CAPTION_TEMPLATE = "instagram"
 # Azure AI integration: Azure Speech transcription runs first with Deepgram
 # as the fallback, and the Azure OpenAI deployments sit in every model chain
 # (see providers.py for the per-role order). Reasoning-capable deployments

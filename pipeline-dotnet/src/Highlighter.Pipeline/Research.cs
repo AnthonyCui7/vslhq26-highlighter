@@ -4,71 +4,100 @@ namespace Highlighter.Pipeline;
 
 /// <summary>Port of highlighter_pipeline/research.py.
 ///
-/// Content research layer: one research call per run.
+/// Content research layer: one research call per run, specialized per mode.
 ///
 /// The Azure OpenAI editor deployment takes the first attempt when configured;
 /// otherwise (or on any failure) the call runs as a single web-grounded Claude
 /// Sonnet 5 request through OpenRouter's web-search plugin. Either way the
-/// result is the same structured, source-cited editorial context that feeds
-/// the clip-selection model as researchContext (Llm threads it into the
-/// scoring prompt).</summary>
+/// result is structured, source-cited editorial context that feeds the editing
+/// models as researchContext. The prompt and schema are specialized per
+/// pipeline mode: short form researches clip formats, hooks, and platform
+/// norms; long form researches video structure, pacing, and retention.</summary>
 public static class Research
 {
-    private const string CONTENT_RESEARCH_SCHEMA_JSON =
+    // Fields both modes research: who the creator is, who watches, and what
+    // the audience already knows. The mode-specific fields below cover what
+    // "performs well" means for that output format.
+    private const string CORE_RESEARCH_PROPERTIES_JSON =
         """
         {
-          "type": "object",
-          "properties": {
-            "creator_profile": {"type": "string"},
-            "content_context": {"type": "string"},
-            "target_audience": {"type": "array", "items": {"type": "string"}},
-            "inside_references": {"type": "array", "items": {"type": "string"}},
-            "recent_context": {"type": "array", "items": {"type": "string"}},
-            "successful_clip_patterns": {"type": "array", "items": {"type": "string"}},
-            "thumbnail_patterns": {"type": "array", "items": {"type": "string"}},
-            "platform_notes": {"type": "array", "items": {"type": "string"}},
-            "useful_hooks": {"type": "array", "items": {"type": "string"}},
-            "avoid": {"type": "array", "items": {"type": "string"}},
-            "sources": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "properties": {
-                  "title": {"type": "string"},
-                  "url": {"type": "string"},
-                  "claim": {"type": "string"}
-                },
-                "required": ["title", "url", "claim"],
-                "additionalProperties": false
-              }
-            }
-          },
-          "required": [
-            "creator_profile",
-            "content_context",
-            "target_audience",
-            "inside_references",
-            "recent_context",
-            "successful_clip_patterns",
-            "thumbnail_patterns",
-            "platform_notes",
-            "useful_hooks",
-            "avoid",
-            "sources"
-          ],
-          "additionalProperties": false
+          "creator_profile": {"type": "string"},
+          "content_context": {"type": "string"},
+          "target_audience": {"type": "array", "items": {"type": "string"}},
+          "inside_references": {"type": "array", "items": {"type": "string"}},
+          "recent_context": {"type": "array", "items": {"type": "string"}},
+          "thumbnail_patterns": {"type": "array", "items": {"type": "string"}},
+          "avoid": {"type": "array", "items": {"type": "string"}}
         }
         """;
 
-    public static JsonObject ContentResearchSchema() =>
-        JsonUtil.ParseObject(CONTENT_RESEARCH_SCHEMA_JSON);
+    private const string SHORTFORM_RESEARCH_PROPERTIES_JSON =
+        """
+        {
+          "successful_clip_patterns": {"type": "array", "items": {"type": "string"}},
+          "useful_hooks": {"type": "array", "items": {"type": "string"}},
+          "platform_notes": {"type": "array", "items": {"type": "string"}}
+        }
+        """;
 
-    public const string RESEARCH_SYSTEM_PROMPT =
+    private const string LONGFORM_RESEARCH_PROPERTIES_JSON =
+        """
+        {
+          "structure_patterns": {"type": "array", "items": {"type": "string"}},
+          "pacing_and_retention": {"type": "array", "items": {"type": "string"}},
+          "title_patterns": {"type": "array", "items": {"type": "string"}}
+        }
+        """;
+
+    private const string SOURCES_PROPERTY_JSON =
+        """
+        {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "title": {"type": "string"},
+              "url": {"type": "string"},
+              "claim": {"type": "string"}
+            },
+            "required": ["title", "url", "claim"],
+            "additionalProperties": false
+          }
+        }
+        """;
+
+    /// <summary>The research response schema for a pipeline mode ('short' or 'long').</summary>
+    public static JsonObject ResearchSchema(string pipelineMode)
+    {
+        var properties = JsonUtil.ParseObject(CORE_RESEARCH_PROPERTIES_JSON);
+        var modeProperties = JsonUtil.ParseObject(
+            pipelineMode == "short"
+                ? SHORTFORM_RESEARCH_PROPERTIES_JSON
+                : LONGFORM_RESEARCH_PROPERTIES_JSON);
+        foreach (var key in modeProperties.Select(pair => pair.Key).ToList())
+        {
+            var value = modeProperties[key];
+            modeProperties.Remove(key);
+            properties[key] = value;
+        }
+        properties["sources"] = JsonUtil.Parse(SOURCES_PROPERTY_JSON);
+        var required = new JsonArray();
+        foreach (var pair in properties) required.Add(pair.Key);
+        return new JsonObject
+        {
+            ["type"] = "object",
+            ["properties"] = properties,
+            ["required"] = required,
+            ["additionalProperties"] = false,
+        };
+    }
+
+    private const string RESEARCH_SYSTEM_PROMPT_TEMPLATE =
         """
         You are a content researcher for an AI video editing
         pipeline. Given a source video (creator/channel, platform, live or VOD), use
         web search to build practical, current editorial context for the editor model
-        that will select clips from it.
+        that will {editing_goal}.
 
         Research and report:
         - Who the creator is and what their content/channel is about.
@@ -78,13 +107,11 @@ public static class Research
         - Recent context: what has happened lately with this creator and in this niche
           (events, drama, releases, discourse) that a moment might reference.
         - The content genre and what is currently trending or discussed in it.
-        - Clip formats and editing patterns that perform well for similar content.
-        - Thumbnail and title patterns that work in this niche.
-        - What to avoid (overdone formats, sensitive topics for this audience).
+        {mode_points}
 
         Rules:
         - Keep every field compact and practical: the consumer is another LLM making
-          clip decisions, not a human reading a report.
+          editing decisions, not a human reading a report.
         - Every factual outside-world claim must be backed by an entry in sources with
           a real URL you found via search.
         - If you cannot find much about this specific creator, research the genre and
@@ -92,6 +119,40 @@ public static class Research
         - Return ONLY one JSON object matching the provided schema. No markdown fences,
           no commentary before or after.
         """;
+
+    private const string SHORTFORM_RESEARCH_POINTS =
+        """
+        - Clip formats and editing patterns that perform well as short-form vertical
+          video for similar content.
+        - Hooks that work in this niche: cold opens, first-line patterns, what stops
+          the scroll.
+        - Platform notes: what TikTok/Reels/Shorts/X each reward or punish for this
+          kind of content.
+        - Thumbnail patterns that work in this niche.
+        - What to avoid (overdone formats, sensitive topics for this audience).
+        """;
+
+    private const string LONGFORM_RESEARCH_POINTS =
+        """
+        - Structures that hold viewers in long-form videos for this niche: how
+          successful videos open, how they are sequenced or chaptered, how they close.
+        - Pacing and retention patterns: where similar videos lose viewers, and what
+          editing rhythm keeps them watching.
+        - Title and thumbnail patterns that work for long uploads in this niche.
+        - What to avoid (overdone formats, sensitive topics for this audience).
+        """;
+
+    /// <summary>The research system prompt for a pipeline mode ('short' or 'long').</summary>
+    public static string ResearchSystemPrompt(string pipelineMode)
+    {
+        return pipelineMode == "short"
+            ? RESEARCH_SYSTEM_PROMPT_TEMPLATE
+                .Replace("{editing_goal}", "select short-form vertical clips from it")
+                .Replace("{mode_points}", SHORTFORM_RESEARCH_POINTS.TrimEnd())
+            : RESEARCH_SYSTEM_PROMPT_TEMPLATE
+                .Replace("{editing_goal}", "cut one long-form edit from it")
+                .Replace("{mode_points}", LONGFORM_RESEARCH_POINTS.TrimEnd());
+    }
 
     public static string ResearchBackendLabel()
     {
@@ -102,8 +163,8 @@ public static class Research
     }
 
     /// <summary>Run the research call and return an object matching
-    /// CONTENT_RESEARCH_SCHEMA. Throws on failure; callers treat research as
-    /// best-effort and continue without it.</summary>
+    /// ResearchSchema(pipelineMode). Throws on failure; callers treat research
+    /// as best-effort and continue without it.</summary>
     public static JsonObject ResearchContentContext(
         JsonObject sourceContext,
         string pipelineMode = "short",
@@ -114,12 +175,14 @@ public static class Research
             sourceContext: sourceContext,
             pipelineMode: pipelineMode,
             userInstructions: userInstructions);
+        var systemPrompt = ResearchSystemPrompt(pipelineMode);
         var provider = Providers.AzureEditorProvider();
         if (provider is not null)
         {
             try
             {
-                return RequestAzureResearch(provider, prompt);
+                return RequestAzureResearch(
+                    provider, prompt, systemPrompt, ResearchSchema(pipelineMode));
             }
             catch (Exception exc)
             {
@@ -128,7 +191,7 @@ public static class Research
                     + $"web-grounded {model}: {exc.Message}");
             }
         }
-        return WebGroundedResearch(prompt, model);
+        return WebGroundedResearch(prompt, model, systemPrompt);
     }
 
     private static string ResearchPrompt(
@@ -157,18 +220,19 @@ public static class Research
         {
             "",
             "Return only a JSON object matching this schema:",
-            JsonUtil.DumpsIndented(ContentResearchSchema()),
+            JsonUtil.DumpsIndented(ResearchSchema(pipelineMode)),
         });
         return string.Join("\n", promptParts);
     }
 
-    private static JsonObject RequestAzureResearch(ChatProvider provider, string prompt)
+    private static JsonObject RequestAzureResearch(
+        ChatProvider provider, string prompt, string systemPrompt, JsonObject schema)
     {
         var body = new JsonObject
         {
             ["messages"] = new JsonArray
             {
-                new JsonObject { ["role"] = "system", ["content"] = RESEARCH_SYSTEM_PROMPT },
+                new JsonObject { ["role"] = "system", ["content"] = systemPrompt },
                 new JsonObject { ["role"] = "user", ["content"] = prompt },
             },
             ["response_format"] = new JsonObject
@@ -177,7 +241,7 @@ public static class Research
                 ["json_schema"] = new JsonObject
                 {
                     ["name"] = "content_research",
-                    ["schema"] = ContentResearchSchema(),
+                    ["schema"] = schema,
                 },
             },
         };
@@ -199,7 +263,7 @@ public static class Research
         return context;
     }
 
-    private static JsonObject WebGroundedResearch(string prompt, string model)
+    private static JsonObject WebGroundedResearch(string prompt, string model, string systemPrompt)
     {
         var apiKey = Config.Env("OPENROUTER_API_KEY");
         if (string.IsNullOrEmpty(apiKey))
@@ -210,7 +274,7 @@ public static class Research
             ["model"] = model,
             ["messages"] = new JsonArray
             {
-                new JsonObject { ["role"] = "system", ["content"] = RESEARCH_SYSTEM_PROMPT },
+                new JsonObject { ["role"] = "system", ["content"] = systemPrompt },
                 new JsonObject { ["role"] = "user", ["content"] = prompt },
             },
             ["temperature"] = 0.3,

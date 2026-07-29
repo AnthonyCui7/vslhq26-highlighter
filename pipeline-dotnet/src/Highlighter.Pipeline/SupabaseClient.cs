@@ -143,6 +143,7 @@ public class SupabaseClient
         JsonNode? score = null,
         string? videoUrl = null,
         string? verticalUrl = null,
+        string? captionedUrl = null,
         string? status = null,
         JsonObject? metadata = null)
     {
@@ -156,6 +157,7 @@ public class SupabaseClient
             ["score"] = JsonUtil.C(score),
             ["video_url"] = videoUrl,
             ["vertical_url"] = verticalUrl,
+            ["captioned_url"] = captionedUrl,
             ["metadata"] = metadata is null ? new JsonObject() : JsonUtil.CloneObj(metadata),
         };
         if (status is not null) body["status"] = status;
@@ -189,6 +191,29 @@ public class SupabaseClient
                 ["segments"] = segments is null ? new JsonArray() : (JsonArray)segments.DeepClone(),
                 ["editor"] = editor is null ? null : JsonUtil.CloneObj(editor),
                 ["revision"] = revision is null ? null : JsonUtil.CloneObj(revision),
+                ["metadata"] = metadata is null ? new JsonObject() : JsonUtil.CloneObj(metadata),
+            },
+            prefer: "return=minimal");
+    }
+
+    public void InsertPublication(
+        string projectId,
+        string target,
+        string platform,
+        string? url = null,
+        string? title = null,
+        JsonObject? metadata = null)
+    {
+        Request(
+            "POST",
+            "publications",
+            body: new JsonObject
+            {
+                ["project_id"] = projectId,
+                ["target"] = target,
+                ["platform"] = platform,
+                ["url"] = url,
+                ["title"] = title,
                 ["metadata"] = metadata is null ? new JsonObject() : JsonUtil.CloneObj(metadata),
             },
             prefer: "return=minimal");

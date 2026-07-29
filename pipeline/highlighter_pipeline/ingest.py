@@ -3,7 +3,9 @@
 Short mode (default): capture -> transcribe -> detect clip-worthy moments ->
 render individual short-form clips. Long mode: same pipeline with a long-form
 editor prompt, then the selected segments are stitched chronologically into one
-long-form video.
+long-form video. Both mode: capture, transcription, and shot detection run
+once, feeding the short and long editorial forks in parallel — one run
+produces the short-form clips and the long-form edit together.
 
 Everything is recorded locally under <output-root>/projects/<project-id>/ in
 the same shape Supabase stores it (see records.py); Supabase writes happen too
@@ -15,16 +17,21 @@ import json
 import os
 import signal
 import subprocess
+import threading
 import time
 import uuid
+from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .capture import assert_capture_prerequisites, capture_audio_chunks
 from .config import float_env, int_env, load_env
+from .captions import caption_clip, captions_available
 from .cookies import prepare_ytdlp_cookies, ytdlp_cookie_args
 from .editor import select_longform_segments
 from .defaults import (
+    DEFAULT_CAPTION_TEMPLATE,
     DEFAULT_CHUNK_SECONDS,
     DEFAULT_CLIP_MERGE_GAP_SECONDS,
     DEFAULT_DEEPGRAM_MODEL,
@@ -60,11 +67,34 @@ from .shots import shot_detector_from_env, snap_window
 from .stitch import stitch_clips
 from .storage import storage_from_env
 from .supabase_client import SupabaseClient
+from .thumbnails import generate_thumbnails, thumbnail_model_label, thumbnails_configured
 
 
 # How often the worker re-reads its project row while capturing, to notice a
 # backend-requested cancellation (status 'stopping').
 PROJECT_STATUS_POLL_SECONDS = 10
+
+
+@dataclass
+class _Fork:
+    """One editorial path over the shared capture: its scoring coordinator,
+    research context, stitching policy, and render bookkeeping. Single modes
+    run one fork; --pipeline both runs a short and a long fork in parallel."""
+
+    mode: str  # "short" | "long"
+    merge_gap_seconds: float
+    max_clip_seconds: float
+    reframe_enabled: bool
+    filename_suffix: str  # "" in single modes, "_short"/"_long" in both mode
+    research_context: dict | None = None
+    coordinator: ClipScoringCoordinator | None = None
+    # Emitter-thread state, touched only by this fork's own emitter.
+    parked_renders: dict[int, list[dict]] = field(default_factory=dict)
+    rendered_log: list[dict] = field(default_factory=list)
+    # How far this fork has progressed, published under the shared segment
+    # lock. -1 means it may still need segment 0; segments are only deleted
+    # once they are behind every fork's bound.
+    retire_bound: float = -1
 
 
 def main() -> None:
@@ -92,24 +122,55 @@ def main() -> None:
         llm_enabled and not args.no_archive and not args.no_shots and not _truthy_env("NO_SHOTS")
     )
     shot_detector = shot_detector_from_env(shots_requested)
-    # Short clips ship as blur-pad verticals; long-form output stays 16:9.
-    reframe_enabled = (
-        llm_enabled
-        and pipeline_mode == "short"
-        and not args.no_reframe
-        and not _truthy_env("NO_REFRAME")
-    )
     reframe_interval = args.reframe_interval
     clips_bucket = os.environ.get("SUPABASE_CLIPS_BUCKET", DEFAULT_SUPABASE_CLIPS_BUCKET)
     output_root = Path(args.output_root or os.environ.get("OUTPUT_ROOT", DEFAULT_OUTPUT_ROOT))
     min_clip_score = args.min_clip_score  # None -> resolved from the project row below
 
-    if pipeline_mode == "long":
-        merge_gap_seconds = DEFAULT_LONGFORM_MERGE_GAP_SECONDS
-        max_clip_seconds = DEFAULT_LONGFORM_MAX_CLIP_SECONDS
-    else:
-        merge_gap_seconds = DEFAULT_CLIP_MERGE_GAP_SECONDS
-        max_clip_seconds = DEFAULT_MAX_CLIP_SECONDS
+    # One editorial fork per output format; --pipeline both runs a short and a
+    # long fork in parallel off the shared capture/transcription front end.
+    fork_modes = ["short", "long"] if pipeline_mode == "both" else [pipeline_mode]
+    no_reframe = args.no_reframe or _truthy_env("NO_REFRAME")
+    forks = [
+        _Fork(
+            mode=mode,
+            merge_gap_seconds=(
+                DEFAULT_LONGFORM_MERGE_GAP_SECONDS
+                if mode == "long"
+                else DEFAULT_CLIP_MERGE_GAP_SECONDS
+            ),
+            max_clip_seconds=(
+                DEFAULT_LONGFORM_MAX_CLIP_SECONDS
+                if mode == "long"
+                else DEFAULT_MAX_CLIP_SECONDS
+            ),
+            # Short clips ship as blur-pad verticals; long-form output stays 16:9.
+            reframe_enabled=llm_enabled and mode == "short" and not no_reframe,
+            filename_suffix=f"_{mode}" if len(fork_modes) > 1 else "",
+        )
+        for mode in fork_modes
+    ]
+    short_fork = next((fork for fork in forks if fork.mode == "short"), None)
+    long_fork = next((fork for fork in forks if fork.mode == "long"), None)
+    reframe_enabled = short_fork is not None and short_fork.reframe_enabled
+    thumbnails_enabled = (
+        long_fork is not None
+        and llm_enabled
+        and not args.no_thumbnails
+        and not _truthy_env("NO_THUMBNAILS")
+    )
+    if thumbnails_enabled and not thumbnails_configured():
+        print("Thumbnail generation needs an image model configured; continuing without it.")
+        thumbnails_enabled = False
+    captions_enabled = (
+        reframe_enabled and not args.no_captions and not _truthy_env("NO_CAPTIONS")
+    )
+    if captions_enabled and not captions_available():
+        print("Captions unavailable (pycaps not on PATH); shipping clean verticals only.")
+        captions_enabled = False
+    # In both mode the two coordinators split the scoring budget so the total
+    # number of in-flight LLM calls stays at the configured level.
+    per_fork_concurrency = max(1, llm_concurrency // len(forks))
 
     if chunk_seconds <= 0:
         raise RuntimeError("CHUNK_SECONDS must be greater than 0")
@@ -182,7 +243,7 @@ def main() -> None:
         # Known length lets the long-form prompts state the keep rate as a
         # number instead of a vibe. Livestreams stay None.
         source_minutes = None
-        if pipeline_mode == "long" and source_type == "video":
+        if long_fork is not None and source_type == "video":
             source_minutes = _probe_source_minutes(source_url)
             if source_minutes is not None and max_chunks > 0:
                 source_minutes = min(source_minutes, max_chunks * chunk_seconds / 60)
@@ -204,7 +265,7 @@ def main() -> None:
         ingest_settings = {
             "pipeline": pipeline_mode,
             "user_instructions": user_instructions,
-            "target_length_minutes": target_length if pipeline_mode == "long" else None,
+            "target_length_minutes": target_length if long_fork is not None else None,
             "chunk_seconds": chunk_seconds,
             "max_chunks": max_chunks,
             "streamlink_quality": streamlink_quality,
@@ -221,10 +282,28 @@ def main() -> None:
                 "style": "blurpad-square" if reframe_enabled else None,
                 "frame_interval_seconds": reframe_interval if reframe_enabled else None,
             },
-            "clip_stitching": {
-                "merge_gap_seconds": merge_gap_seconds,
-                "max_clip_seconds": max_clip_seconds,
+            "thumbnails": {
+                "enabled": thumbnails_enabled,
+                "model": thumbnail_model_label() if thumbnails_enabled else None,
             },
+            "captions": {
+                "enabled": captions_enabled,
+                "template": DEFAULT_CAPTION_TEMPLATE if captions_enabled else None,
+            },
+            "clip_stitching": (
+                {
+                    "merge_gap_seconds": forks[0].merge_gap_seconds,
+                    "max_clip_seconds": forks[0].max_clip_seconds,
+                }
+                if len(forks) == 1
+                else {
+                    fork.mode: {
+                        "merge_gap_seconds": fork.merge_gap_seconds,
+                        "max_clip_seconds": fork.max_clip_seconds,
+                    }
+                    for fork in forks
+                }
+            ),
             "llm": {
                 "enabled": llm_enabled,
                 "backend": scoring_backend,
@@ -232,6 +311,11 @@ def main() -> None:
                 "reasoning_effort": llm_reasoning_effort,
                 "marker_seconds": llm_marker_seconds,
                 "concurrency": llm_concurrency,
+                **(
+                    {"concurrency_per_fork": per_fork_concurrency}
+                    if len(forks) > 1
+                    else {}
+                ),
                 "context_seconds": llm_context_seconds,
             },
             "research": {
@@ -355,16 +439,21 @@ def main() -> None:
         archive_dir = None if args.no_archive else project_dir / "source"
         archive_prefix = f"projects/{project_id}/source"
         archived_segments: list[str] = []
-        # Emitter-thread state (see ClipScoringCoordinator): local archive
-        # segments still on disk, and rendered-decisions parked until the
-        # segment(s) their window needs have been archived.
+        # Local archive segments still on disk, shared across the forks; each
+        # fork parks its own rendered-decisions (in _Fork) until the segment(s)
+        # their window needs have been archived. The lock guards mutations and
+        # the per-fork retire bounds — in both mode two coordinator emitter
+        # threads touch these.
         segment_files: dict[int, Path] = {}
-        parked_renders: dict[int, list[dict]] = {}
-        rendered_log: list[dict] = []
+        segments_lock = threading.Lock()
         # Scene cuts per archive segment (absolute seconds) and every word's
         # absolute span, so boundary snapping never lands inside speech.
         chunk_cuts: dict[int, list[float]] = {}
         word_spans: list[tuple[float, float]] = []
+        # Word timings per chunk for caption renders. Written by the capture
+        # thread before a chunk is scored, so every clip's covering chunks are
+        # present by the time its render decision reaches an emitter.
+        chunk_words: dict[int, list[dict]] = {}
         source_context = {
             "platform": platform,
             "source_type": source_type,
@@ -372,26 +461,39 @@ def main() -> None:
             "source_url": source_url,
         }
 
-        content_research_context = None
         if research_enabled:
-            print(f"Researching content context ({research_backend_label()})")
-            try:
-                content_research_context = research_content_context(
-                    source_context=source_context,
-                    pipeline_mode=pipeline_mode,
-                    user_instructions=user_instructions,
-                )
-                records.write_research(content_research_context)
+            # One specialized research call per fork: short researches clip
+            # formats and hooks, long researches structure and retention.
+            for fork in forks:
                 print(
-                    "Cached content research "
-                    f"with {len(content_research_context.get('sources', []))} source(s)"
+                    f"Researching {fork.mode}-form content context "
+                    f"({research_backend_label()})"
                 )
-            except Exception as exc:
-                # Research is context, not a dependency; never kill a run on it.
-                print(f"Content research failed (continuing without it): {exc}")
+                try:
+                    fork.research_context = research_content_context(
+                        source_context=source_context,
+                        pipeline_mode=fork.mode,
+                        user_instructions=user_instructions,
+                    )
+                    # research.json is the long/sole fork's; a combined run's
+                    # short fork lands in research_short.json.
+                    records.write_research(
+                        fork.research_context,
+                        mode="short" if len(forks) > 1 and fork.mode == "short" else None,
+                    )
+                    print(
+                        f"Cached {fork.mode}-form content research "
+                        f"with {len(fork.research_context.get('sources', []))} source(s)"
+                    )
+                except Exception as exc:
+                    # Research is context, not a dependency; never kill a run on it.
+                    print(
+                        f"Content research for the {fork.mode} fork failed "
+                        f"(continuing without it): {exc}"
+                    )
 
-        def _emit_decision(decision: dict) -> None:
-            """Handle one stitched decision, in chunk order (emitter thread)."""
+        def _emit_decision(fork: _Fork, decision: dict) -> None:
+            """Handle one stitched decision, in chunk order (fork emitter thread)."""
             if decision["is_clip_worthy"] and decision["score"] < min_clip_score:
                 # Below the project's score bar: record the decision locally but
                 # do not render it or insert a clips row.
@@ -415,6 +517,7 @@ def main() -> None:
                     records=records,
                     project_id=project_id,
                     decision=decision,
+                    pipeline=fork.mode,
                 )
                 return
 
@@ -449,13 +552,14 @@ def main() -> None:
                     records=records,
                     project_id=project_id,
                     decision=decision,
+                    pipeline=fork.mode,
                     render_result={
                         "status": "failed",
                         "error": "Clip rendering requires source archiving (run without --no-archive).",
                     },
                 )
                 return
-            _try_render_from_segments(decision)
+            _try_render_from_segments(fork, decision)
 
         def _needed_segments(decision: dict) -> list[int]:
             """Archive segment indexes a clip window spans (end is exclusive
@@ -467,13 +571,13 @@ def main() -> None:
             )
             return list(range(first, last + 1))
 
-        def _try_render_from_segments(decision: dict) -> None:
+        def _try_render_from_segments(fork: _Fork, decision: dict) -> None:
             """Render now when every needed segment is archived; park otherwise
-            (emitter thread)."""
+            (fork emitter thread)."""
             needed = _needed_segments(decision)
             missing = [index for index in needed if index not in segment_files]
             if missing:
-                parked_renders.setdefault(max(missing), []).append(decision)
+                fork.parked_renders.setdefault(max(missing), []).append(decision)
                 print(
                     "Parked clip candidate "
                     f"{decision['chunk_index']} until segment(s) {missing} are archived"
@@ -488,59 +592,92 @@ def main() -> None:
                 decision=decision,
                 segment_paths=[segment_files[index] for index in needed],
                 first_segment_start_seconds=needed[0] * chunk_seconds,
-                rendered_log=rendered_log,
-                reframe_enabled=reframe_enabled,
+                rendered_log=fork.rendered_log,
+                pipeline=fork.mode,
+                filename_suffix=fork.filename_suffix,
+                reframe_enabled=fork.reframe_enabled,
                 reframe_interval=reframe_interval,
                 scene_cuts=_cuts_near_window(
                     chunk_cuts, chunk_seconds, decision["start_seconds"], decision["end_seconds"]
                 )
-                if reframe_enabled
+                if fork.reframe_enabled
                 else None,
-                research_context=content_research_context,
+                research_context=fork.research_context,
+                captions_enabled=captions_enabled and fork.reframe_enabled,
+                clip_words=(
+                    _words_in_window(
+                        chunk_words,
+                        chunk_seconds,
+                        decision["start_seconds"],
+                        decision["end_seconds"],
+                    )
+                    if captions_enabled and fork.reframe_enabled
+                    else None
+                ),
             )
 
-        def _register_segment(segment_index: int, segment_path: Path) -> None:
-            """Record a completed archive segment and wake parked renders
-            (emitter thread)."""
-            segment_files[segment_index] = segment_path
-            for key in sorted(k for k in parked_renders if k <= segment_index):
-                for decision in parked_renders.pop(key):
-                    _try_render_from_segments(decision)
+        def _register_segment(fork: _Fork, segment_index: int, segment_path: Path) -> None:
+            """Record a completed archive segment (every fork registers the
+            same path) and wake this fork's parked renders (fork emitter
+            thread)."""
+            with segments_lock:
+                segment_files[segment_index] = segment_path
+            for key in sorted(k for k in fork.parked_renders if k <= segment_index):
+                for decision in fork.parked_renders.pop(key):
+                    _try_render_from_segments(fork, decision)
 
-        def _retire_stale_segments(chunk_index: int, min_held_start: float | None) -> None:
-            """Delete local segment copies that no held or parked decision can
-            reference anymore (emitter thread)."""
+        def _retire_stale_segments(
+            fork: _Fork, chunk_index: int, min_held_start: float | None
+        ) -> None:
+            """Delete local segment copies that no fork can reference anymore.
+            Each fork publishes its own bound; only segments behind every
+            fork's bound are dropped (fork emitter threads)."""
             if archive_dir is None:
                 return
             bound = chunk_index - 1
             if min_held_start is not None:
                 bound = min(bound, int(min_held_start // chunk_seconds) - 1)
-            for decisions in parked_renders.values():
+            for decisions in fork.parked_renders.values():
                 for decision in decisions:
                     bound = min(bound, int(decision["start_seconds"] // chunk_seconds) - 1)
-            for index in [i for i in segment_files if i <= bound]:
-                path = segment_files.pop(index)
+            with segments_lock:
+                fork.retire_bound = bound
+                shared_bound = min(f.retire_bound for f in forks)
+                stale = [
+                    segment_files.pop(index)
+                    for index in [i for i in segment_files if i <= shared_bound]
+                ]
+            for path in stale:
                 try:
                     path.unlink(missing_ok=True)
                 except OSError as exc:
                     print(f"Could not delete local segment {path}: {exc}")
 
-        def _finish_live_renders() -> None:
-            """Fail parked decisions whose segments never arrived and drop the
-            remaining local segment copies (emitter thread, once at the end)."""
-            for key in sorted(parked_renders):
-                for decision in parked_renders[key]:
+        def _finish_live_renders(fork: _Fork) -> None:
+            """Fail parked decisions whose segments never arrived (fork emitter
+            thread, once at the end); the shared segment copies are dropped on
+            the main thread once every fork has drained."""
+            for key in sorted(fork.parked_renders):
+                for decision in fork.parked_renders[key]:
                     _store_clip_decision(
                         db=db,
                         records=records,
                         project_id=project_id,
                         decision=decision,
+                        pipeline=fork.mode,
                         render_result={
                             "status": "failed",
                             "error": "No archived video segment was produced for this clip.",
                         },
                     )
-            parked_renders.clear()
+            fork.parked_renders.clear()
+            with segments_lock:
+                # A finished fork no longer holds any segment back.
+                fork.retire_bound = float("inf")
+
+        def _drop_remaining_segments() -> None:
+            """Delete leftover local segment copies (main thread, after every
+            fork's coordinator has drained)."""
             for index in list(segment_files):
                 path = segment_files.pop(index)
                 try:
@@ -549,6 +686,7 @@ def main() -> None:
                     print(f"Could not delete local segment {path}: {exc}")
 
         def _score_chunk(
+            fork: _Fork,
             chunk: dict,
             context_before: list[dict],
             context_after: list[dict],
@@ -557,8 +695,8 @@ def main() -> None:
         ) -> tuple[list[dict], str]:
             """Score one chunk via the LLM (runs on coordinator pool threads)."""
             print(
-                f"Scoring chunk {chunk['chunk_index']} for clip candidates "
-                f"via {scoring_backend}"
+                f"Scoring chunk {chunk['chunk_index']} for {fork.mode}-form "
+                f"clip candidates via {scoring_backend}"
             )
             scene_cuts = None
             if shot_detector is not None:
@@ -581,29 +719,30 @@ def main() -> None:
                 context_words_after=context_after,
                 reasoning_effort=llm_reasoning_effort,
                 marker_seconds=llm_marker_seconds,
-                pipeline_mode=pipeline_mode,
+                pipeline_mode=fork.mode,
                 user_instructions=user_instructions,
                 target_length=target_length,
                 source_context=source_context,
-                research_context=content_research_context,
+                research_context=fork.research_context,
                 audio_context=chunk.get("audio_context") or [],
                 scene_cuts=scene_cuts,
                 source_minutes=source_minutes,
             )
 
-        coordinator = None
         if llm_enabled:
-            coordinator = ClipScoringCoordinator(
-                score_chunk=_score_chunk,
-                emit_decision=_emit_decision,
-                chunk_seconds=chunk_seconds,
-                context_seconds=llm_context_seconds,
-                concurrency=llm_concurrency,
-                merge_gap_seconds=merge_gap_seconds,
-                max_clip_seconds=max_clip_seconds,
-                on_chunk_complete=_retire_stale_segments,
-                on_finish=_finish_live_renders,
-            )
+            for fork in forks:
+                fork.coordinator = ClipScoringCoordinator(
+                    score_chunk=partial(_score_chunk, fork),
+                    emit_decision=partial(_emit_decision, fork),
+                    chunk_seconds=chunk_seconds,
+                    context_seconds=llm_context_seconds,
+                    concurrency=per_fork_concurrency,
+                    merge_gap_seconds=fork.merge_gap_seconds,
+                    max_clip_seconds=fork.max_clip_seconds,
+                    on_chunk_complete=partial(_retire_stale_segments, fork),
+                    on_finish=partial(_finish_live_renders, fork),
+                )
+        coordinators = [fork.coordinator for fork in forks if fork.coordinator is not None]
 
         def _handle_video_segment(segment_path: Path, segment_index: int) -> None:
             if shot_detector is not None:
@@ -621,12 +760,14 @@ def main() -> None:
                 print(
                     f"Archived video segment {segment_index} to s3://{storage.bucket}/{key}"
                 )
-            if coordinator is not None:
-                # The local copy stays until nothing can reference it; the
-                # emitter renders clips from these files.
-                coordinator.run_on_emitter(
-                    lambda: _register_segment(segment_index, segment_path)
-                )
+            if coordinators:
+                # The local copy stays until no fork can reference it; each
+                # fork's emitter renders its clips from these files.
+                for fork in forks:
+                    if fork.coordinator is not None:
+                        fork.coordinator.run_on_emitter(
+                            partial(_register_segment, fork, segment_index, segment_path)
+                        )
             else:
                 segment_path.unlink()
 
@@ -634,8 +775,13 @@ def main() -> None:
 
         def _final_metadata(**extra: object) -> dict:
             metadata: dict = {"platform": platform, "ingest": ingest_settings, **extra}
-            if content_research_context is not None:
-                metadata["content_research"] = content_research_context
+            # content_research mirrors the research file naming: the long/sole
+            # fork's context, with the short fork's alongside in a combined run.
+            primary_research = (long_fork or forks[0]).research_context
+            if primary_research is not None:
+                metadata["content_research"] = primary_research
+            if len(forks) > 1 and short_fork.research_context is not None:
+                metadata["content_research_short"] = short_fork.research_context
             if longform_result:
                 metadata["longform"] = longform_result
             if storage is not None:
@@ -661,10 +807,13 @@ def main() -> None:
                 existing = {}
             return {**existing, **metadata}
 
+        edit_description = (
+            "short- and long-form edits" if len(forks) > 1 else f"a {pipeline_mode}-form edit"
+        )
         print(
             f"Capturing {source_url} ({platform} {source_type}, via {downloader}) in {chunk_seconds}s chunks"
             f"{f' ({max_chunks} chunk max)' if max_chunks > 0 else ''}"
-            f" for a {pipeline_mode}-form edit"
+            f" for {edit_description}"
             f"{f'; scoring clips via {scoring_backend}' if llm_enabled else '; LLM scoring disabled'}"
             f"{f'; archiving source to s3://{storage.bucket}/{archive_prefix}' if storage else ''}."
         )
@@ -707,20 +856,33 @@ def main() -> None:
                 start_seconds=start_seconds,
                 end_seconds=end_seconds,
                 deepgram_model=deepgram_model,
-                coordinator=coordinator,
+                coordinators=coordinators,
                 scene_cuts=chunk_cuts.get(chunk_index),
                 word_spans=word_spans,
+                chunk_words=chunk_words,
             ),
             archive_dir=archive_dir,
             on_video_segment=_handle_video_segment if archive_dir is not None else None,
             should_stop=_stop_requested,
         )
-        if coordinator is not None:
-            # Drains in-flight scoring, stitches, renders, and cleans up; on a
-            # cancel nothing new is dispatched but finished scores still land.
-            coordinator.finish(cancelled=stop_state["requested"])
+        # Drains in-flight scoring, stitches, renders, and cleans up; on a
+        # cancel nothing new is dispatched but finished scores still land.
+        # Each finish() blocks until that fork's emitter exits, so the shared
+        # segment copies can be dropped safely once every fork has drained.
+        finish_error: Exception | None = None
+        for fork in forks:
+            if fork.coordinator is not None:
+                try:
+                    fork.coordinator.finish(cancelled=stop_state["requested"])
+                except Exception as exc:
+                    # Keep draining the other fork before surfacing this.
+                    finish_error = exc
+                    print(f"The {fork.mode} fork failed while finishing: {exc}")
+        _drop_remaining_segments()
+        if finish_error is not None:
+            raise finish_error
 
-        if pipeline_mode == "long" and not stop_state["requested"]:
+        if long_fork is not None and not stop_state["requested"]:
             longform_result.update(
                 _edit_longform(
                     db=db,
@@ -728,15 +890,16 @@ def main() -> None:
                     project_id=project_id,
                     project_dir=project_dir,
                     clips_bucket=clips_bucket,
-                    rendered_log=rendered_log,
+                    rendered_log=long_fork.rendered_log,
                     chunk_count=chunk_count,
                     chunk_seconds=chunk_seconds,
                     target_length=target_length,
                     user_instructions=user_instructions,
-                    research_context=content_research_context,
+                    research_context=long_fork.research_context,
                     reasoning_effort=llm_reasoning_effort,
                     chunk_cuts=chunk_cuts,
                     word_spans=word_spans,
+                    thumbnails_enabled=thumbnails_enabled,
                 )
             )
 
@@ -772,12 +935,18 @@ def main() -> None:
         records.update_project(status=final_status, metadata=metadata)
         print(f"Project {project_id} {final_status} with {chunk_count} chunk(s).")
     except Exception as exc:
-        if coordinator is not None:
-            # Best-effort teardown; it must never mask the capture failure.
-            try:
-                coordinator.finish(cancelled=True)
-            except Exception:
-                pass
+        # Best-effort teardown; it must never mask the capture failure, and
+        # every fork must drain even when another fork's teardown fails.
+        for fork in forks:
+            if fork.coordinator is not None:
+                try:
+                    fork.coordinator.finish(cancelled=True)
+                except Exception:
+                    pass
+        try:
+            _drop_remaining_segments()
+        except Exception:
+            pass
         metadata = _final_metadata()
         records.update_project(status="failed", error=str(exc), metadata=metadata)
         if db is not None:
@@ -857,6 +1026,7 @@ def _edit_longform(
     reasoning_effort: str,
     chunk_cuts: dict[int, list[float]],
     word_spans: list[tuple[float, float]],
+    thumbnails_enabled: bool = False,
 ) -> dict:
     """Pass 2: one global editor call sees every rendered pass-1 candidate and
     makes the final cut — keep/drop, plus tightening within a segment's own
@@ -910,6 +1080,9 @@ def _edit_longform(
         clips_bucket=clips_bucket,
         entries=entries,
         editor=editor_meta,
+        research_context=research_context,
+        reasoning_effort=reasoning_effort,
+        thumbnails_enabled=thumbnails_enabled,
     )
 
 
@@ -966,6 +1139,7 @@ def _apply_longform_selections(
         "status": "applied",
         "model": edit["model"],
         "edit_notes": edit["edit_notes"],
+        "title": edit["title"],
         "arithmetic": edit["arithmetic"],
         "candidate_segments": len(entries),
         "kept_segments": len(final_entries),
@@ -985,6 +1159,9 @@ def _stitch_longform(
     clips_bucket: str,
     entries: list[dict],
     editor: dict | None = None,
+    research_context: dict | None = None,
+    reasoning_effort: str = DEFAULT_LLM_REASONING_EFFORT,
+    thumbnails_enabled: bool = False,
 ) -> dict:
     """Concatenate the final segments chronologically into one long-form
     video, persist it as longform_edits version 1, and return its metadata (or
@@ -994,6 +1171,7 @@ def _stitch_longform(
         return {"status": "empty", "segments": 0}
 
     ordered = sorted(entries, key=lambda clip: clip["start_seconds"])
+    title = (editor or {}).get("title") or ordered[0].get("title")
     output_path = project_dir / "longform" / "longform.mp4"
     total_seconds = sum(clip["end_seconds"] - clip["start_seconds"] for clip in ordered)
     print(
@@ -1013,6 +1191,7 @@ def _stitch_longform(
     result = {
         "status": "rendered",
         "version": 1,
+        "title": title,
         "local_path": os.path.relpath(output_path),
         "filename": output_path.name,
         "segments": len(ordered),
@@ -1040,6 +1219,22 @@ def _stitch_longform(
         thumbnail_path = None
         print(f"Long-form thumbnail extraction failed (non-fatal): {exc}")
 
+    thumbnails = None
+    if thumbnails_enabled:
+        try:
+            thumbnails = generate_thumbnails(
+                longform_path=output_path,
+                entries=ordered,
+                title=title,
+                research_context=research_context,
+                output_dir=project_dir / "thumbnails",
+                reasoning_effort=reasoning_effort,
+            )
+        except Exception as exc:
+            print(f"Thumbnail generation failed (non-fatal): {exc}")
+    if thumbnails is not None:
+        result["thumbnails"] = thumbnails
+
     if db is not None:
         try:
             storage_key = f"projects/{project_id}/longform/{output_path.name}"
@@ -1058,12 +1253,25 @@ def _stitch_longform(
                     result["thumbnail_storage_path"] = thumbnail_key
                 except Exception as exc:
                     print(f"Long-form thumbnail upload failed (non-fatal): {exc}")
+            if thumbnails is not None:
+                for variant in thumbnails["variants"]:
+                    try:
+                        variant_name = Path(variant["local_path"]).name
+                        variant_key = f"projects/{project_id}/thumbnails/{variant_name}"
+                        variant["url"] = db.upload_storage_object(
+                            bucket=clips_bucket,
+                            key=variant_key,
+                            path=Path(variant["local_path"]),
+                        )
+                        variant["storage_path"] = variant_key
+                    except Exception as exc:
+                        print(f"Thumbnail variant upload failed (non-fatal): {exc}")
             db.insert_longform_edit(
                 project_id=project_id,
                 version=1,
                 status="rendered",
                 video_url=video_url,
-                thumbnail_url=result.get("thumbnail_url"),
+                thumbnail_url=_display_thumbnail_url(result),
                 duration_seconds=round(total_seconds, 3),
                 segments=result["segment_windows"],
                 editor=editor,
@@ -1079,7 +1287,7 @@ def _stitch_longform(
             "version": 1,
             "status": "rendered",
             "video_url": result.get("video_url") or result["local_path"],
-            "thumbnail_url": result.get("thumbnail_url"),
+            "thumbnail_url": _display_thumbnail_url(result),
             "duration_seconds": round(total_seconds, 3),
             "segments": result["segment_windows"],
             "editor": editor,
@@ -1089,6 +1297,17 @@ def _stitch_longform(
     )
     print(f"Long-form video ready: {output_path}")
     return result
+
+
+def _display_thumbnail_url(result: dict) -> str | None:
+    """The thumbnail a longform_edits row shows: the selected generated
+    variant when one was uploaded, else the midpoint frame."""
+    thumbnails = result.get("thumbnails")
+    if thumbnails is not None:
+        selected = thumbnails["variants"][thumbnails["selected_index"]]
+        if selected.get("url"):
+            return selected["url"]
+    return result.get("thumbnail_url")
 
 
 def _detect_source(url: str) -> tuple[str, str, str]:
@@ -1178,9 +1397,10 @@ def _process_chunk(
     start_seconds: int,
     end_seconds: int,
     deepgram_model: str,
-    coordinator: ClipScoringCoordinator | None,
+    coordinators: list[ClipScoringCoordinator],
     scene_cuts: list[float] | None = None,
     word_spans: list[tuple[float, float]] | None = None,
+    chunk_words: dict[int, list[dict]] | None = None,
 ) -> None:
     stored = _store_chunk(
         db=db,
@@ -1198,20 +1418,38 @@ def _process_chunk(
             (float(word["absolute_start"]), float(word["absolute_end"]))
             for word in stored["words"]
         )
-    if coordinator is None:
-        return
-    # Scoring happens on the coordinator's pool: this chunk is dispatched once
+    if chunk_words is not None:
+        chunk_words[chunk_index] = stored["words"]
+    # Scoring happens on each coordinator's pool: this chunk is dispatched once
     # the NEXT chunk's transcript arrives, so the model sees both boundaries.
-    coordinator.add_chunk(
-        {
-            "chunk_index": chunk_index,
-            "start_seconds": start_seconds,
-            "end_seconds": end_seconds,
-            "transcript": stored["transcript"],
-            "words": stored["words"],
-            "audio_path": str(audio_path),
-        }
-    )
+    # The chunk dict is read-only inside the coordinators, so the forks share it.
+    chunk = {
+        "chunk_index": chunk_index,
+        "start_seconds": start_seconds,
+        "end_seconds": end_seconds,
+        "transcript": stored["transcript"],
+        "words": stored["words"],
+        "audio_path": str(audio_path),
+    }
+    for coordinator in coordinators:
+        coordinator.add_chunk(chunk)
+
+
+def _words_in_window(
+    chunk_words: dict[int, list[dict]],
+    chunk_seconds: int,
+    start_seconds: float,
+    end_seconds: float,
+) -> list[dict]:
+    """Words overlapping a clip window, pulled from the chunks that cover it."""
+    first = int(start_seconds // chunk_seconds)
+    last = int(max(start_seconds, end_seconds - 0.001) // chunk_seconds)
+    return [
+        word
+        for index in range(first, last + 1)
+        for word in chunk_words.get(index, [])
+        if word["absolute_end"] > start_seconds and word["absolute_start"] < end_seconds
+    ]
 
 
 def _render_and_store_clip(
@@ -1225,15 +1463,20 @@ def _render_and_store_clip(
     segment_paths: list[Path],
     first_segment_start_seconds: float,
     rendered_log: list[dict],
+    pipeline: str,
+    filename_suffix: str = "",
     reframe_enabled: bool = False,
     reframe_interval: float | None = None,
     scene_cuts: list[float] | None = None,
     research_context: dict | None = None,
+    captions_enabled: bool = False,
+    clip_words: list[dict] | None = None,
 ) -> None:
     filename = clip_filename(
         chunk_index=decision["chunk_index"],
         start_seconds=decision["start_seconds"],
         end_seconds=decision["end_seconds"],
+        suffix=filename_suffix,
     )
     output_path = project_dir / "clips" / filename
 
@@ -1265,6 +1508,18 @@ def _render_and_store_clip(
                 vertical_path, crop_track = reframed
                 render_result["vertical_path"] = os.path.relpath(vertical_path)
                 decision = {**decision, "reframe": crop_track}
+        captioned_path = None
+        if vertical_path is not None and captions_enabled and clip_words:
+            captioned_path = caption_clip(
+                vertical_path=vertical_path,
+                words=clip_words,
+                clip_start_seconds=decision["start_seconds"],
+                clip_end_seconds=decision["end_seconds"],
+                output_path=vertical_path.with_name(f"{vertical_path.stem}_captions.mp4"),
+            )
+            if captioned_path is not None:
+                render_result["captioned_path"] = os.path.relpath(captioned_path)
+                print(f"Captioned clip {decision['chunk_index']} to {captioned_path.name}")
         if db is not None:
             storage_key = f"projects/{project_id}/clips/{filename}"
             video_url = db.upload_storage_object(
@@ -1297,6 +1552,15 @@ def _render_and_store_clip(
                     render_result["vertical_storage_path"] = vertical_key
                 except Exception as exc:
                     print(f"Vertical clip upload failed (non-fatal): {exc}")
+            if captioned_path is not None:
+                try:
+                    captioned_key = f"projects/{project_id}/clips/{captioned_path.name}"
+                    render_result["captioned_url"] = db.upload_storage_object(
+                        bucket=clips_bucket, key=captioned_key, path=captioned_path
+                    )
+                    render_result["captioned_storage_path"] = captioned_key
+                except Exception as exc:
+                    print(f"Captioned clip upload failed (non-fatal): {exc}")
 
         rendered_log.append(
             {
@@ -1320,6 +1584,7 @@ def _render_and_store_clip(
         records=records,
         project_id=project_id,
         decision=decision,
+        pipeline=pipeline,
         render_result=render_result,
     )
 
@@ -1395,8 +1660,12 @@ def _store_clip_decision(
     records: ProjectRecords,
     project_id: str,
     decision: dict,
+    pipeline: str,
     render_result: dict | None = None,
 ) -> None:
+    # The fork that made the decision; in a combined run both forks' records
+    # interleave, and revisions read only the long-form ones.
+    decision = {**decision, "pipeline": pipeline}
     if render_result is not None:
         decision = {**decision, "render": render_result}
 
@@ -1409,13 +1678,16 @@ def _store_clip_decision(
     clip_status = "detected"
     video_url = None
     vertical_url = None
+    captioned_url = None
     if render_result is not None:
         clip_status = render_result.get("status", "detected")
         video_url = render_result.get("video_url") or render_result.get("local_path")
         vertical_url = render_result.get("vertical_url") or render_result.get("vertical_path")
+        captioned_url = render_result.get("captioned_url") or render_result.get("captioned_path")
 
     clip_metadata = {
         "source": "llm",
+        "pipeline": pipeline,
         "chunk_index": decision["chunk_index"],
         "model": decision["model"],
         "reasoning_effort": decision["reasoning_effort"],
@@ -1438,6 +1710,7 @@ def _store_clip_decision(
             "score": decision["score"],
             "video_url": video_url,
             "vertical_url": vertical_url,
+            "captioned_url": captioned_url,
             "status": clip_status,
             "metadata": clip_metadata,
         }
@@ -1452,6 +1725,7 @@ def _store_clip_decision(
             score=decision["score"],
             video_url=render_result.get("video_url") if render_result else None,
             vertical_url=render_result.get("vertical_url") if render_result else None,
+            captioned_url=render_result.get("captioned_url") if render_result else None,
             status=clip_status,
             metadata=clip_metadata,
         )
@@ -1481,10 +1755,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--pipeline",
-        choices=["short", "long"],
+        choices=["short", "long", "both"],
         default=os.environ.get("PIPELINE") or "short",
         help="short: independent short-form clips. long: long-form segment selection "
-        "stitched into one video (also via PIPELINE).",
+        "stitched into one video. both: one capture feeding the short and long "
+        "forks in parallel (also via PIPELINE).",
     )
     parser.add_argument(
         "--instructions",
@@ -1589,6 +1864,20 @@ def _parse_args() -> argparse.Namespace:
         default=float_env("REFRAME_INTERVAL", DEFAULT_REFRAME_FRAME_INTERVAL_SECONDS),
         help="Seconds between the frames sampled for the auto-reframe framing call; "
         "0 samples only the opener and scene cuts (also via REFRAME_INTERVAL).",
+    )
+    parser.add_argument(
+        "--no-captions",
+        action="store_true",
+        default=False,
+        help="Short mode: skip the burned-caption render of each vertical clip "
+        "(also via NO_CAPTIONS=1).",
+    )
+    parser.add_argument(
+        "--no-thumbnails",
+        action="store_true",
+        default=False,
+        help="Long mode: skip generated thumbnail concepts for the finished video "
+        "(also via NO_THUMBNAILS=1).",
     )
     parser.add_argument(
         "--llm-reasoning-effort",

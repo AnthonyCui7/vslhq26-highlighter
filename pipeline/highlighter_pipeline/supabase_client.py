@@ -146,6 +146,7 @@ class SupabaseClient:
         score: float | None = None,
         video_url: str | None = None,
         vertical_url: str | None = None,
+        captioned_url: str | None = None,
         status: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
@@ -158,6 +159,7 @@ class SupabaseClient:
             "score": score,
             "video_url": video_url,
             "vertical_url": vertical_url,
+            "captioned_url": captioned_url,
             "metadata": metadata or {},
         }
         if status is not None:
@@ -197,6 +199,30 @@ class SupabaseClient:
                 "segments": segments or [],
                 "editor": editor,
                 "revision": revision,
+                "metadata": metadata or {},
+            },
+            prefer="return=minimal",
+        )
+
+    def insert_publication(
+        self,
+        *,
+        project_id: str,
+        target: str,
+        platform: str,
+        url: str | None = None,
+        title: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        self._request(
+            "POST",
+            "publications",
+            body={
+                "project_id": project_id,
+                "target": target,
+                "platform": platform,
+                "url": url,
+                "title": title,
                 "metadata": metadata or {},
             },
             prefer="return=minimal",

@@ -28,6 +28,21 @@ public static class EditorTestData
     }
 }
 
+public class TestEditResponseSchema
+{
+    [Fact]
+    public void TitleIsPartOfTheEdit()
+    {
+        var schema = Editor.EditResponseSchema();
+        var properties = (JsonObject)schema["properties"]!;
+        Assert.True(properties.ContainsKey("title"));
+        var required = ((JsonArray)schema["required"]!)
+            .Select(node => JsonUtil.Str(node)).ToHashSet();
+        Assert.Equal(properties.Select(pair => pair.Key).ToHashSet(), required);
+        Assert.False(JsonUtil.Truthy(schema["additionalProperties"]));
+    }
+}
+
 public class TestParseTargetMinutes
 {
     [Fact]

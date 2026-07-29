@@ -243,10 +243,15 @@ public static class Revise
         chunks.Sort((a, b) =>
             JsonUtil.Int(a["chunk_index"]).CompareTo(JsonUtil.Int(b["chunk_index"])));
 
+        // Combined runs tag clips with metadata.pipeline; only long-form
+        // pass-1 candidates feed a revision (a missing tag means an older
+        // long-form run).
         var candidates = ReadJsonl(Path.Combine(projectDir, "clips.jsonl"))
             .Where(row =>
                 JsonUtil.StrOrNull((row["metadata"] as JsonObject)?["source"]) == "llm"
-                && JsonUtil.StrOrNull(row["status"]) == "rendered")
+                && JsonUtil.StrOrNull(row["status"]) == "rendered"
+                && JsonUtil.StrOrNull((row["metadata"] as JsonObject)?["pipeline"])
+                    is null or "long")
             .OrderBy(row => JsonUtil.Double(row["start_seconds"]))
             .ToList();
 

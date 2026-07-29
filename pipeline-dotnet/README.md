@@ -16,10 +16,10 @@ tests/Highlighter.Pipeline.Tests/  xUnit ports of all pipeline/tests/ suites
 ```
 
 External dependencies stay identical to the Python pipeline: `ffmpeg`/`ffprobe`,
-`yt-dlp`, `streamlink` on PATH; Azure AI Speech (Deepgram fallback), the Azure
-OpenAI deployments and OpenRouter in the same per-role chains, Supabase, and
-optionally S3 via the same env vars (the monorepo root `.env` is discovered by
-walking up from the working directory, exactly like the Python `load_env`).
+`yt-dlp`, `streamlink` on PATH; Azure AI Speech and the Azure OpenAI
+deployments in the same per-role model layer, Supabase, and optionally S3 via
+the same env vars (the monorepo root `.env` is discovered by walking up from
+the working directory, exactly like the Python `load_env`).
 
 ## Build & run
 
@@ -35,9 +35,13 @@ Subcommands mirror the Python console scripts one-to-one:
 |-----------------------|--------------------------|
 | `highlighter-ingest`  | `highlighter ingest`     |
 | `highlighter-revise`  | `highlighter revise`     |
+| `highlighter-publish` | `highlighter publish`    |
 | `highlighter-reclip`  | `highlighter reclip`     |
 | `highlighter-cleanup` | `highlighter cleanup`    |
 | `highlighter-db-smoke`| `highlighter db-smoke`   |
+
+External tools match the Python pipeline too: burned captions shell out to the
+same `pycaps` CLI and auto-skip with a log line when it isn't installed.
 
 Run from the monorepo root so `outputs/` and the `.env` land in the same places
 the Python pipeline uses.

@@ -16,13 +16,19 @@ namespace Highlighter.Pipeline;
 ///     clips.jsonl              one line per clips row (worthy, rendered clips)
 ///     decisions.jsonl          full editorial log: every decision, worthy or not
 ///     longform_edits.jsonl     one line per stitched long-form version
+///     publications.jsonl       one line per social post published from the project
 ///     research.json            content research context, when research ran
+///     research_short.json      the short fork's research in a combined run
+///                              (research.json holds the long fork's)
 /// </summary>
 public class ProjectRecords
 {
     public string ProjectDir { get; }
 
     private readonly JsonObject _project;
+
+    // A combined run writes records from two coordinator emitter threads.
+    private readonly object _gate = new();
 
     public ProjectRecords(string projectDir)
     {
@@ -58,11 +64,20 @@ public class ProjectRecords
 
     public void AppendLongformEdit(JsonObject row) => AppendJsonl("longform_edits.jsonl", row);
 
-    public void WriteResearch(JsonObject context) => WriteJson("research.json", context);
+    public void AppendPublication(JsonObject row) => AppendJsonl("publications.jsonl", row);
 
-    private void WriteJson(string name, JsonObject payload) =>
-        File.WriteAllText(Path.Combine(ProjectDir, name), JsonUtil.DumpsIndented(payload));
+    public void WriteResearch(JsonObject context, string? mode = null) =>
+        WriteJson(mode is null ? "research.json" : $"research_{mode}.json", context);
 
-    private void AppendJsonl(string name, JsonObject row) =>
-        File.AppendAllText(Path.Combine(ProjectDir, name), JsonUtil.Dumps(row) + "\n");
+    private void WriteJson(string name, JsonObject payload)
+    {
+        lock (_gate)
+            File.WriteAllText(Path.Combine(ProjectDir, name), JsonUtil.DumpsIndented(payload));
+    }
+
+    private void AppendJsonl(string name, JsonObject row)
+    {
+        lock (_gate)
+            File.AppendAllText(Path.Combine(ProjectDir, name), JsonUtil.Dumps(row) + "\n");
+    }
 }

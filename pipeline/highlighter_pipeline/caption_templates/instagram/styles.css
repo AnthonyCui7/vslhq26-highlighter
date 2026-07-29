@@ -1,0 +1,25 @@
+/* Reels-style captions: big bold rounded white text in a black box, sitting
+   just under the sharp content band. Every word state renders identically and
+   nothing animates, so a caption is simply on for exactly its spoken window. */
+
+.word {
+    font-family: 'Instagram Sans', 'SF Pro Rounded', 'Arial Rounded MT Bold',
+        'Helvetica Neue', Arial, sans-serif;
+    font-size: 44px;
+    font-weight: 700;
+    color: #ffffff;
+    background-color: rgba(0, 0, 0, 0.82);
+    padding: 10px 8px;
+}
+
+.first-word-in-line {
+    border-top-left-radius: 14px;
+    border-bottom-left-radius: 14px;
+    padding-left: 16px;
+}
+
+.last-word-in-line {
+    border-top-right-radius: 14px;
+    border-bottom-right-radius: 14px;
+    padding-right: 16px;
+}

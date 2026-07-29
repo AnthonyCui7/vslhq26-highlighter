@@ -28,6 +28,8 @@ public static class Defaults
     public const double DEFAULT_LONGFORM_MAX_CLIP_SECONDS = 900;
     public const string DEFAULT_TARGET_LENGTH_MINUTES = "7-15";
     public const string DEFAULT_RESEARCH_MODEL = "anthropic/claude-sonnet-5";
+    public const string DEFAULT_THUMBNAIL_MODEL = "google/gemini-3.1-flash-image";
+    public const string DEFAULT_CAPTION_TEMPLATE = "instagram";
     // Azure AI integration: Azure Speech transcription runs first with Deepgram
     // as the fallback, and the Azure OpenAI deployments sit in every model chain
     // (see Providers.cs for the per-role order). Reasoning-capable deployments

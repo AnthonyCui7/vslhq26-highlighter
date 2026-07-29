@@ -5,10 +5,14 @@ from pathlib import Path
 from .cookies import ytdlp_cookie_args
 
 
-def clip_filename(*, chunk_index: int, start_seconds: float, end_seconds: float) -> str:
+def clip_filename(
+    *, chunk_index: int, start_seconds: float, end_seconds: float, suffix: str = ""
+) -> str:
+    """A combined run passes suffix ('_short'/'_long') so the two forks never
+    collide on a filename when they pick the same window."""
     start_ms = int(round(start_seconds * 1000))
     end_ms = int(round(end_seconds * 1000))
-    return f"clip_{chunk_index:05d}_{start_ms}_{end_ms}.mp4"
+    return f"clip_{chunk_index:05d}_{start_ms}_{end_ms}{suffix}.mp4"
 
 
 def render_clip_from_video_url(
@@ -161,8 +165,10 @@ def trim_clip(
     )
 
 
-def extract_thumbnail(*, clip_path: Path, output_path: Path, at_seconds: float) -> None:
-    """Extract a single JPEG frame (~480px wide) from a rendered clip."""
+def extract_thumbnail(
+    *, clip_path: Path, output_path: Path, at_seconds: float, max_width: int = 480
+) -> None:
+    """Extract a single JPEG frame (max_width wide at most) from a rendered clip."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     _run(
         [
@@ -178,7 +184,7 @@ def extract_thumbnail(*, clip_path: Path, output_path: Path, at_seconds: float) 
             "-frames:v",
             "1",
             "-vf",
-            "scale='min(480,iw)':-2",
+            f"scale='min({max_width},iw)':-2",
             "-q:v",
             "4",
             str(output_path),

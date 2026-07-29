@@ -246,10 +246,14 @@ def _load_state(project_dir: Path) -> dict[str, Any]:
     chunks = _read_jsonl(project_dir / "transcript_chunks.jsonl")
     chunks.sort(key=lambda row: row["chunk_index"])
 
+    # Combined runs tag clips with metadata.pipeline; only long-form pass-1
+    # candidates feed a revision (a missing tag means an older long-form run).
     candidates = [
         row
         for row in _read_jsonl(project_dir / "clips.jsonl")
-        if (row.get("metadata") or {}).get("source") == "llm" and row.get("status") == "rendered"
+        if (row.get("metadata") or {}).get("source") == "llm"
+        and row.get("status") == "rendered"
+        and (row.get("metadata") or {}).get("pipeline") in (None, "long")
     ]
     candidates.sort(key=lambda row: row["start_seconds"])
 

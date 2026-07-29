@@ -1,12 +1,13 @@
-"""Content research layer: one research call per run.
+"""Content research layer: one research call per run, specialized per mode.
 
 The Azure OpenAI editor deployment takes the first attempt when configured;
 otherwise (or on any failure) the call runs as a single web-grounded Claude
 Sonnet 5 request through OpenRouter's web-search plugin. Either way the result
-is the same structured, source-cited editorial context — target audience,
-content genre and current trends, successful clip formats and thumbnails, and
-the creator's background — that feeds the clip-selection model as
-`research_context` (llm.py threads it into the scoring prompt).
+is structured, source-cited editorial context — the creator's background, the
+target audience, and what performs in this niche — that feeds the editing
+models as `research_context`. The prompt and schema are specialized per
+pipeline mode: short form researches clip formats, hooks, and platform norms;
+long form researches video structure, pacing, and retention.
 """
 
 import json
@@ -16,54 +17,69 @@ from typing import Any
 from .defaults import DEFAULT_RESEARCH_MODEL
 from .providers import OPENROUTER_BASE_URL, Provider, azure_editor_provider
 
-CONTENT_RESEARCH_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "creator_profile": {"type": "string"},
-        "content_context": {"type": "string"},
-        "target_audience": {"type": "array", "items": {"type": "string"}},
-        "inside_references": {"type": "array", "items": {"type": "string"}},
-        "recent_context": {"type": "array", "items": {"type": "string"}},
-        "successful_clip_patterns": {"type": "array", "items": {"type": "string"}},
-        "thumbnail_patterns": {"type": "array", "items": {"type": "string"}},
-        "platform_notes": {"type": "array", "items": {"type": "string"}},
-        "useful_hooks": {"type": "array", "items": {"type": "string"}},
-        "avoid": {"type": "array", "items": {"type": "string"}},
-        "sources": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "title": {"type": "string"},
-                    "url": {"type": "string"},
-                    "claim": {"type": "string"},
-                },
-                "required": ["title", "url", "claim"],
-                "additionalProperties": False,
-            },
+# Fields both modes research: who the creator is, who watches, and what the
+# audience already knows. The mode-specific fields below cover what "performs
+# well" means for that output format.
+_CORE_RESEARCH_PROPERTIES: dict[str, Any] = {
+    "creator_profile": {"type": "string"},
+    "content_context": {"type": "string"},
+    "target_audience": {"type": "array", "items": {"type": "string"}},
+    "inside_references": {"type": "array", "items": {"type": "string"}},
+    "recent_context": {"type": "array", "items": {"type": "string"}},
+    "thumbnail_patterns": {"type": "array", "items": {"type": "string"}},
+    "avoid": {"type": "array", "items": {"type": "string"}},
+}
+
+_SHORTFORM_RESEARCH_PROPERTIES: dict[str, Any] = {
+    "successful_clip_patterns": {"type": "array", "items": {"type": "string"}},
+    "useful_hooks": {"type": "array", "items": {"type": "string"}},
+    "platform_notes": {"type": "array", "items": {"type": "string"}},
+}
+
+_LONGFORM_RESEARCH_PROPERTIES: dict[str, Any] = {
+    "structure_patterns": {"type": "array", "items": {"type": "string"}},
+    "pacing_and_retention": {"type": "array", "items": {"type": "string"}},
+    "title_patterns": {"type": "array", "items": {"type": "string"}},
+}
+
+_SOURCES_PROPERTY: dict[str, Any] = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "url": {"type": "string"},
+            "claim": {"type": "string"},
         },
+        "required": ["title", "url", "claim"],
+        "additionalProperties": False,
     },
-    "required": [
-        "creator_profile",
-        "content_context",
-        "target_audience",
-        "inside_references",
-        "recent_context",
-        "successful_clip_patterns",
-        "thumbnail_patterns",
-        "platform_notes",
-        "useful_hooks",
-        "avoid",
-        "sources",
-    ],
-    "additionalProperties": False,
 }
 
 
-RESEARCH_SYSTEM_PROMPT = """You are a content researcher for an AI video editing
+def research_schema(pipeline_mode: str) -> dict[str, Any]:
+    """The research response schema for a pipeline mode ('short' or 'long')."""
+    properties = {
+        **_CORE_RESEARCH_PROPERTIES,
+        **(
+            _SHORTFORM_RESEARCH_PROPERTIES
+            if pipeline_mode == "short"
+            else _LONGFORM_RESEARCH_PROPERTIES
+        ),
+        "sources": _SOURCES_PROPERTY,
+    }
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties),
+        "additionalProperties": False,
+    }
+
+
+_RESEARCH_SYSTEM_PROMPT_TEMPLATE = """You are a content researcher for an AI video editing
 pipeline. Given a source video (creator/channel, platform, live or VOD), use
 web search to build practical, current editorial context for the editor model
-that will select clips from it.
+that will {editing_goal}.
 
 Research and report:
 - Who the creator is and what their content/channel is about.
@@ -73,19 +89,46 @@ Research and report:
 - Recent context: what has happened lately with this creator and in this niche
   (events, drama, releases, discourse) that a moment might reference.
 - The content genre and what is currently trending or discussed in it.
-- Clip formats and editing patterns that perform well for similar content.
-- Thumbnail and title patterns that work in this niche.
-- What to avoid (overdone formats, sensitive topics for this audience).
+{mode_points}
 
 Rules:
 - Keep every field compact and practical: the consumer is another LLM making
-  clip decisions, not a human reading a report.
+  editing decisions, not a human reading a report.
 - Every factual outside-world claim must be backed by an entry in sources with
   a real URL you found via search.
 - If you cannot find much about this specific creator, research the genre and
   platform patterns instead and say so in creator_profile.
 - Return ONLY one JSON object matching the provided schema. No markdown fences,
   no commentary before or after."""
+
+_SHORTFORM_RESEARCH_POINTS = """- Clip formats and editing patterns that perform well as short-form vertical
+  video for similar content.
+- Hooks that work in this niche: cold opens, first-line patterns, what stops
+  the scroll.
+- Platform notes: what TikTok/Reels/Shorts/X each reward or punish for this
+  kind of content.
+- Thumbnail patterns that work in this niche.
+- What to avoid (overdone formats, sensitive topics for this audience)."""
+
+_LONGFORM_RESEARCH_POINTS = """- Structures that hold viewers in long-form videos for this niche: how
+  successful videos open, how they are sequenced or chaptered, how they close.
+- Pacing and retention patterns: where similar videos lose viewers, and what
+  editing rhythm keeps them watching.
+- Title and thumbnail patterns that work for long uploads in this niche.
+- What to avoid (overdone formats, sensitive topics for this audience)."""
+
+
+def research_system_prompt(pipeline_mode: str) -> str:
+    """The research system prompt for a pipeline mode ('short' or 'long')."""
+    if pipeline_mode == "short":
+        return _RESEARCH_SYSTEM_PROMPT_TEMPLATE.format(
+            editing_goal="select short-form vertical clips from it",
+            mode_points=_SHORTFORM_RESEARCH_POINTS,
+        )
+    return _RESEARCH_SYSTEM_PROMPT_TEMPLATE.format(
+        editing_goal="cut one long-form edit from it",
+        mode_points=_LONGFORM_RESEARCH_POINTS,
+    )
 
 
 def research_backend_label() -> str:
@@ -103,23 +146,27 @@ def research_content_context(
     model: str = DEFAULT_RESEARCH_MODEL,
 ) -> dict[str, Any]:
     """Run the research call and return a dict matching
-    CONTENT_RESEARCH_SCHEMA. Raises on failure; callers treat research as
-    best-effort and continue without it."""
+    research_schema(pipeline_mode). Raises on failure; callers treat research
+    as best-effort and continue without it."""
     prompt = _research_prompt(
         source_context=source_context,
         pipeline_mode=pipeline_mode,
         user_instructions=user_instructions,
     )
+    system_prompt = research_system_prompt(pipeline_mode)
+    schema = research_schema(pipeline_mode)
     provider = azure_editor_provider()
     if provider is not None:
         try:
-            return _request_azure_research(provider, prompt)
+            return _request_azure_research(
+                provider, prompt, system_prompt=system_prompt, schema=schema
+            )
         except Exception as exc:
             print(
                 f"{provider.label} research failed; falling back to "
                 f"web-grounded {model}: {exc}"
             )
-    return _web_grounded_research(prompt, model=model)
+    return _web_grounded_research(prompt, model=model, system_prompt=system_prompt)
 
 
 def _research_prompt(
@@ -148,23 +195,25 @@ def _research_prompt(
     prompt_parts += [
         "",
         "Return only a JSON object matching this schema:",
-        json.dumps(CONTENT_RESEARCH_SCHEMA, indent=2),
+        json.dumps(research_schema(pipeline_mode), indent=2),
     ]
     return "\n".join(prompt_parts)
 
 
-def _request_azure_research(provider: Provider, prompt: str) -> dict[str, Any]:
+def _request_azure_research(
+    provider: Provider, prompt: str, *, system_prompt: str, schema: dict[str, Any]
+) -> dict[str, Any]:
     with provider.client(timeout=300.0) as client:
         response = client.chat.completions.create(
             messages=[
-                {"role": "system", "content": RESEARCH_SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt},
             ],
             response_format={
                 "type": "json_schema",
                 "json_schema": {
                     "name": "content_research",
-                    "schema": CONTENT_RESEARCH_SCHEMA,
+                    "schema": schema,
                 },
             },
             **provider.request_kwargs(),
@@ -178,7 +227,9 @@ def _request_azure_research(provider: Provider, prompt: str) -> dict[str, Any]:
     return context
 
 
-def _web_grounded_research(prompt: str, *, model: str) -> dict[str, Any]:
+def _web_grounded_research(
+    prompt: str, *, model: str, system_prompt: str
+) -> dict[str, Any]:
     try:
         from openai import OpenAI
     except ImportError as exc:
@@ -200,7 +251,7 @@ def _web_grounded_research(prompt: str, *, model: str) -> dict[str, Any]:
     response = client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": RESEARCH_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
         temperature=0.3,

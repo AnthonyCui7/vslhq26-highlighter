@@ -60,7 +60,9 @@ ranking you must obey.
 Return only JSON matching the schema: one selections entry per kept segment
 (the candidate's index, your possibly-tightened start_seconds and end_seconds,
 and a short reason), plus edit_notes briefly explaining the shape of the edit
-and the main things you dropped."""
+and the main things you dropped, plus title — the title the finished video
+should publish under, shaped by the research context's title_patterns when
+present."""
 
 
 EDIT_RESPONSE_SCHEMA: dict[str, Any] = {
@@ -97,8 +99,13 @@ EDIT_RESPONSE_SCHEMA: dict[str, Any] = {
             "type": "string",
             "description": "Brief explanation of the edit's shape and the main drops.",
         },
+        "title": {
+            "type": "string",
+            "description": "The published video's title, shaped by the research "
+            "title_patterns when present.",
+        },
     },
-    "required": ["selections", "edit_notes"],
+    "required": ["selections", "edit_notes", "title"],
     "additionalProperties": False,
 }
 
@@ -145,6 +152,7 @@ def select_longform_segments(
     return {
         "selections": _validate_selections(decision, candidates, dict(indexed_candidates)),
         "edit_notes": str(decision.get("edit_notes") or ""),
+        "title": str(decision.get("title") or "").strip() or None,
         "arithmetic": arithmetic,
         "model": provider.model,
         "candidates_considered": len(indexed_candidates),

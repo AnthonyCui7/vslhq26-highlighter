@@ -1,4 +1,5 @@
 from highlighter_pipeline.editor import (
+    EDIT_RESPONSE_SCHEMA,
     _budget_arithmetic,
     _cap_candidates,
     _validate_selections,
@@ -20,6 +21,14 @@ def candidate(start, end, score=0.5, title="t"):
 def selections_of(raw, candidates):
     offered = dict(enumerate(candidates))
     return _validate_selections({"selections": raw}, candidates, offered)
+
+
+class TestEditResponseSchema:
+    def test_title_is_part_of_the_edit(self):
+        properties = EDIT_RESPONSE_SCHEMA["properties"]
+        assert "title" in properties
+        assert set(EDIT_RESPONSE_SCHEMA["required"]) == set(properties)
+        assert EDIT_RESPONSE_SCHEMA["additionalProperties"] is False
 
 
 class TestParseTargetMinutes:

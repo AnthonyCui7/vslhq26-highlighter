@@ -24,6 +24,8 @@ public class IngestArgs
     public bool NoShots;
     public bool NoReframe;
     public double ReframeInterval = Defaults.DEFAULT_REFRAME_FRAME_INTERVAL_SECONDS;
+    public bool NoCaptions;
+    public bool NoThumbnails;
     public string LlmReasoningEffort = Defaults.DEFAULT_LLM_REASONING_EFFORT;
     public int LlmMarkerSeconds = Defaults.DEFAULT_LLM_MARKER_SECONDS;
     public int LlmConcurrency = Defaults.DEFAULT_LLM_CONCURRENCY;
@@ -63,7 +65,7 @@ public class IngestArgs
             switch (flag)
             {
                 case "--pipeline":
-                    args.Pipeline = Argv.Choice(Next(), "--pipeline", "short", "long");
+                    args.Pipeline = Argv.Choice(Next(), "--pipeline", "short", "long", "both");
                     break;
                 case "--instructions":
                     args.Instructions = Next();
@@ -116,6 +118,12 @@ public class IngestArgs
                     break;
                 case "--reframe-interval":
                     args.ReframeInterval = Argv.Float(Next(), "--reframe-interval");
+                    break;
+                case "--no-captions":
+                    args.NoCaptions = true;
+                    break;
+                case "--no-thumbnails":
+                    args.NoThumbnails = true;
                     break;
                 case "--llm-reasoning-effort":
                     args.LlmReasoningEffort = Next();
