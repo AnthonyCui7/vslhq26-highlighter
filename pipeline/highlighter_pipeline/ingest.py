@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import signal
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -21,7 +22,8 @@ from urllib.parse import parse_qs, urlparse
 
 from .capture import assert_capture_prerequisites, capture_audio_chunks
 from .config import float_env, int_env, load_env
-from .cookies import prepare_ytdlp_cookies
+from .cookies import prepare_ytdlp_cookies, ytdlp_cookie_args
+from .editor import select_longform_segments
 from .defaults import (
     DEFAULT_CHUNK_SECONDS,
     DEFAULT_CLIP_MERGE_GAP_SECONDS,
@@ -44,13 +46,16 @@ from .defaults import (
 from .deepgram import transcribe_audio_file
 from .llm import detect_clip_candidates
 from .records import ProjectRecords
+from .reframe import plan_crop_track, render_vertical
 from .render import (
     clip_filename,
     extract_thumbnail,
     render_clip_from_segments,
+    trim_clip,
 )
 from .research import research_content_context
 from .scoring import ClipScoringCoordinator
+from .shots import shot_detector_from_env, snap_window
 from .stitch import stitch_clips
 from .storage import storage_from_env
 from .supabase_client import SupabaseClient
@@ -81,6 +86,19 @@ def main() -> None:
     llm_context_seconds = args.llm_context_seconds
     research_enabled = llm_enabled and not args.no_research and not _truthy_env("NO_RESEARCH")
     local_only = args.local_only or _truthy_env("LOCAL_ONLY")
+    # Shot detection needs the archived video segments and only pays off when
+    # clips are actually being selected.
+    shots_requested = (
+        llm_enabled and not args.no_archive and not args.no_shots and not _truthy_env("NO_SHOTS")
+    )
+    shot_detector = shot_detector_from_env(shots_requested)
+    # Short clips ship as blur-pad verticals; long-form output stays 16:9.
+    reframe_enabled = (
+        llm_enabled
+        and pipeline_mode == "short"
+        and not args.no_reframe
+        and not _truthy_env("NO_REFRAME")
+    )
     clips_bucket = os.environ.get("SUPABASE_CLIPS_BUCKET", DEFAULT_SUPABASE_CLIPS_BUCKET)
     output_root = Path(args.output_root or os.environ.get("OUTPUT_ROOT", DEFAULT_OUTPUT_ROOT))
     min_clip_score = args.min_clip_score  # None -> resolved from the project row below
@@ -158,6 +176,16 @@ def main() -> None:
         # reaches the row via the pre-capture failure handling below.
         prepare_ytdlp_cookies()
 
+        # Known length lets the long-form prompts state the keep rate as a
+        # number instead of a vibe. Livestreams stay None.
+        source_minutes = None
+        if pipeline_mode == "long" and source_type == "video":
+            source_minutes = _probe_source_minutes(source_url)
+            if source_minutes is not None and max_chunks > 0:
+                source_minutes = min(source_minutes, max_chunks * chunk_seconds / 60)
+            if source_minutes is not None:
+                print(f"Source runs ~{source_minutes:.0f} min; calibrating selectivity to it.")
+
         ingest_settings = {
             "pipeline": pipeline_mode,
             "user_instructions": user_instructions,
@@ -167,6 +195,15 @@ def main() -> None:
             "streamlink_quality": streamlink_quality,
             "deepgram_model": deepgram_model,
             "min_clip_score": min_clip_score,
+            "source_minutes": source_minutes,
+            "shots": {
+                "enabled": shot_detector is not None,
+                "backend": "transnetv2" if shot_detector is not None else None,
+            },
+            "reframe": {
+                "enabled": reframe_enabled,
+                "style": "blurpad-square" if reframe_enabled else None,
+            },
             "clip_stitching": {
                 "merge_gap_seconds": merge_gap_seconds,
                 "max_clip_seconds": max_clip_seconds,
@@ -307,6 +344,10 @@ def main() -> None:
         segment_files: dict[int, Path] = {}
         parked_renders: dict[int, list[dict]] = {}
         rendered_log: list[dict] = []
+        # Scene cuts per archive segment (absolute seconds) and every word's
+        # absolute span, so boundary snapping never lands inside speech.
+        chunk_cuts: dict[int, list[float]] = {}
+        word_spans: list[tuple[float, float]] = []
         source_context = {
             "platform": platform,
             "source_type": source_type,
@@ -360,6 +401,31 @@ def main() -> None:
                 )
                 return
 
+            # The model picked the moment; scene cuts pick the frame. Snap
+            # before segment selection so the render uses the final window.
+            nearby_cuts = _cuts_near_window(
+                chunk_cuts, chunk_seconds, decision["start_seconds"], decision["end_seconds"]
+            )
+            if nearby_cuts:
+                snapped_start, snapped_end, snap_info = snap_window(
+                    decision["start_seconds"],
+                    decision["end_seconds"],
+                    cuts=nearby_cuts,
+                    word_spans=word_spans,
+                )
+                if snap_info is not None:
+                    print(
+                        f"Snapped clip candidate {decision['chunk_index']} to scene cuts: "
+                        f"{snap_info['original_start']}s-{snap_info['original_end']}s -> "
+                        f"{snapped_start}s-{snapped_end}s"
+                    )
+                    decision = {
+                        **decision,
+                        "start_seconds": snapped_start,
+                        "end_seconds": snapped_end,
+                        "boundary_snap": snap_info,
+                    }
+
             if archive_dir is None:
                 _store_clip_decision(
                     db=db,
@@ -406,6 +472,13 @@ def main() -> None:
                 segment_paths=[segment_files[index] for index in needed],
                 first_segment_start_seconds=needed[0] * chunk_seconds,
                 rendered_log=rendered_log,
+                reframe_enabled=reframe_enabled,
+                scene_cuts=_cuts_near_window(
+                    chunk_cuts, chunk_seconds, decision["start_seconds"], decision["end_seconds"]
+                )
+                if reframe_enabled
+                else None,
+                research_context=content_research_context,
             )
 
         def _register_segment(segment_index: int, segment_path: Path) -> None:
@@ -471,6 +544,15 @@ def main() -> None:
                 f"Scoring chunk {chunk['chunk_index']} for clip candidates "
                 f"via {scoring_backend}"
             )
+            scene_cuts = None
+            if shot_detector is not None:
+                index = chunk["chunk_index"]
+                scene_cuts = sorted(
+                    cut
+                    for neighbor in (index - 1, index, index + 1)
+                    for cut in chunk_cuts.get(neighbor, [])
+                    if visible_start <= cut <= visible_end
+                )
             return detect_clip_candidates(
                 transcript=chunk["transcript"],
                 words=chunk["words"],
@@ -490,6 +572,8 @@ def main() -> None:
                 source_context=source_context,
                 research_context=content_research_context,
                 audio_context=chunk.get("audio_context") or [],
+                scene_cuts=scene_cuts,
+                source_minutes=source_minutes,
             )
 
         coordinator = None
@@ -507,6 +591,14 @@ def main() -> None:
             )
 
         def _handle_video_segment(segment_path: Path, segment_index: int) -> None:
+            if shot_detector is not None:
+                try:
+                    cuts = shot_detector.detect_cuts(segment_path, segment_index * chunk_seconds)
+                    chunk_cuts[segment_index] = cuts
+                    print(f"Detected {len(cuts)} scene cut(s) in segment {segment_index}")
+                except Exception as exc:
+                    # Cuts are context, not a dependency; capture must survive.
+                    print(f"Shot detection failed for segment {segment_index} (continuing): {exc}")
             if storage is not None:
                 key = f"{archive_prefix}/{segment_path.name}"
                 storage.upload_file(segment_path, key)
@@ -601,6 +693,8 @@ def main() -> None:
                 end_seconds=end_seconds,
                 deepgram_model=deepgram_model,
                 coordinator=coordinator,
+                scene_cuts=chunk_cuts.get(chunk_index),
+                word_spans=word_spans,
             ),
             archive_dir=archive_dir,
             on_video_segment=_handle_video_segment if archive_dir is not None else None,
@@ -613,13 +707,21 @@ def main() -> None:
 
         if pipeline_mode == "long" and not stop_state["requested"]:
             longform_result.update(
-                _stitch_longform(
+                _edit_longform(
                     db=db,
                     records=records,
                     project_id=project_id,
                     project_dir=project_dir,
                     clips_bucket=clips_bucket,
                     rendered_log=rendered_log,
+                    chunk_count=chunk_count,
+                    chunk_seconds=chunk_seconds,
+                    target_length=target_length,
+                    user_instructions=user_instructions,
+                    research_context=content_research_context,
+                    reasoning_effort=llm_reasoning_effort,
+                    chunk_cuts=chunk_cuts,
+                    word_spans=word_spans,
                 )
             )
 
@@ -683,7 +785,48 @@ def main() -> None:
         raise
 
 
-def _stitch_longform(
+def _cuts_near_window(
+    chunk_cuts: dict[int, list[float]],
+    chunk_seconds: int,
+    start_seconds: float,
+    end_seconds: float,
+) -> list[float]:
+    """Every detected scene cut in the chunks a window touches, plus one chunk
+    of margin on each side so boundary snapping can look just past the edges."""
+    first = int(start_seconds // chunk_seconds) - 1
+    last = int(end_seconds // chunk_seconds) + 1
+    return sorted(
+        cut for index in range(first, last + 1) for cut in chunk_cuts.get(index, [])
+    )
+
+
+def _probe_source_minutes(source_url: str) -> float | None:
+    """Best-effort source duration in minutes via yt-dlp; None when unknown."""
+    try:
+        result = subprocess.run(
+            [
+                "yt-dlp",
+                "--quiet",
+                "--no-warnings",
+                *ytdlp_cookie_args(),
+                "--skip-download",
+                "--print",
+                "duration",
+                source_url,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        duration_seconds = float(result.stdout.strip().splitlines()[0])
+        return duration_seconds / 60 if duration_seconds > 0 else None
+    except Exception:
+        return None
+
+
+def _edit_longform(
     *,
     db: SupabaseClient | None,
     records: ProjectRecords,
@@ -691,15 +834,151 @@ def _stitch_longform(
     project_dir: Path,
     clips_bucket: str,
     rendered_log: list[dict],
+    chunk_count: int,
+    chunk_seconds: int,
+    target_length: str | None,
+    user_instructions: str | None,
+    research_context: dict | None,
+    reasoning_effort: str,
+    chunk_cuts: dict[int, list[float]],
+    word_spans: list[tuple[float, float]],
 ) -> dict:
-    """Concatenate the rendered segments chronologically into one long-form
-    video, persist it like a clip, and return its metadata (or a failure/empty
-    record — stitching problems must not fail the whole run)."""
-    if not rendered_log:
+    """Pass 2: one global editor call sees every rendered pass-1 candidate and
+    makes the final cut — keep/drop, plus tightening within a segment's own
+    window — before stitching. Any editor failure falls back to stitching all
+    pass-1 selections, so this pass can only improve a run."""
+    entries = sorted(rendered_log, key=lambda clip: clip["start_seconds"])
+    editor_meta: dict | None = None
+    if len(entries) >= 2:
+        try:
+            edit = select_longform_segments(
+                candidates=entries,
+                source_minutes=chunk_count * chunk_seconds / 60,
+                target_length=target_length,
+                research_context=research_context,
+                user_instructions=user_instructions,
+                reasoning_effort=reasoning_effort,
+            )
+            if not edit["selections"]:
+                raise RuntimeError("the editor kept no segments")
+            final_entries, editor_meta = _apply_longform_selections(
+                entries=entries,
+                edit=edit,
+                project_dir=project_dir,
+                chunk_cuts=chunk_cuts,
+                word_spans=word_spans,
+                chunk_seconds=chunk_seconds,
+            )
+            records.append_decision(
+                {"type": "longform_edit", **editor_meta, "selections": edit["selections"]}
+            )
+            print(
+                f"Long-form editor kept {editor_meta['kept_segments']} of "
+                f"{editor_meta['candidate_segments']} candidate segment(s)"
+                + (
+                    f" ({editor_meta['trimmed_segments']} tightened)"
+                    if editor_meta["trimmed_segments"]
+                    else ""
+                )
+            )
+            entries = final_entries
+        except Exception as exc:
+            print(f"Long-form editor pass failed; stitching all pass-1 selections: {exc}")
+            editor_meta = {"status": "failed", "error": str(exc)}
+            records.append_decision({"type": "longform_edit", **editor_meta})
+
+    return _stitch_longform(
+        db=db,
+        records=records,
+        project_id=project_id,
+        project_dir=project_dir,
+        clips_bucket=clips_bucket,
+        entries=entries,
+        editor=editor_meta,
+    )
+
+
+def _apply_longform_selections(
+    *,
+    entries: list[dict],
+    edit: dict,
+    project_dir: Path,
+    chunk_cuts: dict[int, list[float]],
+    word_spans: list[tuple[float, float]],
+    chunk_seconds: int,
+) -> tuple[list[dict], dict]:
+    """Materialize the editor's selections: keep each chosen rendered segment,
+    re-cutting any whose final window was tightened (snapped to scene cuts,
+    never extended). Returns (final entries, editor metadata)."""
+    segments_dir = project_dir / "longform" / "segments"
+    final_entries: list[dict] = []
+    trimmed = 0
+    for order, selection in enumerate(edit["selections"]):
+        candidate = entries[selection["index"]]
+        entry = {**candidate, "editor_reason": selection["reason"]}
+        start, end = selection["start_seconds"], selection["end_seconds"]
+        needs_trim = (
+            start - candidate["start_seconds"] > 0.25
+            or candidate["end_seconds"] - end > 0.25
+        )
+        if needs_trim:
+            nearby_cuts = _cuts_near_window(chunk_cuts, chunk_seconds, start, end)
+            snap_info = None
+            if nearby_cuts:
+                start, end, snap_info = snap_window(
+                    start, end, cuts=nearby_cuts, word_spans=word_spans
+                )
+            start = max(start, candidate["start_seconds"])
+            end = min(end, candidate["end_seconds"])
+            if end - start >= 2.0:
+                output_path = segments_dir / f"segment_{order:03d}.mp4"
+                trim_clip(
+                    source_path=Path(candidate["path"]),
+                    output_path=output_path,
+                    start_offset_seconds=start - candidate["start_seconds"],
+                    duration_seconds=end - start,
+                )
+                entry.update(
+                    {"path": str(output_path), "start_seconds": start, "end_seconds": end}
+                )
+                if snap_info is not None:
+                    entry["boundary_snap"] = snap_info
+                trimmed += 1
+
+        final_entries.append(entry)
+
+    editor_meta = {
+        "status": "applied",
+        "model": edit["model"],
+        "edit_notes": edit["edit_notes"],
+        "arithmetic": edit["arithmetic"],
+        "candidate_segments": len(entries),
+        "kept_segments": len(final_entries),
+        "dropped_segments": len(entries) - len(final_entries),
+        "trimmed_segments": trimmed,
+        "candidates_dropped_from_prompt": edit["candidates_dropped_from_prompt"],
+    }
+    return sorted(final_entries, key=lambda e: e["start_seconds"]), editor_meta
+
+
+def _stitch_longform(
+    *,
+    db: SupabaseClient | None,
+    records: ProjectRecords,
+    project_id: str,
+    project_dir: Path,
+    clips_bucket: str,
+    entries: list[dict],
+    editor: dict | None = None,
+) -> dict:
+    """Concatenate the final segments chronologically into one long-form
+    video, persist it as longform_edits version 1, and return its metadata (or
+    a failure/empty record — stitching problems must not fail the whole run)."""
+    if not entries:
         print("No rendered segments to stitch into a long-form video.")
         return {"status": "empty", "segments": 0}
 
-    ordered = sorted(rendered_log, key=lambda clip: clip["start_seconds"])
+    ordered = sorted(entries, key=lambda clip: clip["start_seconds"])
     output_path = project_dir / "longform" / "longform.mp4"
     total_seconds = sum(clip["end_seconds"] - clip["start_seconds"] for clip in ordered)
     print(
@@ -718,6 +997,7 @@ def _stitch_longform(
 
     result = {
         "status": "rendered",
+        "version": 1,
         "local_path": os.path.relpath(output_path),
         "filename": output_path.name,
         "segments": len(ordered),
@@ -732,6 +1012,8 @@ def _stitch_longform(
             for clip in ordered
         ],
     }
+    if editor is not None:
+        result["editor"] = editor
 
     thumbnail_path = None
     try:
@@ -743,7 +1025,6 @@ def _stitch_longform(
         thumbnail_path = None
         print(f"Long-form thumbnail extraction failed (non-fatal): {exc}")
 
-    title = f"Long-form edit ({len(ordered)} segments, {total_seconds / 60:.0f} min)"
     if db is not None:
         try:
             storage_key = f"projects/{project_id}/longform/{output_path.name}"
@@ -755,36 +1036,39 @@ def _stitch_longform(
             )
             if thumbnail_path is not None:
                 try:
+                    thumbnail_key = f"projects/{project_id}/longform/{thumbnail_path.name}"
                     result["thumbnail_url"] = db.upload_storage_object(
-                        bucket=clips_bucket,
-                        key=f"projects/{project_id}/longform/{thumbnail_path.name}",
-                        path=thumbnail_path,
+                        bucket=clips_bucket, key=thumbnail_key, path=thumbnail_path
                     )
+                    result["thumbnail_storage_path"] = thumbnail_key
                 except Exception as exc:
                     print(f"Long-form thumbnail upload failed (non-fatal): {exc}")
-            db.insert_clip(
+            db.insert_longform_edit(
                 project_id=project_id,
-                title=title,
-                description=f"Stitched long-form edit assembled from {len(ordered)} segments.",
-                start_seconds=ordered[0]["start_seconds"],
-                end_seconds=ordered[-1]["end_seconds"],
-                video_url=video_url,
+                version=1,
                 status="rendered",
+                video_url=video_url,
+                thumbnail_url=result.get("thumbnail_url"),
+                duration_seconds=round(total_seconds, 3),
+                segments=result["segment_windows"],
+                editor=editor,
                 metadata={"source": "longform_stitch", "render": result},
             )
         except Exception as exc:
             print(f"Long-form upload failed (kept locally at {output_path}): {exc}")
             result["upload_error"] = str(exc)
 
-    records.append_clip(
+    records.append_longform_edit(
         {
             "project_id": project_id,
-            "title": title,
-            "description": f"Stitched long-form edit assembled from {len(ordered)} segments.",
-            "start_seconds": ordered[0]["start_seconds"],
-            "end_seconds": ordered[-1]["end_seconds"],
-            "video_url": result.get("video_url") or result["local_path"],
+            "version": 1,
             "status": "rendered",
+            "video_url": result.get("video_url") or result["local_path"],
+            "thumbnail_url": result.get("thumbnail_url"),
+            "duration_seconds": round(total_seconds, 3),
+            "segments": result["segment_windows"],
+            "editor": editor,
+            "revision": None,
             "metadata": {"source": "longform_stitch", "render": result},
         }
     )
@@ -830,6 +1114,7 @@ def _store_chunk(
     start_seconds: int,
     end_seconds: int,
     deepgram_model: str,
+    scene_cuts: list[float] | None = None,
 ) -> dict:
     print(f"Transcribing chunk {chunk_index} ({start_seconds}s-{end_seconds}s)")
     transcript = transcribe_audio_file(audio_path, model=deepgram_model)
@@ -839,6 +1124,8 @@ def _store_chunk(
         "deepgram_request_id": transcript["metadata"].get("request_id"),
         "deepgram": transcript["metadata"],
     }
+    if scene_cuts is not None:
+        metadata["scene_cuts"] = scene_cuts
 
     if db is not None:
         db.insert_transcript_chunk(
@@ -877,6 +1164,8 @@ def _process_chunk(
     end_seconds: int,
     deepgram_model: str,
     coordinator: ClipScoringCoordinator | None,
+    scene_cuts: list[float] | None = None,
+    word_spans: list[tuple[float, float]] | None = None,
 ) -> None:
     stored = _store_chunk(
         db=db,
@@ -887,7 +1176,13 @@ def _process_chunk(
         start_seconds=start_seconds,
         end_seconds=end_seconds,
         deepgram_model=deepgram_model,
+        scene_cuts=scene_cuts,
     )
+    if word_spans is not None:
+        word_spans.extend(
+            (float(word["absolute_start"]), float(word["absolute_end"]))
+            for word in stored["words"]
+        )
     if coordinator is None:
         return
     # Scoring happens on the coordinator's pool: this chunk is dispatched once
@@ -915,6 +1210,9 @@ def _render_and_store_clip(
     segment_paths: list[Path],
     first_segment_start_seconds: float,
     rendered_log: list[dict],
+    reframe_enabled: bool = False,
+    scene_cuts: list[float] | None = None,
+    research_context: dict | None = None,
 ) -> None:
     filename = clip_filename(
         chunk_index=decision["chunk_index"],
@@ -938,6 +1236,18 @@ def _render_and_store_clip(
             "filename": filename,
         }
         thumbnail_path = _extract_clip_thumbnail(output_path, decision)
+        vertical_path = None
+        if reframe_enabled:
+            reframed = _reframe_clip(
+                clip_path=output_path,
+                decision=decision,
+                scene_cuts=scene_cuts,
+                research_context=research_context,
+            )
+            if reframed is not None:
+                vertical_path, crop_track = reframed
+                render_result["vertical_path"] = os.path.relpath(vertical_path)
+                decision = {**decision, "reframe": crop_track}
         if db is not None:
             storage_key = f"projects/{project_id}/clips/{filename}"
             video_url = db.upload_storage_object(
@@ -954,19 +1264,31 @@ def _render_and_store_clip(
             )
             if thumbnail_path is not None:
                 try:
+                    thumbnail_key = f"projects/{project_id}/clips/{thumbnail_path.name}"
                     render_result["thumbnail_url"] = db.upload_storage_object(
-                        bucket=clips_bucket,
-                        key=f"projects/{project_id}/clips/{thumbnail_path.name}",
-                        path=thumbnail_path,
+                        bucket=clips_bucket, key=thumbnail_key, path=thumbnail_path
                     )
+                    render_result["thumbnail_storage_path"] = thumbnail_key
                 except Exception as exc:
                     print(f"Thumbnail upload failed (non-fatal): {exc}")
+            if vertical_path is not None:
+                try:
+                    vertical_key = f"projects/{project_id}/clips/{vertical_path.name}"
+                    render_result["vertical_url"] = db.upload_storage_object(
+                        bucket=clips_bucket, key=vertical_key, path=vertical_path
+                    )
+                    render_result["vertical_storage_path"] = vertical_key
+                except Exception as exc:
+                    print(f"Vertical clip upload failed (non-fatal): {exc}")
 
         rendered_log.append(
             {
                 "path": str(output_path),
                 "chunk_index": decision["chunk_index"],
                 "title": decision["title"],
+                "description": decision["description"],
+                "score": decision["score"],
+                "reason": decision["reason"],
                 "start_seconds": decision["start_seconds"],
                 "end_seconds": decision["end_seconds"],
             }
@@ -983,6 +1305,49 @@ def _render_and_store_clip(
         decision=decision,
         render_result=render_result,
     )
+
+
+def _reframe_clip(
+    *,
+    clip_path: Path,
+    decision: dict,
+    scene_cuts: list[float] | None,
+    research_context: dict | None,
+) -> tuple[Path, dict] | None:
+    """Best-effort blur-pad vertical next to the rendered clip. Returns
+    (vertical_path, crop_track) or None — a reframe failure keeps the 16:9."""
+    try:
+        duration = decision["end_seconds"] - decision["start_seconds"]
+        relative_cuts = [
+            round(cut - decision["start_seconds"], 2)
+            for cut in (scene_cuts or [])
+            if decision["start_seconds"] < cut < decision["end_seconds"]
+        ]
+        crop_track = plan_crop_track(
+            clip_path=clip_path,
+            clip_duration_seconds=duration,
+            scene_cuts=relative_cuts,
+            title=decision["title"],
+            description=decision["description"],
+            research_context=research_context,
+        )
+        vertical_path = clip_path.with_name(f"{clip_path.stem}_vertical.mp4")
+        render_vertical(
+            source_path=clip_path,
+            output_path=vertical_path,
+            keyframes=crop_track["keyframes"],
+        )
+        print(
+            f"Reframed clip {decision['chunk_index']} to {vertical_path.name} "
+            f"({len(crop_track['keyframes'])} framing(s))"
+        )
+        return vertical_path, crop_track
+    except Exception as exc:
+        print(
+            f"Auto-reframe failed for chunk {decision['chunk_index']} "
+            f"(keeping the 16:9 clip): {exc}"
+        )
+        return None
 
 
 def _extract_clip_thumbnail(clip_path: Path, decision: dict) -> Path | None:
@@ -1020,9 +1385,11 @@ def _store_clip_decision(
 
     clip_status = "detected"
     video_url = None
+    vertical_url = None
     if render_result is not None:
         clip_status = render_result.get("status", "detected")
         video_url = render_result.get("video_url") or render_result.get("local_path")
+        vertical_url = render_result.get("vertical_url") or render_result.get("vertical_path")
 
     clip_metadata = {
         "source": "llm",
@@ -1032,6 +1399,8 @@ def _store_clip_decision(
         "reason": decision["reason"],
         "research_sources": decision.get("research_sources", []),
         "raw_decision": decision["raw_decision"],
+        "boundary_snap": decision.get("boundary_snap"),
+        "reframe": decision.get("reframe"),
         "render": render_result,
         "thumbnail_url": (render_result or {}).get("thumbnail_url"),
         "merged_from": decision.get("merged_from"),
@@ -1045,6 +1414,7 @@ def _store_clip_decision(
             "end_seconds": decision["end_seconds"],
             "score": decision["score"],
             "video_url": video_url,
+            "vertical_url": vertical_url,
             "status": clip_status,
             "metadata": clip_metadata,
         }
@@ -1058,6 +1428,7 @@ def _store_clip_decision(
             end_seconds=decision["end_seconds"],
             score=decision["score"],
             video_url=render_result.get("video_url") if render_result else None,
+            vertical_url=render_result.get("vertical_url") if render_result else None,
             status=clip_status,
             metadata=clip_metadata,
         )
@@ -1174,6 +1545,20 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         default=False,
         help="Skip LLM clip scoring after transcription (also via NO_LLM=1).",
+    )
+    parser.add_argument(
+        "--no-shots",
+        action="store_true",
+        default=False,
+        help="Skip TransNetV2 shot detection: no scene cuts in editor prompts and no "
+        "cut-aligned boundary snapping (also via NO_SHOTS=1).",
+    )
+    parser.add_argument(
+        "--no-reframe",
+        action="store_true",
+        default=False,
+        help="Short mode: skip the auto-reframe pass that renders a blur-pad 9:16 "
+        "vertical next to each clip (also via NO_REFRAME=1).",
     )
     parser.add_argument(
         "--llm-reasoning-effort",

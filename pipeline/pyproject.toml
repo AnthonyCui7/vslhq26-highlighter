@@ -5,8 +5,13 @@ description = "Highlighter core pipeline: capture, transcription, and clip detec
 requires-python = ">=3.11"
 dependencies = ["openai", "langgraph"]
 
+[project.optional-dependencies]
+# TransNetV2 shot-boundary detection (scene cuts + boundary snapping).
+shots = ["transnetv2-pytorch", "numpy"]
+
 [project.scripts]
 highlighter-db-smoke = "highlighter_pipeline.db_smoke:main"
 highlighter-ingest = "highlighter_pipeline.ingest:main"
 highlighter-reclip = "highlighter_pipeline.reclip:main"
+highlighter-revise = "highlighter_pipeline.revise:main"
 highlighter-cleanup = "highlighter_pipeline.cleanup:main"

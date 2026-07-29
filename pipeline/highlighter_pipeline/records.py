@@ -8,6 +8,7 @@ the same shape the database has:
     transcript_chunks.jsonl  one line per transcript_chunks row (with words)
     clips.jsonl              one line per clips row (worthy, rendered clips)
     decisions.jsonl          full editorial log: every decision, worthy or not
+    longform_edits.jsonl     one line per stitched long-form version
     research.json            content research context, when research ran
 """
 
@@ -25,7 +26,13 @@ class ProjectRecords:
     def __init__(self, project_dir: Path) -> None:
         self.project_dir = project_dir
         self.project_dir.mkdir(parents=True, exist_ok=True)
-        self._project: dict[str, Any] = {"created_at": _now()}
+        # Resume an existing record (e.g. the revision loop reopening a
+        # finished project) instead of starting a fresh row over it.
+        project_file = self.project_dir / "project.json"
+        if project_file.exists():
+            self._project: dict[str, Any] = json.loads(project_file.read_text())
+        else:
+            self._project = {"created_at": _now()}
 
     def update_project(self, **fields: Any) -> None:
         """Merge fields into project.json (None values are ignored so a status
@@ -42,6 +49,9 @@ class ProjectRecords:
 
     def append_decision(self, row: dict[str, Any]) -> None:
         self._append_jsonl("decisions.jsonl", row)
+
+    def append_longform_edit(self, row: dict[str, Any]) -> None:
+        self._append_jsonl("longform_edits.jsonl", row)
 
     def write_research(self, context: dict[str, Any]) -> None:
         self._write_json("research.json", context)

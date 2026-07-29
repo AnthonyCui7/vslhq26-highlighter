@@ -91,6 +91,16 @@ class SupabaseClient:
         )
         return rows[0] if rows else None
 
+    def update_project_metadata(self, project_id: str, metadata: dict[str, Any]) -> None:
+        """PATCH only the metadata jsonb, leaving status untouched."""
+        self._request(
+            "PATCH",
+            "projects",
+            query={"id": f"eq.{project_id}"},
+            body={"metadata": metadata},
+            prefer="return=minimal",
+        )
+
     def get_project_status(self, project_id: str) -> str | None:
         rows = self._request(
             "GET",
@@ -135,6 +145,7 @@ class SupabaseClient:
         description: str | None = None,
         score: float | None = None,
         video_url: str | None = None,
+        vertical_url: str | None = None,
         status: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> None:
@@ -146,6 +157,7 @@ class SupabaseClient:
             "description": description,
             "score": score,
             "video_url": video_url,
+            "vertical_url": vertical_url,
             "metadata": metadata or {},
         }
         if status is not None:
@@ -155,6 +167,38 @@ class SupabaseClient:
             "POST",
             "clips",
             body=body,
+            prefer="return=minimal",
+        )
+
+    def insert_longform_edit(
+        self,
+        *,
+        project_id: str,
+        version: int,
+        status: str = "rendered",
+        video_url: str | None = None,
+        thumbnail_url: str | None = None,
+        duration_seconds: float | None = None,
+        segments: list[dict[str, Any]] | None = None,
+        editor: dict[str, Any] | None = None,
+        revision: dict[str, Any] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        self._request(
+            "POST",
+            "longform_edits",
+            body={
+                "project_id": project_id,
+                "version": version,
+                "status": status,
+                "video_url": video_url,
+                "thumbnail_url": thumbnail_url,
+                "duration_seconds": duration_seconds,
+                "segments": segments or [],
+                "editor": editor,
+                "revision": revision,
+                "metadata": metadata or {},
+            },
             prefer="return=minimal",
         )
 

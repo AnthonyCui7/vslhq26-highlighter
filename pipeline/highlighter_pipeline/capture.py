@@ -190,6 +190,18 @@ def capture_audio_chunks(
     archived: set[str] = set()
 
     def _sweep(include_latest: bool) -> None:
+        # Video segments before audio chunks: both finalize together (one
+        # ffmpeg segmenter), and the segment handler derives per-chunk scene
+        # cuts that the transcript store and clip scoring want available.
+        if archive_dir is not None and on_video_segment is not None:
+            _process_ready_files(
+                archive_dir,
+                "video_*.ts",
+                archived,
+                include_latest=include_latest,
+                handler=on_video_segment,
+                should_stop=should_stop,
+            )
         _process_ready_files(
             output_dir,
             "audio_*.wav",
@@ -200,15 +212,6 @@ def capture_audio_chunks(
             ),
             should_stop=should_stop,
         )
-        if archive_dir is not None and on_video_segment is not None:
-            _process_ready_files(
-                archive_dir,
-                "video_*.ts",
-                archived,
-                include_latest=include_latest,
-                handler=on_video_segment,
-                should_stop=should_stop,
-            )
 
     stopped = False
     try:

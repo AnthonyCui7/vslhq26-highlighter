@@ -10,8 +10,13 @@ DEFAULT_LLM_CONCURRENCY = 8
 DEFAULT_LLM_CONTEXT_SECONDS = 10
 DEFAULT_CLIP_MERGE_GAP_SECONDS = 1.0
 DEFAULT_MAX_CLIP_SECONDS = 120
-# Long-form mode selects bigger segments and tolerates wider gaps when merging.
-DEFAULT_LONGFORM_MERGE_GAP_SECONDS = 15.0
+# Shot-boundary detection (TransNetV2) and cut-aligned boundary snapping.
+DEFAULT_SHOT_FPS = 25
+DEFAULT_SHOT_SNAP_TOLERANCE_SECONDS = 1.5
+# Long-form mode selects bigger segments but keeps the merge gap tight: the
+# editor deliberately splits a passage around coughs, false starts, and dead
+# air, and a wide gap would glue those micro-cuts (junk included) back in.
+DEFAULT_LONGFORM_MERGE_GAP_SECONDS = 1.0
 DEFAULT_LONGFORM_MAX_CLIP_SECONDS = 900
 DEFAULT_TARGET_LENGTH_MINUTES = "7-15"
 DEFAULT_RESEARCH_MODEL = "anthropic/claude-sonnet-5"

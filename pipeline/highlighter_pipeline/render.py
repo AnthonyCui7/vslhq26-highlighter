@@ -117,6 +117,50 @@ def render_clip_from_segments(
         )
 
 
+def trim_clip(
+    *,
+    source_path: Path,
+    output_path: Path,
+    start_offset_seconds: float,
+    duration_seconds: float,
+) -> None:
+    """Re-encode a window of an already-rendered clip (same encode settings as
+    renders, so trimmed segments still codec-copy concat with untrimmed ones)."""
+    if duration_seconds <= 0:
+        raise RuntimeError("Trim duration must be greater than 0")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    _run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(source_path),
+            "-ss",
+            f"{max(0.0, start_offset_seconds):.3f}",
+            "-t",
+            f"{duration_seconds:.3f}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "30",
+            "-vf",
+            "scale='min(720,iw)':-2",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+    )
+
+
 def extract_thumbnail(*, clip_path: Path, output_path: Path, at_seconds: float) -> None:
     """Extract a single JPEG frame (~480px wide) from a rendered clip."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
