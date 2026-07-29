@@ -1,0 +1,27 @@
+# Env and secrets
+.env
+.env.*
+
+# Generated runtime data and local test harness
+/outputs/
+/tests/
+pipeline/data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# Node
+node_modules/
+apps/web/dist/
+
+# Supabase CLI local state
+supabase/.temp/
+
+# OS/editor
+.DS_Store
+.claude/
+
+PROJECT.md
