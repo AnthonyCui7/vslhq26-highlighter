@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Highlighter.Cli/Highlighter.Cli.csproj" />
+    <Project Path="src/Highlighter.Pipeline/Highlighter.Pipeline.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Highlighter.Pipeline.Tests/Highlighter.Pipeline.Tests.csproj" />
+  </Folder>
+</Solution>

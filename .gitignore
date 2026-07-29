@@ -39,6 +39,8 @@ supabase/.temp/
 .idea/
 .vscode/
 .claude/
+# RocketRide VS Code extension drops a schema cache in any open workspace
+.rocketride/
 
 # Internal planning notes
 PROJECT.md
