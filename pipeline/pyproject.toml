@@ -1,0 +1,12 @@
+[project]
+name = "highlighter-pipeline"
+version = "0.1.0"
+description = "Highlighter core pipeline: capture, transcription, and clip detection."
+requires-python = ">=3.11"
+dependencies = ["openai", "langgraph"]
+
+[project.scripts]
+highlighter-db-smoke = "highlighter_pipeline.db_smoke:main"
+highlighter-ingest = "highlighter_pipeline.ingest:main"
+highlighter-reclip = "highlighter_pipeline.reclip:main"
+highlighter-cleanup = "highlighter_pipeline.cleanup:main"

@@ -1,0 +1,54 @@
+"""Local project records: a file mirror of what lands in Supabase.
+
+Every run — Supabase-backed or --local-only — writes these under the project
+directory, so `outputs/projects/<id>/` is always a self-contained record with
+the same shape the database has:
+
+    project.json             the projects row (status, metadata, error)
+    transcript_chunks.jsonl  one line per transcript_chunks row (with words)
+    clips.jsonl              one line per clips row (worthy, rendered clips)
+    decisions.jsonl          full editorial log: every decision, worthy or not
+    research.json            content research context, when research ran
+"""
+
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+class ProjectRecords:
+    def __init__(self, project_dir: Path) -> None:
+        self.project_dir = project_dir
+        self.project_dir.mkdir(parents=True, exist_ok=True)
+        self._project: dict[str, Any] = {"created_at": _now()}
+
+    def update_project(self, **fields: Any) -> None:
+        """Merge fields into project.json (None values are ignored so a status
+        write never erases metadata written earlier)."""
+        self._project.update({k: v for k, v in fields.items() if v is not None})
+        self._project["updated_at"] = _now()
+        self._write_json("project.json", self._project)
+
+    def append_chunk(self, row: dict[str, Any]) -> None:
+        self._append_jsonl("transcript_chunks.jsonl", row)
+
+    def append_clip(self, row: dict[str, Any]) -> None:
+        self._append_jsonl("clips.jsonl", row)
+
+    def append_decision(self, row: dict[str, Any]) -> None:
+        self._append_jsonl("decisions.jsonl", row)
+
+    def write_research(self, context: dict[str, Any]) -> None:
+        self._write_json("research.json", context)
+
+    def _write_json(self, name: str, payload: dict[str, Any]) -> None:
+        (self.project_dir / name).write_text(json.dumps(payload, indent=2, default=str))
+
+    def _append_jsonl(self, name: str, row: dict[str, Any]) -> None:
+        with (self.project_dir / name).open("a") as file:
+            file.write(json.dumps(row, default=str) + "\n")

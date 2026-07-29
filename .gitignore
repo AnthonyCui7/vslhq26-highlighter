@@ -1,20 +1,34 @@
 # Env and secrets
 .env
 .env.*
+!.env.example
 
 # Generated runtime data and local test harness
-/outputs/
+# Unanchored: the pipeline writes these relative to its working directory,
+# so they land under pipeline/ when the module is run from there.
+outputs/
+data/
 /tests/
-pipeline/data/
+pipeline/local-poc/
 
 # Python
 __pycache__/
 *.py[cod]
+.python-version
 .venv/
+venv/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
 
 # Node
 node_modules/
+.vite/
 apps/web/dist/
 
 # Supabase CLI local state
@@ -22,6 +36,9 @@ supabase/.temp/
 
 # OS/editor
 .DS_Store
+.idea/
+.vscode/
 .claude/
 
+# Internal planning notes
 PROJECT.md
