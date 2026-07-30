@@ -22,6 +22,21 @@ public sealed class PipelineJobService(RepoLayout layout, SupabaseDb db, ILogger
 
     public static string NewJobId() => "job_" + Guid.NewGuid().ToString("N")[..12];
 
+    /// <summary>Wait (bounded) for a job to reach a terminal state — for verbs
+    /// that are metadata flips rather than renders, where the caller wants a
+    /// definite answer. True when the job finished within the timeout.</summary>
+    public static async Task<bool> WaitForExitAsync(
+        PipelineJob job, TimeSpan timeout, CancellationToken ct = default)
+    {
+        var deadline = DateTimeOffset.UtcNow + timeout;
+        while (job.State is JobState.Starting or JobState.Running
+               && DateTimeOffset.UtcNow < deadline)
+        {
+            await Task.Delay(250, ct);
+        }
+        return job.State is not (JobState.Starting or JobState.Running);
+    }
+
     /// <summary>id may be preassigned (POST /api/projects writes it into the row's
     /// instance_id before the row exists, so it must be known up front).</summary>
     public PipelineJob Start(string kind, Guid? projectId, IReadOnlyList<string> workerArgs, string? id = null)
@@ -63,6 +78,60 @@ public sealed class PipelineJobService(RepoLayout layout, SupabaseDb db, ILogger
             throw new WorkerUnavailableException(
                 $"Failed to launch the pipeline worker: {exception.Message} (job {id}, log: {job.LogPath})");
         }
+        return job;
+    }
+
+    /// <summary>An API-native job (editor exports): same registry, conflict
+    /// rules, and durable log file as worker jobs, but the work runs in-process.
+    /// The body returns an exit code; an exception marks the job failed.</summary>
+    public PipelineJob StartExternal(string kind, Guid? projectId,
+        IReadOnlyList<string> displayArgv, Func<PipelineJob, CancellationToken, Task<int>> body)
+    {
+        var id = NewJobId();
+        var logName = $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{kind}"
+            + $"-{(projectId is { } p ? p.ToString()[..8] : "global")}-{id}.log";
+        var job = new PipelineJob(id, kind, projectId, displayArgv,
+            Path.Combine(layout.JobLogRoot, logName));
+
+        lock (_gate)
+        {
+            if (projectId is { } pid && ActiveForProjectLocked(pid) is { } blocker)
+                throw new JobConflictException(
+                    $"Project {pid} already has an active job ({blocker.Id}: {blocker.Kind}).");
+            _jobs[id] = job;
+            _order.Add(job);
+        }
+
+        job.OpenSink(
+        [
+            $"job {job.Id} kind={kind}" + (projectId is { } proj ? $" project={proj}" : ""),
+            $"command: {string.Join(' ', displayArgv)} (in-process)",
+        ]);
+        job.MarkRunning();
+        log.LogInformation("Job {JobId} ({Kind}) started in-process for project {ProjectId}",
+            id, kind, projectId);
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var exitCode = await body(job, CancellationToken.None);
+                job.MarkExited(exitCode, null);
+                log.LogInformation("Job {JobId} ({Kind}) finished: {State} (exit {Exit})",
+                    id, kind, job.State, exitCode);
+            }
+            catch (Exception exception)
+            {
+                job.Append("err", exception.ToString());
+                job.MarkFailed($"{kind} failed: {exception.Message}");
+                log.LogError(exception, "Job {JobId} ({Kind}) failed; log: {LogPath}",
+                    id, kind, job.LogPath);
+            }
+            finally
+            {
+                Evict();
+            }
+        });
         return job;
     }
 

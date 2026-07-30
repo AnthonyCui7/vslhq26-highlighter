@@ -67,14 +67,14 @@ public class StudioAgentService(StudioState state, IStudioBackend backend)
         if (_sessionContext == ContextKey()) return;
         state.AgentMessages.Clear();
         state.AddAgentMessage("agent", state.AgentContext == "long"
-            ? $"Working on the long-form cut \"{SampleData.LongformTitle}\" (v2, 24:36). "
+            ? $"Working on the long-form cut \"{state.LongformTitle}\". "
               + "I can revise the cut, rerun research, and generate or select thumbnails."
             : $"Working on \"{state.ActiveClipTitle}\". I can rerun research, re-render this "
               + "clip in another format, and answer questions about the project.");
         ResetAgent();
     }
 
-    private string ContextKey() => $"{state.AgentContext}:{state.ActiveClip}";
+    private string ContextKey() => $"{state.AgentContext}:{state.ActiveClip?.Id}";
 
     private void ResetAgent()
     {
@@ -105,7 +105,7 @@ public class StudioAgentService(StudioState state, IStudioBackend backend)
             + "editor. When something is unavailable, say so plainly and offer the closest "
             + "alternative.";
         return state.AgentContext == "long"
-            ? shared + $" Context: the long-form cut \"{SampleData.LongformTitle}\" (v2). You "
+            ? shared + $" Context: the long-form cut \"{state.LongformTitle}\". You "
               + "can revise the cut with revise_longform (a re-cut keeps the thumbnail and "
               + "title), refresh research, and generate, select, or list thumbnails."
             : shared + $" Context: the highlight clip \"{state.ActiveClipTitle}\". Revisions "

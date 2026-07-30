@@ -2,7 +2,9 @@ using Highlighter.Api;
 using Highlighter.Api.Endpoints;
 using Highlighter.Api.Infrastructure;
 using Highlighter.Api.Services;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Diagnostics;
+using Microsoft.IdentityModel.Tokens;
 using Scalar.AspNetCore;
 using Serilog;
 using Serilog.Events;
@@ -35,9 +37,43 @@ builder.Services.AddHttpClient(SupabaseDb.HttpClientName);
 builder.Services.AddSingleton(provider => SupabaseDb.FromEnv(
     provider.GetRequiredService<IHttpClientFactory>(),
     provider.GetRequiredService<ILogger<SupabaseDb>>()));
+builder.Services.AddHttpClient(SupabaseStorage.HttpClientName);
+builder.Services.AddHttpClient(EditorExportService.HttpClientName,
+    client => client.Timeout = TimeSpan.FromMinutes(10));
+builder.Services.AddSingleton(provider => SupabaseStorage.FromEnv(
+    provider.GetRequiredService<IHttpClientFactory>(),
+    provider.GetRequiredService<ILogger<SupabaseStorage>>()));
+builder.Services.AddSingleton<EditorRenderer>();
+builder.Services.AddSingleton<EditorExportService>();
 builder.Services.AddSingleton<PipelineJobService>();
 builder.Services.AddSingleton<MediaCleanupScheduler>();
 builder.Services.AddHostedService(provider => provider.GetRequiredService<MediaCleanupScheduler>());
+
+// Auth: /api/auth proxies GoTrue; everything else validates the Supabase user
+// JWT (ES256 against the project JWKS) when Api:RequireAuth is on.
+builder.Services.AddHttpClient(SupabaseAuth.HttpClientName);
+builder.Services.AddSingleton(provider => SupabaseAuth.FromEnv(
+    provider.GetRequiredService<IHttpClientFactory>(),
+    provider.GetRequiredService<ILogger<SupabaseAuth>>()));
+builder.Services.AddSingleton(provider => SupabaseJwks.FromEnv(
+    provider.GetRequiredService<IHttpClientFactory>(),
+    provider.GetRequiredService<ILogger<SupabaseJwks>>()));
+var supabaseUrl = Environment.GetEnvironmentVariable("SUPABASE_URL")?.TrimEnd('/');
+builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme).AddJwtBearer();
+builder.Services.AddOptions<JwtBearerOptions>(JwtBearerDefaults.AuthenticationScheme)
+    .Configure<IServiceProvider>((options, services) =>
+    {
+        options.MapInboundClaims = false; // keep "sub" as "sub"
+        options.TokenValidationParameters = new TokenValidationParameters
+        {
+            ValidIssuer = $"{supabaseUrl}/auth/v1",
+            ValidAudience = "authenticated",
+            ValidAlgorithms = ["ES256"],
+            IssuerSigningKeyResolver = (_, _, kid, _) =>
+                services.GetRequiredService<SupabaseJwks>().GetKeys(kid),
+        };
+    });
+builder.Services.AddAuthorization();
 builder.Services.AddProblemDetails();
 builder.Services.AddOpenApi();
 builder.Services.AddCors(options => options.AddDefaultPolicy(policy =>
@@ -63,15 +99,24 @@ app.UseExceptionHandler(errorApp => errorApp.Run(async context =>
 }));
 app.UseStatusCodePages();
 app.UseCors();
+app.UseAuthentication();
+app.UseAuthorization();
 app.UseMiddleware<ApiKeyMiddleware>();
 
 app.MapOpenApi();
 app.MapScalarApiReference();
 app.MapHealthEndpoints();
-app.MapProjectEndpoints();
-app.MapProjectActionEndpoints();
-app.MapJobEndpoints();
-app.MapAdminEndpoints();
+app.MapAuthEndpoints();
+IEndpointConventionBuilder[] gated =
+[
+    app.MapProjectEndpoints(),
+    app.MapProjectActionEndpoints(),
+    app.MapEditorEndpoints(),
+    app.MapJobEndpoints(),
+    app.MapAdminEndpoints(),
+];
+if (apiOptions.RequireAuth)
+    foreach (var endpoints in gated) endpoints.RequireAuthorization();
 
 app.Run();
 

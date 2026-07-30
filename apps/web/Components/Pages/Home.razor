@@ -1,25 +1,48 @@
 @page "/"
-@rendermode InteractiveServer
+@rendermode RenderModes.NoPrerender
 @inherits StudioComponent
+@inject AuthSession Auth
+@inject NavigationManager Nav
 
 <PageTitle>Highlighter</PageTitle>
 
-<div class="relative flex h-screen min-h-[820px] w-full flex-col overflow-hidden bg-ink font-sans text-fg" data-screen-label="Highlighter">
-    <TopBar />
-    @if (S.IsProjects)
+@if (_ready)
+{
+    <div class="relative flex h-screen min-h-[820px] w-full flex-col overflow-hidden bg-ink font-sans text-fg" data-screen-label="Highlighter">
+        <TopBar />
+        @if (S.IsProjects)
+        {
+            <ProjectsView />
+        }
+        @if (S.IsProject)
+        {
+            <ProjectDetailView />
+        }
+        @if (S.EditorOpen)
+        {
+            <EditorOverlay />
+        }
+        @if (S.ModalOpen)
+        {
+            <NewProjectModal />
+        }
+    </div>
+}
+
+@code {
+    private bool _ready;
+
+    protected override async Task OnInitializedAsync()
     {
-        <ProjectsView />
+        await Auth.InitializeAsync();
+        if (!Auth.IsAuthenticated)
+        {
+            // BlazorDisableThrowNavigationException is set: NavigateTo returns,
+            // so the guard must return too.
+            Nav.NavigateTo("/login");
+            return;
+        }
+        _ready = true;
+        _ = S.LoadProjectsAsync(); // fire-and-forget: skeletons render meanwhile
     }
-    @if (S.IsProject)
-    {
-        <ProjectDetailView />
-    }
-    @if (S.EditorOpen)
-    {
-        <EditorOverlay />
-    }
-    @if (S.ModalOpen)
-    {
-        <NewProjectModal />
-    }
-</div>
+}

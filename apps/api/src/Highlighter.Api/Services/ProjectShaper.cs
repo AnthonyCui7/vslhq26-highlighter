@@ -92,8 +92,25 @@ public static class ProjectShaper
             CreatedAt: Ts(row["created_at"]));
     }
 
-    public static LongformEditDto Longform(JsonObject row) =>
-        new(
+    public static LongformEditDto Longform(JsonObject row)
+    {
+        var render = (row["metadata"] as JsonObject)?["render"] as JsonObject;
+        var thumbnails = render?["thumbnails"] as JsonObject;
+        var variants = Rows(thumbnails?["variants"])
+            .Select(variant => new ThumbnailVariantDto(
+                IntOrNull(variant["index"]) ?? 0,
+                Str(variant["direction"]),
+                Str(variant["overlay_text"]),
+                Str(variant["url"])))
+            .ToList();
+        // selected_index is the LIST position (the worker stores IndexOf); expose
+        // the variant's stable Index number instead.
+        var selectedPosition = IntOrNull(thumbnails?["selected_index"]);
+        int? selected = selectedPosition is { } position && position >= 0 && position < variants.Count
+            ? variants[position].Index
+            : null;
+
+        return new LongformEditDto(
             Id: Guid.Parse(Str(row["id"])!),
             Version: IntOrNull(row["version"]) ?? 1,
             Status: Str(row["status"]) ?? "rendered",
@@ -108,7 +125,11 @@ public static class ProjectShaper
                     Dbl(segment["end_seconds"]) ?? 0))
                 .ToList(),
             RevisionRequest: Str((row["revision"] as JsonObject)?["request"]),
-            CreatedAt: Ts(row["created_at"]));
+            CreatedAt: Ts(row["created_at"]),
+            Title: Str(render?["title"]),
+            Thumbnails: variants,
+            SelectedThumbnail: selected);
+    }
 
     public static PublicationDto Publication(JsonObject row)
     {

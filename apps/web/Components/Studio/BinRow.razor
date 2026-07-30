@@ -1,0 +1,21 @@
+@* One media-bin row: real thumbnail when hosted, click to preview in the monitor. *@
+
+<div @onclick="() => OnPick.InvokeAsync(Item)"
+     class="flex cursor-pointer items-center gap-2.5 rounded-[5px] border p-1.5 hover:bg-elevate @(Active ? "border-accent/40 bg-well" : "border-transparent")">
+    <div class="relative aspect-video w-[52px] shrink-0 overflow-hidden rounded-[3px] bg-[repeating-linear-gradient(-45deg,#1C1B19_0_6px,#201E1C_6px_12px)]">
+        @if (Item.Thumb is { } thumb)
+        {
+            <img src="@thumb" alt="" loading="lazy" class="absolute inset-0 h-full w-full object-cover" />
+        }
+    </div>
+    <div class="min-w-0">
+        <div class="truncate text-xs font-semibold @(Active ? "text-fg" : "text-soft")">@Item.Name</div>
+        <div class="mt-0.5 truncate font-mono text-[9.5px] text-faint">@Item.Meta</div>
+    </div>
+</div>
+
+@code {
+    [Parameter] public MediaBin.MediaItem Item { get; set; } = default!;
+    [Parameter] public bool Active { get; set; }
+    [Parameter] public EventCallback<MediaBin.MediaItem> OnPick { get; set; }
+}

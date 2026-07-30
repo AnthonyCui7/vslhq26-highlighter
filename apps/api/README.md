@@ -18,10 +18,31 @@ cd apps/api && dotnet run --project src/Highlighter.Api
 
 - **API docs (Scalar UI):** http://localhost:5199/scalar · OpenAPI at `/openapi/v1.json`
 - Secrets come from the repo-root `.env` — the exact same contract as the worker
-  (`SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`, Azure/Deepgram/OpenRouter keys, …).
-  `GET /healthz` reports what is present/missing as booleans, never values.
+  (`SUPABASE_URL` + `SUPABASE_ANON_KEY` + `SUPABASE_SERVICE_ROLE_KEY`, Azure/Deepgram/OpenRouter
+  keys, …). `GET /healthz` reports what is present/missing as booleans, never values.
 - Tests: `dotnet test apps/api` — no network, Supabase stubbed.
-- Smoke the whole flow end-to-end: `scripts/e2e-smoke.sh <short youtube VOD url>`.
+- Smoke the whole flow end-to-end: `scripts/e2e-smoke.sh <short youtube VOD url>`
+  (signs up an ephemeral account first — the API requires auth).
+
+## Auth
+
+Every `/api/*` route except `/api/auth` requires `Authorization: Bearer <token>`,
+where the token is a Supabase user JWT obtained from this API's own auth surface
+(the browser never sees a Supabase key; the API validates tokens offline against
+the project's ES256 JWKS):
+
+| Route | Purpose |
+|---|---|
+| POST `/api/auth/signup` `{email, password}` | Creates the user **in Supabase** (`auth.users`, pre-confirmed via the admin API) and returns a session |
+| POST `/api/auth/login` | Password grant → `{accessToken, refreshToken, expiresAt, user}` |
+| POST `/api/auth/refresh` `{refreshToken}` | Rotates the session (GoTrue refresh tokens are single-use) |
+| POST `/api/auth/logout` | Best-effort GoTrue sign-out, always 204 |
+
+**Strict ownership:** projects are stamped with the creator's `user_id` and every
+read/write is scoped to it — another user's project (and legacy ownerless rows)
+read as 404. Set `Api:RequireAuth=false` in `appsettings.json` (or
+`Api__RequireAuth=false` env) for tokenless scripting; queries are then unscoped,
+matching pre-auth behavior. Jobs endpoints are gated but not per-user filtered.
 
 ## Endpoints
 
@@ -40,7 +61,16 @@ cd apps/api && dotnet run --project src/Highlighter.Api
 | POST | `/api/projects/{id}/revise` | `{request}` → tool-calling revision agent → `longform_v<N>.mp4` |
 | POST | `/api/projects/{id}/publish` | `{target: clip\|longform, clipId?, version?, platforms[], title?, thumbnail?, plain?, dryRun?}` |
 | POST | `/api/projects/{id}/reclip` | `{startSeconds, endSeconds, title?}` — needs an archived livestream source |
-| GET | `/api/jobs` · `/api/jobs/{id}` | Worker process registry |
+| POST | `/api/projects/{id}/research` | `{mode?: short\|long, focus?}` → job (worker `research` verb) |
+| POST | `/api/projects/{id}/thumbnails` | `{prompt?, version?}` → job — generate more long-form thumbnail concepts |
+| POST | `/api/projects/{id}/thumbnails/select` | `{index, version?}` — make a variant the video's thumbnail (short-wait job) |
+| POST | `/api/projects/{id}/thumbnails/import` | `{fileName, contentBase64, version?}` — upload your own, stored + selected |
+| POST | `/api/projects/{id}/clips/{clipId}/reformat` | `{format: "square", captions?}` → job (worker `reformat` verb) |
+| GET/PUT | `/api/projects/{id}/clips/{clipId}/editor` | The clip's timeline-editor document (EDL; seeded from transcript words) |
+| POST | `/api/projects/{id}/clips/{clipId}/editor/export` | Render the EDL (ffmpeg in-process job) → storage + `metadata.editor.render` |
+| GET/PUT | `/api/projects/{id}/longform/editor?version=` | Long-form editor draft (stored on the version row) |
+| POST | `/api/projects/{id}/longform/editor/export` | Render the draft → a NEW long-form version row |
+| GET | `/api/jobs` · `/api/jobs/{id}` | Worker + in-process job registry |
 | GET | `/api/jobs/{id}/logs?tail=` | Log tail (falls back to the on-disk file after an API restart) |
 | GET | `/api/jobs/{id}/logs/stream` | **SSE**: replay + live worker output, terminal `end` event |
 | POST | `/api/admin/cleanup` | Manual outbox drain (`{limit}`) |
@@ -93,6 +123,21 @@ still be alive:
    error, `decisions.jsonl`, `clips.jsonl`, `transcript_chunks.jsonl`).
 5. The API's log — `outputs/api/api-<date>.log` (Serilog: request log, job
    lifecycle, every Supabase failure with status + body prefix, never keys).
+
+## The timeline editor's render path
+
+The studio's editor stores an EDL (segments/cuts/speed, captions with word
+timings, text overlays, markers, zoom/pan reframe, voice/music gains) in the
+schema's existing jsonb room — `clips.metadata.editor` for clips, a draft on the
+long-form version row — and exports run as in-process jobs: fetch the clean
+source render, composite with ffmpeg, upload to the public bucket. Because this
+machine's ffmpeg ships without libass/drawtext, caption lines and text overlays
+are rasterized to PNGs in-process (ImageSharp) and composited with the `overlay`
+filter — karaoke as one image per word-state (capped at 240 inputs, degrading to
+line-level). Clip exports overwrite a deterministic `{project}/editor/…` path;
+long-form exports insert a new version row whose `metadata.render` the existing
+DB cleanup trigger already understands. Project DELETE additionally sweeps the
+`{project}/editor/` and `{project}/thumbnails/` storage prefixes.
 
 ## Known limitations
 

@@ -3,38 +3,96 @@
 <div class="flex-1 overflow-y-auto" data-screen-label="Projects">
     <div class="mx-auto max-w-[1080px] px-10 pb-12 pt-8">
         <div class="anim-fade-up text-[22px] font-bold tracking-[-0.01em]">Projects</div>
+
+        @if (S.ProjectsError is not null)
+        {
+            <div class="anim-fade-up mt-4 flex items-center gap-3 rounded-md border border-playhead/30 bg-playhead/10 px-4 py-3 text-[13px] text-soft">
+                <span class="min-w-0 flex-1">@S.ProjectsError</span>
+                <span @onclick="() => _ = S.LoadProjectsAsync()" class="cursor-pointer font-semibold text-accent hover:text-accent-soft">Retry</span>
+            </div>
+        }
+
         <div class="mt-[22px] grid grid-cols-3 gap-4">
-            <div @onclick="S.OpenNewJob" class="anim-fade-up group flex min-h-full cursor-pointer flex-col items-center justify-center gap-2.5 rounded-lg border border-dashed border-[#33302C] text-muted hover:border-accent hover:text-fg">
+            <div @onclick="S.OpenNewJob" class="anim-fade-up group flex min-h-[180px] cursor-pointer flex-col items-center justify-center gap-2.5 rounded-lg border border-dashed border-[#33302C] text-muted hover:border-accent hover:text-fg">
                 <span class="flex h-9 w-9 items-center justify-center rounded-full border border-[#33302C] text-base transition-transform duration-150 group-hover:scale-110">+</span>
                 <span class="text-[13px] font-semibold">New project</span>
             </div>
-            @foreach (var (p, i) in SampleData.Projects.Select((p, i) => (p, i)))
+
+            @if (S.Projects is null)
             {
-                <div @onclick="() => S.OpenProject(i)" class="anim-fade-up cursor-pointer overflow-hidden rounded-lg border border-well bg-card hover:-translate-y-[2px] hover:border-[#4A4638]" style="animation-delay:@(40 * (i + 1))ms">
-                    <div class="relative flex aspect-video items-center justify-center bg-[repeating-linear-gradient(-45deg,#1C1B19_0_10px,#201E1C_10px_20px)]">
-                        <span class="font-mono text-[10px] text-dim">source frame</span>
-                        <span class="absolute bottom-2 right-2 rounded-[3px] bg-[rgba(20,19,18,0.85)] px-1.5 py-0.5 font-mono text-[10.5px] text-fg">@p.Dur</span>
-                        @if (p.Processing)
-                        {
-                            <div class="absolute inset-x-0 bottom-0 h-[3px] bg-[rgba(20,19,18,0.6)]"><div class="h-full w-[78%] bg-accent"></div></div>
-                        }
-                    </div>
-                    <div class="px-3.5 pb-3.5 pt-[13px]">
-                        <div class="text-[13.5px] font-semibold leading-[1.35]">@p.Title</div>
-                        <div class="mt-[9px] flex items-center gap-2 text-[11.5px] text-muted">
-                            <span class="rounded-[3px] border border-line2 px-[5px] py-px font-mono text-[10px] text-muted">@p.Kind</span>
-                            <span>@p.Outputs</span>
-                            <span class="ml-auto flex items-center gap-[5px] @(p.Processing ? "text-accent" : "text-muted")">
-                                @if (p.Processing)
-                                {
-                                    <span class="h-1.5 w-1.5 animate-pulse-dc rounded-full bg-accent"></span>
-                                }
-                                @p.Status
-                            </span>
+                @* Loading skeletons *@
+                @foreach (var i in Enumerable.Range(0, 3))
+                {
+                    <div class="anim-fade-up overflow-hidden rounded-lg border border-well bg-card" style="animation-delay:@(40 * (i + 1))ms">
+                        <div class="aspect-video animate-pulse-dc bg-card2"></div>
+                        <div class="px-3.5 pb-3.5 pt-[13px]">
+                            <div class="h-[14px] w-3/4 animate-pulse-dc rounded bg-card2"></div>
+                            <div class="mt-[9px] h-[12px] w-1/2 animate-pulse-dc rounded bg-card2"></div>
                         </div>
                     </div>
-                </div>
+                }
+            }
+            else
+            {
+                @foreach (var (p, i) in S.FilteredProjects.Select((p, i) => (p, i)))
+                {
+                    <div @onclick="() => S.OpenProject(p.Id)" class="anim-fade-up cursor-pointer overflow-hidden rounded-lg border border-well bg-card hover:-translate-y-[2px] hover:border-[#4A4638]" style="animation-delay:@(40 * (i + 1))ms">
+                        <div class="relative flex aspect-video items-center justify-center bg-[repeating-linear-gradient(-45deg,#1C1B19_0_10px,#201E1C_10px_20px)]">
+                            <span class="font-mono text-[10px] text-dim">@Fmt.Kind(p.SourceType) source</span>
+                            <span class="absolute bottom-2 right-2 rounded-[3px] bg-[rgba(20,19,18,0.85)] px-1.5 py-0.5 font-mono text-[10.5px] text-fg">@Fmt.Duration(p.DurationSeconds)</span>
+                            @if (p.Processing)
+                            {
+                                <div class="absolute inset-x-0 bottom-0 h-[3px] bg-[rgba(20,19,18,0.6)]">
+                                    @if (p.Progress.Percent is { } pct)
+                                    {
+                                        <div class="h-full bg-accent" style="width:@($"{Math.Clamp(pct * 100, 2, 100):0}%")"></div>
+                                    }
+                                    else
+                                    {
+                                        <div class="h-full w-full animate-pulse-dc bg-accent"></div>
+                                    }
+                                </div>
+                            }
+                        </div>
+                        <div class="px-3.5 pb-3.5 pt-[13px]">
+                            <div class="truncate text-[13.5px] font-semibold leading-[1.35]" title="@p.Name">@p.Name</div>
+                            <div class="mt-[9px] flex items-center gap-2 text-[11.5px] text-muted">
+                                <span class="rounded-[3px] border border-line2 px-[5px] py-px font-mono text-[10px] text-muted">@Fmt.Kind(p.SourceType)</span>
+                                <span class="truncate">@Fmt.Outputs(p.Pipeline)</span>
+                                <span class="ml-auto flex shrink-0 items-center gap-[5px] @(StatusColor(p))">
+                                    @if (p.Processing)
+                                    {
+                                        <span class="h-1.5 w-1.5 animate-pulse-dc rounded-full bg-accent"></span>
+                                    }
+                                    @Fmt.StatusLine(p)
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                }
             }
         </div>
+
+        @if (S.Projects is { Count: 0 })
+        {
+            <div class="anim-fade-up mt-5 text-[12.5px] text-muted">
+                No projects yet — paste a VOD or livestream URL to start one.
+            </div>
+        }
+        else if (S.Projects is not null && !S.FilteredProjects.Any())
+        {
+            <div class="anim-fade-up mt-5 text-[12.5px] text-muted">
+                Nothing matches "@S.Search".
+            </div>
+        }
     </div>
 </div>
+
+@code {
+    static string StatusColor(ProjectSummaryDto p) => p.Status switch
+    {
+        _ when p.Processing => "text-accent",
+        "failed" => "text-playhead",
+        _ => "text-muted",
+    };
+}

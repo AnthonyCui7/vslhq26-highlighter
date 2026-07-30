@@ -14,8 +14,8 @@ BASE="${BASE:-http://localhost:5199}"
 VOD="${1:?usage: e2e-smoke.sh <short youtube VOD url>}"
 
 say() { printf '\n\033[1;32m== %s\033[0m\n' "$*"; }
-get() { curl -sS "$BASE$1"; }
-post() { curl -sS -X POST "$BASE$1" -H 'content-type: application/json' ${2:+-d "$2"}; }
+get() { curl -sS -H "Authorization: Bearer $TOKEN" "$BASE$1"; }
+post() { curl -sS -X POST "$BASE$1" -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' ${2:+-d "$2"}; }
 field() { # field <dot.path>  — reads JSON on stdin, prints the value
   python3 -c '
 import json, sys
@@ -37,6 +37,14 @@ wait_status() { # wait_status <project-id> <target-status> <timeout-seconds>
   done
 }
 
+say "auth (ephemeral account -> bearer token)"
+TOKEN=""
+E2E_EMAIL="e2e+$(date +%s)@example.com"
+SESSION=$(post /api/auth/signup "{\"email\":\"$E2E_EMAIL\",\"password\":\"e2e-pass-123\"}")
+TOKEN=$(echo "$SESSION" | field accessToken)
+echo "signed up $E2E_EMAIL (token ${#TOKEN} chars)"
+echo "tokenless is rejected: http $(curl -sS -o /dev/null -w '%{http_code}' "$BASE/api/projects") (401 expected)"
+
 say "healthz"
 HEALTH=$(get /healthz)
 echo "status=$(echo "$HEALTH" | field status) worker=$(echo "$HEALTH" | field worker.resolved) supabase=$(echo "$HEALTH" | field supabase.reachable)"
@@ -49,7 +57,7 @@ JOB=$(echo "$PROJECT" | field activeJobId)
 echo "project $ID job $JOB"
 
 say "worker log stream (job $JOB) until the run ends"
-curl -sN "$BASE/api/jobs/$JOB/logs/stream" \
+curl -sN -H "Authorization: Bearer $TOKEN" "$BASE/api/jobs/$JOB/logs/stream" \
   | grep --line-buffered '^data:' \
   | sed -u -e 's/^data: //' -e 's/\\"/"/g' \
   | grep --line-buffered -o '"line":"[^"]*"' || true
@@ -60,36 +68,36 @@ get "/api/projects/$ID" | python3 -c '
 import json, sys
 detail = json.load(sys.stdin)
 project = detail["project"]
-print(f"status={project[\"status\"]} clips={project[\"clipCount\"]}"
-      f" chunks={project[\"chunkCount\"]} longform={project[\"longformCount\"]}"
-      f" mirror={detail[\"hasLocalMirror\"]}")'
+print("status=%s clips=%s chunks=%s longform=%s mirror=%s" % (
+    project["status"], project["clipCount"], project["chunkCount"],
+    project["longformCount"], detail["hasLocalMirror"]))'
 
 say "clips (short fork, by score)"
 get "/api/projects/$ID/clips?pipeline=short&order=score" | python3 -c '
 import json, sys
 for clip in json.load(sys.stdin):
-    print(f"{clip[\"fileName\"]} score={clip[\"score\"]}"
-          f" video={bool(clip[\"videoUrl\"])} vertical={bool(clip[\"verticalUrl\"])}")'
+    print("%s score=%s video=%s vertical=%s" % (
+        clip["fileName"], clip["score"], bool(clip["videoUrl"]), bool(clip["verticalUrl"])))'
 
 say "long-form versions + first transcript word"
 get "/api/projects/$ID/longform" | python3 -c '
 import json, sys
 for edit in json.load(sys.stdin):
-    print(f"v{edit[\"version\"]} {edit[\"durationSeconds\"]}s video={bool(edit[\"videoUrl\"])}")'
+    print("v%s %ss video=%s" % (edit["version"], edit["durationSeconds"], bool(edit["videoUrl"])))'
 get "/api/projects/$ID/transcript?includeWords=true" | python3 -c '
 import json, sys
 chunks = json.load(sys.stdin)
-print(f"chunks={len(chunks)} firstWord={chunks[0][\"words\"][0] if chunks and chunks[0][\"words\"] else None}")'
+print("chunks=%s firstWord=%s" % (len(chunks), chunks[0]["words"][0] if chunks and chunks[0]["words"] else None))'
 
 say "revise"
 RJOB=$(post "/api/projects/$ID/revise" '{"request":"tighten the opening seconds"}' | field id)
-curl -sN "$BASE/api/jobs/$RJOB/logs/stream" >/dev/null || true
+curl -sN -H "Authorization: Bearer $TOKEN" "$BASE/api/jobs/$RJOB/logs/stream" >/dev/null || true
 echo "revise job state: $(get "/api/jobs/$RJOB" | field state)"
 get "/api/projects/$ID/longform" | python3 -c 'import json,sys; print("versions:", [e["version"] for e in json.load(sys.stdin)])'
 
 say "publish (dry run)"
 PJOB=$(post "/api/projects/$ID/publish" '{"target":"longform","platforms":["youtube"],"dryRun":true}' | field id)
-curl -sN "$BASE/api/jobs/$PJOB/logs/stream" >/dev/null || true
+curl -sN -H "Authorization: Bearer $TOKEN" "$BASE/api/jobs/$PJOB/logs/stream" >/dev/null || true
 get "/api/jobs/$PJOB/logs?tail=15" | python3 -c 'import json,sys; [print(l["line"]) for l in json.load(sys.stdin)]'
 
 say "cancel flow on a second project"
@@ -97,11 +105,11 @@ ID2=$(post /api/projects "{\"sourceUrl\":\"$VOD\",\"pipeline\":\"short\",\"maxCh
 sleep 20
 echo "cancel -> $(post "/api/projects/$ID2/cancel" | field status)"
 wait_status "$ID2" cancelled 180
-echo "re-cancel http $(curl -sS -o /dev/null -w '%{http_code}' -X POST "$BASE/api/projects/$ID2/cancel") (409 expected)"
-echo "cancel ready project http $(curl -sS -o /dev/null -w '%{http_code}' -X POST "$BASE/api/projects/$ID/cancel") (409 expected)"
+echo "re-cancel http $(curl -sS -H "Authorization: Bearer $TOKEN" -o /dev/null -w '%{http_code}' -X POST "$BASE/api/projects/$ID2/cancel") (409 expected)"
+echo "cancel ready project http $(curl -sS -H "Authorization: Bearer $TOKEN" -o /dev/null -w '%{http_code}' -X POST "$BASE/api/projects/$ID/cancel") (409 expected)"
 
 say "delete second project + drain cleanup"
-curl -sS -X DELETE "$BASE/api/projects/$ID2" -o /dev/null -w 'delete http %{http_code}\n'
+curl -sS -H "Authorization: Bearer $TOKEN" -X DELETE "$BASE/api/projects/$ID2" -o /dev/null -w 'delete http %{http_code}\n'
 post /api/admin/cleanup '{"limit":100}' | field state
 sleep 10
 get /healthz | field cleanup.pending

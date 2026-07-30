@@ -12,18 +12,52 @@
     @if (S.Panel == "inspector")
     {
         <div class="anim-fade-up flex flex-1 flex-col overflow-y-auto px-4 py-3.5">
-            <div class="pb-2.5 font-mono text-[9.5px] tracking-[0.1em] text-faint">CUT · SETUP (V1)</div>
-            @foreach (var sl in SampleData.InspectorSliders)
+            <div class="pb-2.5 font-mono text-[9.5px] tracking-[0.1em] text-faint">
+                CUT · @(S.ActiveClip is null ? $"LONG-FORM V{S.Edit.Meta?.LongformVersion ?? 1}" : "HIGHLIGHT")
+                · <span class="@(S.Edit.SaveState == "Save failed" ? "text-playhead" : "text-faint")">@S.Edit.SaveState.ToUpperInvariant()</span>
+            </div>
+
+            @if (S.Edit.SelectedSegment is { } segment)
+            {
+                <Slider Label="Segment speed" Value="@segment.Speed" Min="0.5" Max="2" Step="0.05"
+                        Display="@($"{segment.Speed:0.##}×")"
+                        OnChange="v => S.Edit.SetSegmentSpeed(segment.Id, v)" />
+            }
+            else
+            {
+                <div class="pb-4 text-[10.5px] leading-[1.5] text-faint">Select a segment on the timeline to adjust its speed.</div>
+            }
+
+            @if (S.Edit.SelectedText is { } text)
             {
                 <div class="pb-4">
-                    <div class="mb-[7px] flex justify-between text-xs"><span class="font-semibold text-soft">@sl.Label</span><span class="font-mono text-[11px] text-muted">@sl.Val</span></div>
-                    <div class="relative h-[3px] rounded-[2px] bg-well">
-                        <div class="absolute bottom-0 left-0 top-0" style="width:@sl.Pct; background:@sl.Fill"></div>
-                        <div class="absolute -top-1 h-[11px] w-[11px] -translate-x-[5px] rounded-full bg-fg" style="left:@sl.Pct"></div>
-                    </div>
+                    <div class="mb-[7px] text-xs font-semibold text-soft">Text overlay</div>
+                    <input value="@text.Text" @onchange='e => S.Edit.UpdateTextOverlay(text.Id, text: e.Value?.ToString() ?? "")'
+                           class="box-border w-full rounded-md border border-line3 bg-ink px-[10px] py-[7px] font-sans text-[12px] text-fg outline-none focus:border-[#4A4638]" />
                 </div>
+                <Slider Label="Text position" Value="@text.Y" Min="0.05" Max="0.9" Step="0.01"
+                        Display="@($"{text.Y * 100:0}%")"
+                        OnChange="v => S.Edit.UpdateTextOverlay(text.Id, y: v)" />
             }
-            <div class="flex flex-col gap-3 border-t border-line pt-3.5">
+
+            @if (S.Edit.Doc is { } doc)
+            {
+                <Slider Label="Zoom" Value="@doc.Transform.Scale" Min="1" Max="3" Step="0.05"
+                        Display="@($"{doc.Transform.Scale:0.##}×")" Disabled="@(doc.Reframe != "manual")"
+                        OnChange="v => S.Edit.SetTransform(scale: v)" />
+                <Slider Label="Position X" Value="@doc.Transform.PosX" Min="-1" Max="1" Step="0.05"
+                        Display="@($"{doc.Transform.PosX:+0.##;-0.##;0}")" Disabled="@(doc.Reframe != "manual")"
+                        OnChange="v => S.Edit.SetTransform(posX: v)" />
+                <Slider Label="Voice volume" Value="@doc.Audio.Voice" Min="0" Max="2" Step="0.05"
+                        Display="@($"{doc.Audio.Voice * 100:0}%")"
+                        OnChange="v => S.Edit.SetAudio(voice: v)" />
+                <Slider Label="Music bed" Value="@doc.Audio.Music" Min="0" Max="1" Step="0.05"
+                        Display="@(doc.Audio.Music > 0.001 ? $"{doc.Audio.Music * 100:0}%" : "off")"
+                        OnChange="v => S.Edit.SetAudio(music: v)" />
+                <div class="pb-1 text-[10px] leading-[1.5] text-faint">Music bed and final caption typography render on export; the preview approximates them.</div>
+            }
+
+            <div class="mt-2 flex flex-col gap-3 border-t border-line pt-3.5">
                 <div class="flex items-center justify-between text-xs">
                     <span class="font-semibold text-soft">Format</span>
                     <span class="flex overflow-hidden rounded border border-line2">
@@ -54,9 +88,19 @@
                         <div class="mt-1 text-[10.5px] leading-[1.5] text-faint">@CaptionsHint</div>
                     }
                 </div>
-                <div class="flex items-center justify-between text-xs"><span class="font-semibold text-soft">Reframe</span><span class="flex overflow-hidden rounded border border-line2"><span class="cursor-pointer bg-well px-[9px] py-[3px] font-semibold text-fg">Auto</span><span class="cursor-pointer border-l border-line2 px-[9px] py-[3px] text-muted hover:text-fg">Manual</span></span></div>
-                <div class="flex items-center justify-between text-xs"><span class="font-semibold text-soft">Snap to source cuts</span><span class="relative h-[17px] w-[30px] cursor-pointer rounded-[9px] bg-accent"><span class="absolute right-0.5 top-0.5 h-[13px] w-[13px] rounded-full bg-ink"></span></span></div>
-                <div class="flex items-center justify-between text-xs"><span class="font-semibold text-soft">Loudness normalize</span><span class="font-mono text-[11px] text-muted">−14 LUFS</span></div>
+                <div class="flex items-center justify-between text-xs">
+                    <span class="font-semibold text-soft">Reframe</span>
+                    <span class="flex overflow-hidden rounded border border-line2">
+                        <span @onclick='() => S.Edit.SetReframe("auto")' class="cursor-pointer px-[9px] py-[3px] @(S.Edit.Doc?.Reframe != "manual" ? "bg-well font-semibold text-fg" : "text-muted hover:text-fg")">Auto</span>
+                        <span @onclick='() => S.Edit.SetReframe("manual")' class="cursor-pointer border-l border-line2 px-[9px] py-[3px] @(S.Edit.Doc?.Reframe == "manual" ? "bg-well font-semibold text-fg" : "text-muted hover:text-fg")">Manual</span>
+                    </span>
+                </div>
+                <div class="flex items-center justify-between text-xs">
+                    <span class="font-semibold text-soft">Snap to grid</span>
+                    <span @onclick="S.ToggleSnap" class="relative h-[17px] w-[30px] cursor-pointer rounded-[9px] @(S.Snap ? "bg-accent" : "bg-well")">
+                        <span class="absolute top-0.5 h-[13px] w-[13px] rounded-full @(S.Snap ? "right-0.5 bg-ink" : "left-0.5 bg-muted")"></span>
+                    </span>
+                </div>
             </div>
         </div>
     }

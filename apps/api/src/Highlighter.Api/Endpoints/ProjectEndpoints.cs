@@ -1,3 +1,4 @@
+using System.Security.Claims;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using Highlighter.Api.Contracts;
@@ -11,19 +12,19 @@ public static class ProjectEndpoints
     private static readonly string[] ClipStatuses = ["detected", "rendered", "failed"];
     private static readonly Regex TargetMinutesPattern = new(@"^\d+(-\d+)?$", RegexOptions.Compiled);
 
-    public static void MapProjectEndpoints(this IEndpointRouteBuilder app)
+    public static IEndpointConventionBuilder MapProjectEndpoints(this IEndpointRouteBuilder app)
     {
         var group = app.MapGroup("/api/projects");
 
         group.MapPost("/",
-            async (CreateProjectRequest request, SupabaseDb db, PipelineJobService jobs,
-                ILogger<PipelineJobService> log, CancellationToken ct) =>
+            async (CreateProjectRequest request, ClaimsPrincipal user, SupabaseDb db,
+                PipelineJobService jobs, ILogger<PipelineJobService> log, CancellationToken ct) =>
             {
                 if (Validate(request) is { } invalid) return invalid;
                 SourceDetector.TryDetect(request.SourceUrl!, out var source);
 
                 var jobId = PipelineJobService.NewJobId();
-                var inserted = await db.InsertProjectAsync(new JsonObject
+                var row = new JsonObject
                 {
                     ["name"] = string.IsNullOrWhiteSpace(request.Name) ? source.Name : request.Name.Trim(),
                     ["source_type"] = source.SourceType,
@@ -34,7 +35,9 @@ public static class ProjectEndpoints
                     // The worker's metadata merge is a SHALLOW top-level overlay:
                     // "api" is the one key it never writes, so ours survives.
                     ["metadata"] = new JsonObject { ["api"] = ApiMetadata(jobId, request) },
-                }, ct);
+                };
+                if (AuthHelpers.Uid(user) is { } uid) row["user_id"] = uid.ToString();
+                var inserted = await db.InsertProjectAsync(row, ct);
                 var projectId = Guid.Parse(inserted["id"]!.GetValue<string>());
 
                 try
@@ -51,7 +54,7 @@ public static class ProjectEndpoints
                         {
                             ["status"] = "failed",
                             ["error"] = $"worker spawn failed: {exception.Message}",
-                        }, ct);
+                        }, ct: ct);
                     }
                     catch (PostgrestException patchFailure)
                     {
@@ -68,9 +71,13 @@ public static class ProjectEndpoints
             .WithName("CreateProject");
 
         group.MapDelete("/{id:guid}",
-            async (Guid id, bool? force, SupabaseDb db, PipelineJobService jobs, RepoLayout layout,
-                MediaCleanupScheduler cleanup, CancellationToken ct) =>
+            async (Guid id, bool? force, ClaimsPrincipal user, SupabaseDb db, PipelineJobService jobs,
+                RepoLayout layout, MediaCleanupScheduler cleanup, SupabaseStorage storage,
+                CancellationToken ct) =>
             {
+                var uid = AuthHelpers.Uid(user);
+                if (!await CanSeeAsync(db, id, uid, ct)) return NotFound(id);
+
                 var active = jobs.ActiveForProject(id);
                 if (active is not null)
                 {
@@ -80,7 +87,12 @@ public static class ProjectEndpoints
                     await jobs.ForceKillAsync(active);
                 }
 
-                if (!await db.DeleteProjectAsync(id, ct)) return NotFound(id);
+                if (!await db.DeleteProjectAsync(id, uid, ct)) return NotFound(id);
+
+                // Storage objects the DB outbox triggers don't know about: editor
+                // exports and thumbnail variants live under deterministic prefixes.
+                await storage.DeletePrefixAsync($"{id}/editor", ct);
+                await storage.DeletePrefixAsync($"{id}/thumbnails", ct);
 
                 // The DB cascade + outbox triggers handle remote media; the local
                 // mirror is ours to remove (path is pinned under the projects root).
@@ -102,9 +114,12 @@ public static class ProjectEndpoints
             })
             .WithName("DeleteProject");
 
-        group.MapGet("/", async (SupabaseDb db, PipelineJobService jobs, int? limit, CancellationToken ct) =>
+        group.MapGet("/",
+            async (ClaimsPrincipal user, SupabaseDb db, PipelineJobService jobs, int? limit,
+                CancellationToken ct) =>
             {
-                var rows = await db.ListProjectsAsync(Math.Clamp(limit ?? 100, 1, 500), ct);
+                var rows = await db.ListProjectsAsync(
+                    Math.Clamp(limit ?? 100, 1, 500), AuthHelpers.Uid(user), ct);
                 return Results.Ok(rows.OfType<JsonObject>()
                     .Select(row => ProjectShaper.Summary(row, ActiveJobId(jobs, row)))
                     .ToList());
@@ -112,9 +127,10 @@ public static class ProjectEndpoints
             .WithName("ListProjects");
 
         group.MapGet("/{id:guid}",
-            async (Guid id, SupabaseDb db, RepoLayout layout, PipelineJobService jobs, CancellationToken ct) =>
+            async (Guid id, ClaimsPrincipal user, SupabaseDb db, RepoLayout layout,
+                PipelineJobService jobs, CancellationToken ct) =>
             {
-                var row = await db.GetProjectDetailAsync(id, ct);
+                var row = await db.GetProjectDetailAsync(id, AuthHelpers.Uid(user), ct);
                 return row is null
                     ? NotFound(id)
                     : Results.Ok(ProjectShaper.Detail(
@@ -123,7 +139,8 @@ public static class ProjectEndpoints
             .WithName("GetProject");
 
         group.MapGet("/{id:guid}/clips",
-            async (Guid id, SupabaseDb db, string? pipeline, string? status, string? order, CancellationToken ct) =>
+            async (Guid id, ClaimsPrincipal user, SupabaseDb db, string? pipeline, string? status,
+                string? order, CancellationToken ct) =>
             {
                 if (pipeline is not (null or "short" or "long"))
                     return Problem(400, "Invalid filter", "pipeline must be 'short' or 'long'");
@@ -131,28 +148,34 @@ public static class ProjectEndpoints
                     return Problem(400, "Invalid filter", "status must be one of detected|rendered|failed");
                 if (order is not (null or "score" or "start"))
                     return Problem(400, "Invalid filter", "order must be 'score' or 'start'");
+                if (!await CanSeeAsync(db, id, AuthHelpers.Uid(user), ct)) return NotFound(id);
                 var rows = await db.ListClipsAsync(id, pipeline, status, order ?? "score", ct);
                 return Results.Ok(rows.OfType<JsonObject>().Select(ProjectShaper.Clip).ToList());
             })
             .WithName("ListClips");
 
-        group.MapGet("/{id:guid}/longform", async (Guid id, SupabaseDb db, CancellationToken ct) =>
+        group.MapGet("/{id:guid}/longform",
+            async (Guid id, ClaimsPrincipal user, SupabaseDb db, CancellationToken ct) =>
             {
+                if (!await CanSeeAsync(db, id, AuthHelpers.Uid(user), ct)) return NotFound(id);
                 var rows = await db.ListLongformEditsAsync(id, ct);
                 return Results.Ok(rows.OfType<JsonObject>().Select(ProjectShaper.Longform).ToList());
             })
             .WithName("ListLongformEdits");
 
-        group.MapGet("/{id:guid}/publications", async (Guid id, SupabaseDb db, CancellationToken ct) =>
+        group.MapGet("/{id:guid}/publications",
+            async (Guid id, ClaimsPrincipal user, SupabaseDb db, CancellationToken ct) =>
             {
+                if (!await CanSeeAsync(db, id, AuthHelpers.Uid(user), ct)) return NotFound(id);
                 var rows = await db.ListPublicationsAsync(id, ct);
                 return Results.Ok(rows.OfType<JsonObject>().Select(ProjectShaper.Publication).ToList());
             })
             .WithName("ListPublications");
 
         group.MapGet("/{id:guid}/transcript",
-            async (Guid id, SupabaseDb db, bool? includeWords, CancellationToken ct) =>
+            async (Guid id, ClaimsPrincipal user, SupabaseDb db, bool? includeWords, CancellationToken ct) =>
             {
+                if (!await CanSeeAsync(db, id, AuthHelpers.Uid(user), ct)) return NotFound(id);
                 var withWords = includeWords ?? false;
                 var rows = await db.ListTranscriptChunksAsync(id, withWords, ct);
                 return Results.Ok(rows.OfType<JsonObject>()
@@ -160,7 +183,16 @@ public static class ProjectEndpoints
                     .ToList());
             })
             .WithName("GetTranscript");
+
+        return group;
     }
+
+    /// <summary>Strict visibility: with a user id, a project someone else owns
+    /// (or a legacy ownerless row) reads as nonexistent. Anonymous (auth off)
+    /// sees everything, matching pre-auth behavior.</summary>
+    internal static async Task<bool> CanSeeAsync(
+        SupabaseDb db, Guid id, Guid? uid, CancellationToken ct) =>
+        uid is null || await db.GetProjectAsync(id, "id", uid, ct) is not null;
 
     private static IResult? Validate(CreateProjectRequest request)
     {

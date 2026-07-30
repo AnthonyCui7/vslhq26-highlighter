@@ -12,8 +12,18 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddRazorComponents()
     .AddInteractiveServerComponents();
 
+// The Highlighter API (apps/api). Server-to-server: the browser only ever talks
+// to this Blazor app; auth tokens live in DataProtection-encrypted local
+// storage and Supabase keys never leave the API process.
+var apiBaseUrl = builder.Configuration["Api:BaseUrl"] ?? "http://localhost:5199";
+builder.Services.AddHttpClient(AuthApiClient.HttpClientName,
+    client => client.BaseAddress = new Uri(apiBaseUrl));
+builder.Services.AddScoped<AuthApiClient>();
+builder.Services.AddScoped<AuthSession>();
+builder.Services.AddScoped<ApiClient>();
+
 builder.Services.AddScoped<StudioState>();
-builder.Services.AddScoped<IStudioBackend, SampleStudioBackend>();
+builder.Services.AddScoped<IStudioBackend, ApiStudioBackend>();
 builder.Services.AddScoped<StudioAgentService>();
 
 var app = builder.Build();

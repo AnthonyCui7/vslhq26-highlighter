@@ -114,4 +114,33 @@ public class WorkerArgsTests
     {
         Assert.Equal(["cleanup", "--limit", "50"], WorkerArgs.Cleanup(50));
     }
+
+    [Fact]
+    public void Research_ModeAlwaysExplicit_FocusOptional()
+    {
+        Assert.Equal(["research", Id.ToString(), "--mode", "long"],
+            WorkerArgs.Research(Id, "long", null));
+        Assert.Equal(["research", Id.ToString(), "--mode", "short", "--focus", "hooks"],
+            WorkerArgs.Research(Id, "short", "hooks"));
+    }
+
+    [Fact]
+    public void Thumbnails_GenerateVsSelect()
+    {
+        Assert.Equal(["thumbnails", Id.ToString(), "--prompt", "bold text"],
+            WorkerArgs.Thumbnails(Id, "bold text", null, null));
+        Assert.Equal(["thumbnails", Id.ToString(), "--version", "2", "--select", "3"],
+            WorkerArgs.Thumbnails(Id, null, 2, 3));
+    }
+
+    [Fact]
+    public void Reformat_SquareWithCaptions()
+    {
+        Assert.Equal(
+            ["reformat", Id.ToString(), "clip_003.mp4", "--format", "square", "--captions"],
+            WorkerArgs.Reformat(Id, "clip_003.mp4", "square", captions: true));
+        Assert.Equal(
+            ["reformat", Id.ToString(), "clip_003.mp4", "--format", "square"],
+            WorkerArgs.Reformat(Id, "clip_003.mp4", "square", captions: false));
+    }
 }

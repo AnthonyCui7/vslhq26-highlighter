@@ -3,80 +3,162 @@
 <div class="flex-1 overflow-y-auto" data-screen-label="Project">
     <div class="mx-auto max-w-[1080px] px-10 pb-12 pt-[30px]">
         <div class="anim-fade-up flex items-baseline gap-[14px]">
-            <div class="text-[22px] font-bold tracking-[-0.01em]">@S.ProjectTitle</div>
-            <div class="text-[12.5px] text-muted">VOD · 2:01:44 · added Jul 26</div>
+            <div class="min-w-0 truncate text-[22px] font-bold tracking-[-0.01em]">@S.ProjectTitle</div>
+            @if (S.Project is { } p)
+            {
+                <div class="shrink-0 text-[12.5px] text-muted">@Fmt.Kind(p.SourceType) · @Fmt.Duration(p.DurationSeconds) · @Fmt.Added(p.CreatedAt)</div>
+            }
         </div>
 
-        @* Long-form cut *@
-        @if (S.Project.HasLong)
+        @if (S.DetailError is not null)
         {
-            <div class="anim-fade-up mt-[22px] flex gap-[18px] rounded-lg border border-well bg-card p-4" style="animation-delay:50ms">
+            <div class="anim-fade-up mt-4 flex items-center gap-3 rounded-md border border-playhead/30 bg-playhead/10 px-4 py-3 text-[13px] text-soft">
+                <span class="min-w-0 flex-1">@S.DetailError</span>
+                <span @onclick="() => _ = S.RefreshDetailAsync()" class="cursor-pointer font-semibold text-accent hover:text-accent-soft">Retry</span>
+            </div>
+        }
+        @if (S.Project is { Status: "failed", Error: { } error })
+        {
+            <div class="anim-fade-up mt-4 rounded-md border border-playhead/30 bg-playhead/10 px-4 py-3 text-[13px] leading-[1.55] text-soft">
+                This run failed: @error
+            </div>
+        }
+
+        @if (S.Detail is null)
+        {
+            @* Loading skeleton *@
+            <div class="anim-fade-up mt-[22px] flex gap-[18px] rounded-lg border border-well bg-card p-4">
                 <div class="w-[46%] shrink-0">
-                    <div class="relative flex aspect-video items-center justify-center overflow-hidden rounded-[5px] bg-[repeating-linear-gradient(-45deg,#1C1B19_0_12px,#201E1C_12px_24px)]">
-                        <span class="flex h-11 w-11 cursor-pointer items-center justify-center rounded-full bg-[rgba(237,234,226,0.92)] text-base text-ink">▶</span>
-                        <span class="absolute bottom-2 right-2 rounded-[3px] bg-[rgba(20,19,18,0.85)] px-1.5 py-0.5 font-mono text-[10.5px] text-fg">24:36</span>
+                    <div class="aspect-video animate-pulse-dc rounded-[5px] bg-card2"></div>
+                </div>
+                <div class="flex-1 space-y-2.5 pt-1">
+                    <div class="h-[12px] w-1/3 animate-pulse-dc rounded bg-card2"></div>
+                    <div class="h-[12px] w-2/3 animate-pulse-dc rounded bg-card2"></div>
+                    <div class="h-[12px] w-1/2 animate-pulse-dc rounded bg-card2"></div>
+                </div>
+            </div>
+        }
+        else
+        {
+            @* Long-form cut *@
+            @if (ShowLongform)
+            {
+                <div class="anim-fade-up mt-[22px] flex gap-[18px] rounded-lg border border-well bg-card p-4" style="animation-delay:50ms">
+                    <div class="w-[46%] shrink-0">
+                        @if (S.LatestLongform is { VideoUrl: { } videoUrl } cut)
+                        {
+                            <video controls preload="metadata" playsinline src="@videoUrl"
+                                   poster="@cut.ThumbnailUrl"
+                                   class="aspect-video w-full rounded-[5px] bg-black"></video>
+                        }
+                        else
+                        {
+                            <div class="relative flex aspect-video items-center justify-center overflow-hidden rounded-[5px] bg-[repeating-linear-gradient(-45deg,#1C1B19_0_12px,#201E1C_12px_24px)]">
+                                @if (S.Project is { Processing: true } processing)
+                                {
+                                    <span class="flex items-center gap-2 font-mono text-[10.5px] text-accent">
+                                        <span class="h-1.5 w-1.5 animate-pulse-dc rounded-full bg-accent"></span>
+                                        @Fmt.StatusLine(processing) — stitching the cut
+                                    </span>
+                                }
+                                else
+                                {
+                                    <span class="font-mono text-[10px] text-dim">no long-form cut yet</span>
+                                }
+                            </div>
+                        }
+                        <div class="mt-3 flex items-center gap-2">
+                            <div class="min-w-0 truncate text-sm font-bold" title="@S.LongformTitle">@S.LongformTitle</div>
+                            @if (S.LatestLongform is { } lf)
+                            {
+                                <div class="shrink-0 text-[11.5px] text-muted">v@(lf.Version) · @Fmt.Duration(lf.DurationSeconds)</div>
+                                <div @onclick="S.OpenEditorLong" class="ml-auto shrink-0 cursor-pointer rounded-[5px] border border-line2 px-3 py-[5px] text-xs text-soft hover:border-[#4A4638] hover:text-fg active:scale-[0.98]">Open in editor</div>
+                            }
+                        </div>
                     </div>
-                    <div class="mt-3 flex items-center gap-2">
-                        <div class="min-w-0 truncate text-sm font-bold" title="@SampleData.LongformTitle">@SampleData.LongformTitle</div>
-                        <div class="shrink-0 text-[11.5px] text-muted">v2</div>
-                        <div @onclick="S.OpenEditorLong" class="ml-auto shrink-0 cursor-pointer rounded-[5px] border border-line2 px-3 py-[5px] text-xs text-soft hover:border-[#4A4638] hover:text-fg active:scale-[0.98]">Open in editor</div>
+                    <div class="flex min-w-0 flex-1 flex-col">
+                        <div class="mb-1.5 font-mono text-[11px] font-semibold tracking-[0.08em] text-muted">IN THIS CUT</div>
+                        <div class="flex flex-1 flex-col overflow-y-auto">
+                            @if (Segments.Count == 0)
+                            {
+                                <div class="px-2.5 py-2 text-[12px] text-faint">Segments appear when the cut is stitched.</div>
+                            }
+                            @foreach (var (seg, i) in Segments.Select((s, i) => (s, i)))
+                            {
+                                <div class="flex cursor-pointer items-center gap-3 rounded-[5px] px-2.5 py-2 hover:bg-elevate">
+                                    <span class="w-[48px] shrink-0 font-mono text-[10.5px] text-faint">@Fmt.Stamp(seg.StartSeconds)</span>
+                                    <span class="flex-1 truncate text-[12.5px] text-soft">@(seg.Title ?? $"Segment {i + 1}")</span>
+                                    <span class="shrink-0 font-mono text-[10px] text-faint">@Fmt.Duration(seg.EndSeconds - seg.StartSeconds)</span>
+                                </div>
+                            }
+                        </div>
                     </div>
                 </div>
-                <div class="flex min-w-0 flex-1 flex-col">
-                    <div class="mb-1.5 font-mono text-[11px] font-semibold tracking-[0.08em] text-muted">IN THIS CUT</div>
-                    <div class="flex flex-1 flex-col overflow-y-auto">
-                        @foreach (var seg in SampleData.Segments)
+
+                @if (S.LatestLongform is not null)
+                {
+                    <ThumbnailSection />
+                }
+            }
+
+            @* Highlights *@
+            @if (ShowShorts)
+            {
+                <div class="anim-fade-up mb-3.5 mt-8 flex items-center gap-[14px]" style="animation-delay:90ms">
+                    <div class="text-[15.5px] font-bold">Highlights</div>
+                    <div class="text-[12.5px] text-muted">@Fmt.Count(S.Detail.Clips.Count, "highlight")</div>
+                    @if (S.Project is { Processing: true })
+                    {
+                        <span class="flex items-center gap-[5px] text-[11.5px] text-accent">
+                            <span class="h-1.5 w-1.5 animate-pulse-dc rounded-full bg-accent"></span> more on the way
+                        </span>
+                    }
+                    <div class="relative ml-auto">
+                        <div @onclick="S.ToggleSort" class="flex cursor-pointer items-center gap-2 rounded-md border border-line2 px-3 py-1.5 text-[12.5px] text-soft hover:border-[#4A4638]">
+                            Sort by <span class="font-semibold text-fg">@S.SortLabel</span> <span class="text-[9px] text-muted">▼</span>
+                        </div>
+                        @if (S.SortOpen)
                         {
-                            <div class="flex cursor-pointer items-center gap-3 rounded-[5px] px-2.5 py-2 hover:bg-elevate">
-                                <span class="w-[38px] font-mono text-[10.5px] text-faint">@seg.At</span>
-                                <span class="flex-1 truncate text-[12.5px] text-soft">@seg.Title</span>
-                                <span class="font-mono text-[10px] text-faint">@seg.Dur</span>
+                            <div class="anim-drop-in absolute right-0 top-[calc(100%_+_6px)] z-20 w-[150px] rounded-md border border-line3 bg-elevate p-1 shadow-[0_12px_32px_rgba(0,0,0,0.45)]">
+                                <div @onclick="S.SortByScore" class="cursor-pointer rounded px-2.5 py-[7px] text-[12.5px] hover:bg-well @(S.SortBy == "score" ? "text-accent" : "text-soft")">Score</div>
+                                <div @onclick="S.SortByTimeline" class="cursor-pointer rounded px-2.5 py-[7px] text-[12.5px] hover:bg-well @(S.SortBy == "timeline" ? "text-accent" : "text-soft")">Timeline</div>
                             </div>
                         }
                     </div>
                 </div>
-            </div>
-
-            <ThumbnailSection />
-        }
-
-        @* Highlights *@
-        <div class="anim-fade-up mb-3.5 mt-8 flex items-center gap-[14px]" style="animation-delay:90ms">
-            <div class="text-[15.5px] font-bold">Highlights</div>
-            <div class="text-[12.5px] text-muted">8 highlights</div>
-            <div class="relative ml-auto">
-                <div @onclick="S.ToggleSort" class="flex cursor-pointer items-center gap-2 rounded-md border border-line2 px-3 py-1.5 text-[12.5px] text-soft hover:border-[#4A4638]">
-                    Sort by <span class="font-semibold text-fg">@S.SortLabel</span> <span class="text-[9px] text-muted">▼</span>
+                <div class="grid grid-cols-4 gap-[14px]">
+                    @foreach (var (clip, pos) in S.SortedClips.Select((c, pos) => (c, pos)))
+                    {
+                        <div @onclick="() => S.OpenClip(clip)" class="anim-fade-up cursor-pointer overflow-hidden rounded-lg border border-well bg-card hover:-translate-y-[2px] hover:border-[#4A4638]" style="animation-delay:@(120 + 30 * Math.Min(pos, 8))ms">
+                            <div class="relative flex aspect-[9/12] items-center justify-center overflow-hidden bg-[repeating-linear-gradient(-45deg,#1C1B19_0_10px,#201E1C_10px_20px)]">
+                                @if (clip.ThumbnailUrl is { } thumb)
+                                {
+                                    <img src="@thumb" alt="@clip.Title" loading="lazy" class="absolute inset-0 h-full w-full object-cover" />
+                                }
+                                else
+                                {
+                                    <span class="font-mono text-[10px] text-dim">@(clip.Status == "rendered" ? "highlight frame" : "rendering…")</span>
+                                }
+                                <span class="absolute bottom-2 right-2 rounded-[3px] bg-[rgba(20,19,18,0.85)] px-1.5 py-0.5 font-mono text-[10.5px] text-fg">@Fmt.Duration(clip.DurationSeconds)</span>
+                            </div>
+                            <div class="flex items-start gap-[9px] px-3 pb-3 pt-[11px]">
+                                <span title="Content score" class="mt-px flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-full bg-accent font-mono text-[9.5px] font-medium leading-none text-ink" style="opacity:@Fmt.ScoreOpacity(clip.Score)">@Fmt.Score100(clip.Score)</span>
+                                <div class="text-[13px] font-semibold leading-[1.35]">@clip.Title</div>
+                            </div>
+                        </div>
+                    }
                 </div>
-                @if (S.SortOpen)
+                @if (S.Detail.Clips.Count == 0 && S.Project is { Processing: false })
                 {
-                    <div class="anim-drop-in absolute right-0 top-[calc(100%_+_6px)] z-20 w-[150px] rounded-md border border-line3 bg-elevate p-1 shadow-[0_12px_32px_rgba(0,0,0,0.45)]">
-                        <div @onclick="S.SortByScore" class="cursor-pointer rounded px-2.5 py-[7px] text-[12.5px] hover:bg-well @(S.SortBy == "score" ? "text-accent" : "text-soft")">Score</div>
-                        <div @onclick="S.SortByTimeline" class="cursor-pointer rounded px-2.5 py-[7px] text-[12.5px] hover:bg-well @(S.SortBy == "timeline" ? "text-accent" : "text-soft")">Timeline</div>
-                    </div>
+                    <div class="anim-fade-up mt-2 text-[12.5px] text-muted">No highlight clips were produced for this run.</div>
                 }
-            </div>
-        </div>
-        <div class="grid grid-cols-4 gap-[14px]">
-            @foreach (var (clip, pos) in SortedClips.Select((c, pos) => (c, pos)))
-            {
-                <div @onclick="() => S.OpenClip(clip.Index)" class="anim-fade-up cursor-pointer overflow-hidden rounded-lg border border-well bg-card hover:-translate-y-[2px] hover:border-[#4A4638]" style="animation-delay:@(120 + 30 * pos)ms">
-                    <div class="relative flex aspect-[9/12] items-center justify-center bg-[repeating-linear-gradient(-45deg,#1C1B19_0_10px,#201E1C_10px_20px)]">
-                        <span class="font-mono text-[10px] text-dim">highlight frame</span>
-                        <span class="absolute bottom-2 right-2 rounded-[3px] bg-[rgba(20,19,18,0.85)] px-1.5 py-0.5 font-mono text-[10.5px] text-fg">@clip.Dur</span>
-                    </div>
-                    <div class="flex items-start gap-[9px] px-3 pb-3 pt-[11px]">
-                        <span title="Content score" class="mt-px flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-full bg-accent font-mono text-[9.5px] font-medium leading-none text-ink" style="opacity:@clip.ScoreOpacity">@clip.Score</span>
-                        <div class="text-[13px] font-semibold leading-[1.35]">@clip.Title</div>
-                    </div>
-                </div>
             }
-        </div>
+        }
     </div>
 </div>
 
 @code {
-    IEnumerable<ClipInfo> SortedClips => S.SortBy == "score"
-        ? SampleData.Clips.OrderByDescending(c => c.Score)
-        : SampleData.Clips.OrderBy(c => c.At);
+    bool ShowLongform => S.Project?.Pipeline is "long" or "both" || (S.Detail?.LongformEdits.Count ?? 0) > 0;
+    bool ShowShorts => S.Project?.Pipeline is "short" or "both" || (S.Detail?.Clips.Count ?? 0) > 0;
+    List<LongformSegmentDto> Segments => (S.LatestLongform?.Segments ?? []).ToList();
 }

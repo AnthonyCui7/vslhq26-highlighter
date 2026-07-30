@@ -65,6 +65,29 @@ public static class WorkerArgs
         return argv;
     }
 
+    public static List<string> Research(Guid projectId, string mode, string? focus)
+    {
+        var argv = new List<string> { "research", projectId.ToString(), "--mode", mode };
+        if (!string.IsNullOrWhiteSpace(focus)) argv.AddRange(["--focus", focus]);
+        return argv;
+    }
+
+    public static List<string> Thumbnails(Guid projectId, string? prompt, int? version, int? select)
+    {
+        var argv = new List<string> { "thumbnails", projectId.ToString() };
+        if (!string.IsNullOrWhiteSpace(prompt)) argv.AddRange(["--prompt", prompt]);
+        if (version is { } wanted) argv.AddRange(["--version", Invariant(wanted)]);
+        if (select is { } pick) argv.AddRange(["--select", Invariant(pick)]);
+        return argv;
+    }
+
+    public static List<string> Reformat(Guid projectId, string fileName, string format, bool captions)
+    {
+        var argv = new List<string> { "reformat", projectId.ToString(), fileName, "--format", format };
+        if (captions) argv.Add("--captions");
+        return argv;
+    }
+
     public static List<string> Cleanup(int limit) => ["cleanup", "--limit", Invariant(limit)];
 
     private static string Invariant(int value) => value.ToString(CultureInfo.InvariantCulture);

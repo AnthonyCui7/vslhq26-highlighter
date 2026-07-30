@@ -11,18 +11,19 @@
     @if (S.BinTab == "media")
     {
         <div class="anim-fade-up flex-1 overflow-y-auto p-2">
-            <div class="px-1.5 pb-1 pt-1.5 font-mono text-[9.5px] tracking-[0.1em] text-faint">SOURCE</div>
-            <div class="flex cursor-pointer items-center gap-2.5 rounded-[5px] p-1.5 hover:bg-elevate">
-                <div class="aspect-video w-[52px] shrink-0 rounded-[3px] bg-[repeating-linear-gradient(-45deg,#1C1B19_0_6px,#201E1C_6px_12px)]"></div>
-                <div class="min-w-0"><div class="truncate text-xs font-semibold">Ep. 47 master</div><div class="mt-0.5 font-mono text-[9.5px] text-faint">2:01:44 · 1080p</div></div>
-            </div>
-            <div class="px-1.5 pb-1 pt-3 font-mono text-[9.5px] tracking-[0.1em] text-faint">TIMELINE MEDIA</div>
-            @foreach (var b in SampleData.BinItems)
+            <div class="px-1.5 pb-1 pt-1.5 font-mono text-[9.5px] tracking-[0.1em] text-faint">EDITING</div>
+            @foreach (var item in MediaItems.Where(m => m.Section == "edit"))
             {
-                <div class="flex cursor-pointer items-center gap-2.5 rounded-[5px] p-1.5 hover:bg-elevate">
-                    <div class="flex aspect-video w-[52px] shrink-0 items-center justify-center rounded-[3px] font-mono text-[8px] text-dim" style="background:@b.Thumb">@b.Glyph</div>
-                    <div class="min-w-0"><div class="truncate text-xs font-semibold">@b.Name</div><div class="mt-0.5 font-mono text-[9.5px] text-faint">@b.Meta</div></div>
-                </div>
+                <BinRow Item="item" Active="@(ActiveUrl == item.Url)" OnPick="Pick" />
+            }
+            <div class="px-1.5 pb-1 pt-3 font-mono text-[9.5px] tracking-[0.1em] text-faint">RENDERS</div>
+            @if (!MediaItems.Any(m => m.Section == "render"))
+            {
+                <div class="px-1.5 py-1 text-[10.5px] leading-[1.5] text-faint">Other renders of this media appear here.</div>
+            }
+            @foreach (var item in MediaItems.Where(m => m.Section == "render"))
+            {
+                <BinRow Item="item" Active="@(ActiveUrl == item.Url)" OnPick="Pick" />
             }
         </div>
     }
@@ -30,20 +31,81 @@
     @if (S.BinTab == "caps")
     {
         <div class="anim-fade-up flex-1 overflow-y-auto p-1.5">
-            @foreach (var (cap, i) in SampleData.Captions.Select((c, i) => (c, i)))
+            @if (S.Edit.Doc is null or { Captions.Count: 0 })
             {
-                <div @onclick="() => S.SelectCaption(i)" class="flex cursor-pointer gap-2.5 rounded-[5px] px-[9px] py-[7px] hover:bg-elevate @(S.ActiveCaption == i ? "bg-well" : "bg-transparent")">
-                    <span class="shrink-0 pt-0.5 font-mono text-[10px] @(S.ActiveCaption == i ? "text-accent" : "text-faint")">@cap.T</span>
-                    <span class="text-xs leading-[1.5] @(S.ActiveCaption == i ? "text-fg" : "text-[#A8A399]")">@cap.Text</span>
+                <div class="px-2 py-2 text-[11px] leading-[1.5] text-faint">
+                    No caption lines on this cut — the transcript had no words in its window.
                 </div>
+            }
+            else
+            {
+                @foreach (var caption in S.Edit.Doc.Captions)
+                {
+                    var isActive = S.Edit.Playhead >= caption.Start && S.Edit.Playhead <= caption.End;
+                    var isSelected = S.Edit.SelectedId == caption.Id;
+                    <div class="flex gap-2 rounded-[5px] px-[9px] py-[6px] hover:bg-elevate @(isActive || isSelected ? "bg-well" : "bg-transparent")">
+                        <span @onclick="() => Seek(caption)" class="shrink-0 cursor-pointer pt-[5px] font-mono text-[10px] @(isActive ? "text-accent" : "text-faint")">@Fmt.Stamp(caption.Start)</span>
+                        <input value="@caption.Text"
+                               @onfocus="() => S.Edit.Select(caption.Id)"
+                               @onchange='e => S.Edit.UpdateCaptionText(caption.Id, e.Value?.ToString() ?? "")'
+                               class="w-full border-none bg-transparent py-0.5 font-sans text-xs leading-[1.5] outline-none @(isActive || isSelected ? "text-fg" : "text-[#A8A399]")" />
+                    </div>
+                }
             }
         </div>
         <div class="anim-fade-up flex items-center gap-1.5 border-t border-line px-3 py-2.5">
             <span class="font-mono text-[9.5px] tracking-[0.08em] text-faint">STYLE</span>
             @foreach (var k in new[] { "boxed", "plain", "karaoke" })
             {
-                <span @onclick="() => S.SetCapStyle(k)" class="cursor-pointer rounded border px-[9px] py-[3px] text-[11px] hover:text-fg @(S.CapStyle == k ? "border-accent text-accent" : "border-line2 text-muted")">@(char.ToUpper(k[0]) + k[1..])</span>
+                <span @onclick="() => PickStyle(k)" class="cursor-pointer rounded border px-[9px] py-[3px] text-[11px] hover:text-fg @(CurrentStyle == k ? "border-accent text-accent" : "border-line2 text-muted")">@(char.ToUpper(k[0]) + k[1..])</span>
             }
         </div>
     }
 </div>
+
+@code {
+    public record MediaItem(string Section, string Name, string Meta, string? Url, string? Thumb);
+
+    private string? ActiveUrl => S.Edit.PreviewOverrideUrl ?? S.Edit.Meta?.SourceUrl ?? S.ActiveMediaUrl;
+    private string CurrentStyle => S.Edit.Doc?.CaptionStyle ?? S.CapStyle;
+
+    private List<MediaItem> MediaItems
+    {
+        get
+        {
+            var items = new List<MediaItem>();
+            if (S.ActiveClip is { } clip)
+            {
+                if (clip.VerticalUrl is { } vertical)
+                    items.Add(new("edit", "Vertical 9:16", $"{Fmt.Duration(clip.DurationSeconds)} · clean", vertical, clip.ThumbnailUrl));
+                if (clip.VideoUrl is { } source)
+                    items.Add(new(items.Count == 0 ? "edit" : "render", "Source 16:9", Fmt.Duration(clip.DurationSeconds), source, clip.ThumbnailUrl));
+                if (clip.CaptionedUrl is { } captioned)
+                    items.Add(new("render", "Captioned 9:16", "pipeline captions", captioned, clip.ThumbnailUrl));
+                if (S.Edit.Meta?.Export?.Url is { } exported)
+                    items.Add(new("render", "Editor export", Fmt.Duration(S.Edit.Meta.Export.DurationSeconds), exported, S.Edit.Meta.Export.ThumbnailUrl));
+            }
+            else if (S.ActiveLongform is { } cut)
+            {
+                items.Add(new("edit", $"Long-form v{cut.Version}", Fmt.Duration(cut.DurationSeconds), cut.VideoUrl, cut.ThumbnailUrl));
+                foreach (var other in (S.Detail?.LongformEdits ?? []).Where(e => e.Id != cut.Id && e.VideoUrl is not null))
+                    items.Add(new("render", $"Long-form v{other.Version}", Fmt.Duration(other.DurationSeconds), other.VideoUrl, other.ThumbnailUrl));
+            }
+            return items;
+        }
+    }
+
+    private void Pick(MediaItem item)
+    {
+        // Previewing the edited source again clears the override.
+        S.Edit.SetPreview(item.Url == S.Edit.Meta?.SourceUrl ? null : item.Url);
+    }
+
+    private void Seek(EdlCaption caption) => S.Edit.RequestSeek(caption.Start);
+
+    private void PickStyle(string style)
+    {
+        S.SetCapStyle(style);            // preview fallback outside the editor
+        if (S.Edit.Doc is not null) S.Edit.SetCaptionStyle(style);
+    }
+}

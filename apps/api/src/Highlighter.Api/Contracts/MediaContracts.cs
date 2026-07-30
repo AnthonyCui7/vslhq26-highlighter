@@ -26,7 +26,15 @@ public record LongformEditDto(
     double? DurationSeconds,
     IReadOnlyList<LongformSegmentDto> Segments,
     string? RevisionRequest,
-    DateTimeOffset CreatedAt);
+    DateTimeOffset CreatedAt,
+    string? Title = null,
+    IReadOnlyList<ThumbnailVariantDto>? Thumbnails = null,
+    int? SelectedThumbnail = null);
+
+/// <summary>A generated long-form thumbnail concept (metadata.render.thumbnails).
+/// Index is the variant's stable number; SelectedThumbnail on the edit points at
+/// the Index currently set as the video's thumbnail.</summary>
+public record ThumbnailVariantDto(int Index, string? Direction, string? OverlayText, string? Url);
 
 public record LongformSegmentDto(
     int? ChunkIndex, string? Title, double StartSeconds, double EndSeconds);

@@ -19,4 +19,23 @@ public record PublishRequestDto(
 public record ReclipRequestDto(
     double StartSeconds, double EndSeconds, string? Title = null, string? Description = null);
 
+/// <summary>POST .../research — rerun web-grounded content research. Mode picks
+/// the short- or long-form research context; Focus steers it.</summary>
+public record ResearchRequestDto(string? Mode = "long", string? Focus = null);
+
+/// <summary>POST .../thumbnails — generate more long-form thumbnail concepts
+/// (latest version unless Version picks one).</summary>
+public record ThumbnailsRequestDto(string? Prompt = null, int? Version = null);
+
+/// <summary>POST .../thumbnails/select — make variant Index the video thumbnail.</summary>
+public record ThumbnailSelectRequestDto(int Index, int? Version = null);
+
+/// <summary>POST .../thumbnails/import — a user-supplied thumbnail image
+/// (base64 payload), stored and selected for the latest (or given) version.</summary>
+public record ThumbnailImportRequestDto(string? FileName, string? ContentBase64, int? Version = null);
+
+/// <summary>POST .../clips/{clipId}/reformat — re-render a clip in another
+/// delivery format ("square" today), optionally with burned captions.</summary>
+public record ReformatRequestDto(string? Format = "square", bool Captions = false);
+
 public record CleanupRequestDto(int Limit = 100);

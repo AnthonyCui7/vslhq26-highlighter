@@ -7,6 +7,11 @@ public sealed class ApiOptions
     /// Empty (the default) disables the gate — the API binds to localhost.</summary>
     public string ApiKey { get; set; } = "";
 
+    /// <summary>When true, /api/* (except /api/auth) requires a valid Supabase
+    /// user JWT (Authorization: Bearer). Reads and writes are then scoped to the
+    /// caller's own projects. Turn off for tokenless scripting/debugging.</summary>
+    public bool RequireAuth { get; set; } = true;
+
     public string[] CorsOrigins { get; set; } = [];
 }
 

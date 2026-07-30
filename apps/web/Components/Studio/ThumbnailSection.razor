@@ -83,6 +83,20 @@
         }
     }
 
-    async Task Import(InputFileChangeEventArgs e) =>
-        await Backend.ImportThumbnailAsync(e.File.Name);
+    async Task Import(InputFileChangeEventArgs e)
+    {
+        try
+        {
+            using var stream = e.File.OpenReadStream(maxAllowedSize: 8 * 1024 * 1024);
+            using var buffer = new MemoryStream();
+            await stream.CopyToAsync(buffer);
+            var result = await Backend.ImportThumbnailAsync(e.File.Name, buffer.ToArray());
+            if (result.Contains("failed", StringComparison.OrdinalIgnoreCase))
+                S.SetThumbJob(false, result);
+        }
+        catch (Exception exc)
+        {
+            S.SetThumbJob(false, $"Import failed: {exc.Message}");
+        }
+    }
 }

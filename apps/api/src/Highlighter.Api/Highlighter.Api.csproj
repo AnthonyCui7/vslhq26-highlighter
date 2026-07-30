@@ -13,10 +13,15 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.*" />
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.*" />
     <!-- Transitive pin: the 2.0.0 pulled in by AspNetCore.OpenApi has a known CVE (NU1903). -->
     <PackageReference Include="Microsoft.OpenApi" Version="2.*" />
     <PackageReference Include="Scalar.AspNetCore" Version="2.*" />
+    <!-- Editor caption/text rendering: this machine's ffmpeg has no libass or
+         drawtext, so caption lines are rasterized here and composited with the
+         overlay filter. Managed code only — no native font libraries. -->
+    <PackageReference Include="SixLabors.ImageSharp.Drawing" Version="2.*" />
     <PackageReference Include="Serilog.AspNetCore" Version="9.*" />
     <PackageReference Include="Serilog.Sinks.File" Version="6.*" />
   </ItemGroup>

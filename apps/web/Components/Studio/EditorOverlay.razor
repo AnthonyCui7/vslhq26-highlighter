@@ -1,4 +1,5 @@
 @inherits StudioComponent
+@inject ApiClient Api
 
 <div class="anim-rise absolute inset-0 z-40 flex flex-col bg-[#111010]" data-screen-label="Editor">
 
@@ -6,18 +7,75 @@
     <div class="flex h-11 shrink-0 items-center gap-3 border-b border-line bg-bar px-3.5">
         <div @onclick="S.CloseEditor" class="flex cursor-pointer items-center gap-[7px] rounded-[5px] px-[9px] py-[5px] text-[12.5px] text-muted hover:bg-elevate hover:text-fg">✕ <span>Close</span></div>
         <div class="h-4 w-px bg-line2"></div>
-        <div class="text-[13px] font-semibold">@S.ActiveClipTitle</div>
-        <div class="text-[11px] text-faint">@S.ProjectTitle · autosaved</div>
+        <div class="min-w-0 truncate text-[13px] font-semibold">@S.ActiveClipTitle</div>
+        <div class="shrink-0 text-[11px] @(S.Edit.SaveState == "Save failed" ? "text-playhead" : "text-faint")">@S.ProjectTitle · @S.Edit.SaveState.ToLowerInvariant()</div>
         <div class="ml-auto flex items-center gap-2">
             <div class="flex overflow-hidden rounded-[5px] border border-line2">
-                <div class="cursor-pointer px-[9px] py-1 text-[12.5px] leading-none text-muted hover:bg-elevate hover:text-fg">↺</div>
-                <div class="cursor-pointer border-l border-line2 px-[9px] py-1 text-[12.5px] leading-none text-muted hover:bg-elevate hover:text-fg">↻</div>
+                <div @onclick="S.Edit.Undo" title="Undo" class="cursor-pointer px-[9px] py-1 text-[12.5px] leading-none hover:bg-elevate @(S.Edit.CanUndo ? "text-soft hover:text-fg" : "pointer-events-none text-ghost")">↺</div>
+                <div @onclick="S.Edit.Redo" title="Redo" class="cursor-pointer border-l border-line2 px-[9px] py-1 text-[12.5px] leading-none hover:bg-elevate @(S.Edit.CanRedo ? "text-soft hover:text-fg" : "pointer-events-none text-ghost")">↻</div>
             </div>
-            <div class="cursor-pointer rounded-[5px] border border-line2 px-2.5 py-[5px] font-mono text-[11.5px] text-muted hover:text-fg">@FormatChip</div>
-            <div class="cursor-pointer rounded-[5px] border border-line2 px-3 py-[5px] text-[12.5px] text-soft hover:border-[#4A4638] hover:text-fg active:scale-[0.98]">Export</div>
-            <div class="cursor-pointer rounded-[5px] bg-accent px-[13px] py-[5px] text-[12.5px] font-bold text-ink hover:bg-accent-soft active:scale-95">Publish</div>
+            <div class="rounded-[5px] border border-line2 px-2.5 py-[5px] font-mono text-[11.5px] text-muted">@FormatChip</div>
+            <div @onclick="() => _ = S.Edit.ExportAsync()"
+                 class="flex cursor-pointer items-center gap-1.5 rounded-[5px] border border-line2 px-3 py-[5px] text-[12.5px] text-soft hover:border-[#4A4638] hover:text-fg active:scale-[0.98] @(S.Edit.ExportBusy ? "pointer-events-none opacity-60" : "")">
+                @if (S.Edit.ExportBusy)
+                {
+                    <span class="h-1.5 w-1.5 animate-pulse-dc rounded-full bg-accent"></span>
+                    <span>Exporting…</span>
+                }
+                else
+                {
+                    <span>Export</span>
+                }
+            </div>
+            <div class="relative">
+                <div @onclick="() => _publishOpen = !_publishOpen" class="cursor-pointer rounded-[5px] bg-accent px-[13px] py-[5px] text-[12.5px] font-bold text-ink hover:bg-accent-soft active:scale-95">Publish</div>
+                @if (_publishOpen)
+                {
+                    <div class="anim-drop-in absolute right-0 top-[calc(100%_+_8px)] z-50 w-[280px] rounded-md border border-line3 bg-elevate p-3 shadow-[0_12px_32px_rgba(0,0,0,0.45)]" @onclick:stopPropagation>
+                        <div class="mb-2 text-xs font-bold text-fg">Publish @(S.ActiveClip is null ? $"long-form v{S.ActiveLongform?.Version}" : "this highlight")</div>
+                        <div class="mb-2.5 flex flex-wrap gap-1.5">
+                            @foreach (var platform in Platforms)
+                            {
+                                <span @onclick="() => Toggle(platform)" class="cursor-pointer rounded border px-2 py-[3px] text-[11px] @(_selected.Contains(platform) ? "border-accent text-accent" : "border-line2 text-muted hover:text-fg")">@platform</span>
+                            }
+                        </div>
+                        <div class="mb-2.5 flex items-center justify-between text-[11.5px]">
+                            <span class="text-soft">Dry run <span class="text-faint">· nothing posts</span></span>
+                            <span @onclick="() => _dryRun = !_dryRun" class="relative h-[15px] w-[27px] cursor-pointer rounded-[8px] @(_dryRun ? "bg-accent" : "bg-well")">
+                                <span class="absolute top-0.5 h-[11px] w-[11px] rounded-full @(_dryRun ? "right-0.5 bg-ink" : "left-0.5 bg-muted")"></span>
+                            </span>
+                        </div>
+                        @if (_publishNote is not null)
+                        {
+                            <div class="mb-2 rounded border border-line2 bg-card2 px-2 py-1.5 text-[10.5px] leading-[1.5] text-soft">@_publishNote</div>
+                        }
+                        <div class="mb-2 text-[10px] leading-[1.5] text-faint">Publishes the pipeline's rendered file via the upload service. Editor exports stay downloadable from the media bin.</div>
+                        <div @onclick="PublishAsync" class="cursor-pointer rounded-md bg-accent px-3 py-[7px] text-center text-[12px] font-bold text-ink hover:bg-accent-soft active:scale-[0.97] @(_publishBusy || _selected.Count == 0 ? "pointer-events-none opacity-60" : "")">
+                            @(_publishBusy ? "Publishing…" : _dryRun ? "Run dry publish" : "Publish now")
+                        </div>
+                    </div>
+                }
+            </div>
         </div>
     </div>
+
+    @if (S.Edit.ExportError is not null || S.Edit.ExportDoneUrl is not null)
+    {
+        <div class="anim-drop-in flex shrink-0 items-center gap-3 border-b border-line px-3.5 py-2 text-[12px] @(S.Edit.ExportError is null ? "bg-[#1A2114] text-soft" : "bg-playhead/10 text-soft")">
+            @if (S.Edit.ExportError is { } error)
+            {
+                <span class="min-w-0 flex-1 truncate">Export failed: @error</span>
+            }
+            else
+            {
+                <span class="min-w-0 flex-1 truncate">Export finished — it's in the media bin@(S.ActiveClip is null ? " and on the project page as a new version" : "").</span>
+                @if (S.Edit.ExportDoneUrl is { } url)
+                {
+                    <a href="@url" target="_blank" class="shrink-0 font-semibold text-accent hover:text-accent-soft">Open</a>
+                }
+            }
+        </div>
+    }
 
     @* Editor body *@
     <div class="flex min-h-0 flex-1">
@@ -30,10 +88,77 @@
 </div>
 
 @code {
-    string FormatChip => S.ClipFormat switch
+    private static readonly string[] Platforms = ["tiktok", "instagram", "youtube", "x"];
+    private bool _publishOpen;
+    private bool _publishBusy;
+    private bool _dryRun = true;
+    private string? _publishNote;
+    private readonly HashSet<string> _selected = ["youtube"];
+
+    string FormatChip => S.ActiveClip is null ? "1920 × 1080" : S.ClipFormat switch
     {
-        "square" => "1080 × 1080 ▾",
-        "wide" => "1920 × 1080 ▾",
-        _ => "1080 × 1920 ▾",
+        "square" => "1080 × 1080",
+        "wide" => "1920 × 1080",
+        _ => "1080 × 1920",
     };
+
+    private void Toggle(string platform)
+    {
+        if (!_selected.Remove(platform)) _selected.Add(platform);
+    }
+
+    private async Task PublishAsync()
+    {
+        if (S.ProjectId is not { } projectId || _publishBusy) return;
+        if (_selected.SetEquals(["x"]))
+        {
+            _publishNote = "'x' is a promo layer — pick a companion platform too.";
+            return;
+        }
+        _publishBusy = true;
+        _publishNote = null;
+        try
+        {
+            var request = new PublishRequestDto(
+                Target: S.ActiveClip is null ? "longform" : "clip",
+                ClipId: S.ActiveClip?.Id,
+                Version: S.ActiveLongform?.Version,
+                Platforms: _selected.ToArray(),
+                DryRun: _dryRun);
+            var job = await Api.PublishAsync(projectId, request);
+            _publishNote = $"Publish job {job.Id} started{(_dryRun ? " (dry run)" : "")} — watching…";
+            StateHasChanged();
+            for (var i = 0; i < 120; i++)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(3));
+                var state = await Api.GetJobAsync(job.Id);
+                if (state.State is "starting" or "running") continue;
+                if (state.State == "succeeded")
+                {
+                    var tail = await Api.GetJobLogsAsync(job.Id, tail: 3);
+                    _publishNote = tail.Count > 0
+                        ? tail[^1].Line
+                        : $"Publish {(_dryRun ? "dry run " : "")}succeeded.";
+                    _ = S.RefreshDetailAsync();
+                }
+                else
+                {
+                    _publishNote = $"Publish {state.State}: {state.FailureReason ?? "see job logs"}";
+                }
+                break;
+            }
+        }
+        catch (ApiException exception)
+        {
+            _publishNote = exception.UserMessage;
+        }
+        catch (HttpRequestException)
+        {
+            _publishNote = "Can't reach the Highlighter API.";
+        }
+        finally
+        {
+            _publishBusy = false;
+        }
+    }
 }

@@ -21,6 +21,8 @@ public class ApiSmokeTests
         return new WebApplicationFactory<Program>().WithWebHostBuilder(builder =>
         {
             builder.UseSetting("Api:ApiKey", apiKey);
+            // These tests cover pre-auth behavior; AuthGateTests covers the gate.
+            builder.UseSetting("Api:RequireAuth", "false");
             builder.ConfigureServices(services =>
             {
                 services.RemoveAll<IHostedService>();

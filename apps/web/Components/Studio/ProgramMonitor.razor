@@ -1,63 +1,220 @@
 @inherits StudioComponent
+@inject IJSRuntime JS
+@implements IAsyncDisposable
+
+@* EDL-aware program monitor: plays the clean source while studio.js skips cut
+   regions and applies per-segment speed; scale/pan preview via CSS transform;
+   captions and text overlays render live from the document at the playhead. *@
 
 <div class="anim-fade-up flex min-w-0 flex-1 flex-col bg-[#0D0C0B]" style="animation-delay:90ms">
     <div class="flex min-h-0 flex-1 items-center justify-center p-[18px] [container-type:size]">
         <div class="relative @AspectClasses overflow-hidden border border-line bg-[repeating-linear-gradient(-45deg,#191817_0_12px,#1D1B19_12px_24px)]">
-            <div class="absolute inset-0 flex items-center justify-center">
-                <span class="font-mono text-[10px] text-dim">program · @FormatLabel</span>
-            </div>
-            @if (S.ClipCaptionsOn)
+            @if (MediaUrl is { } mediaUrl)
             {
-                <div class="absolute bottom-[12%] left-[8%] right-[8%] text-center">
-                    @if (S.CapStyle == "boxed")
+                <video @ref="_video" @key="mediaUrl" src="@mediaUrl" poster="@S.ActivePosterUrl"
+                       playsinline preload="metadata"
+                       class="absolute inset-0 h-full w-full bg-black object-contain"
+                       style="@TransformStyle"
+                       @onclick="S.TogglePlay"
+                       @onplay="() => S.SetPlaying(true)"
+                       @onpause="() => S.SetPlaying(false)"
+                       @onended="() => S.SetPlaying(false)"></video>
+            }
+            else
+            {
+                <div class="absolute inset-0 flex items-center justify-center">
+                    <span class="flex items-center gap-2 font-mono text-[10px] text-dim">
+                        <span class="h-1.5 w-1.5 animate-pulse-dc rounded-full bg-accent"></span>
+                        rendering — program · @FormatLabel
+                    </span>
+                </div>
+            }
+
+            @* live EDL text overlays *@
+            @foreach (var text in ActiveTexts)
+            {
+                <div class="pointer-events-none absolute left-[5%] right-[5%] z-10 text-center" style="top:@($"{text.Y * 100:0.#}%")">
+                    <span class="text-[13px] font-extrabold uppercase leading-[1.2] text-fg [text-shadow:0_1px_3px_#141312,0_0_10px_#141312]">@text.Text</span>
+                </div>
+            }
+
+            @* live EDL caption at the playhead *@
+            @if (ActiveCaption is { } caption)
+            {
+                <div class="pointer-events-none absolute bottom-[12%] left-[8%] right-[8%] z-10 text-center">
+                    @if (Style == "boxed")
                     {
-                        <span class="anim-fade-up rounded-[3px] bg-ink px-[7px] py-[3px] text-[15px] font-extrabold leading-[1.55] text-fg [box-decoration-break:clone] [-webkit-box-decoration-break:clone]">nobody budgets for the <span class="text-accent">retry storm</span></span>
+                        <span class="rounded-[3px] bg-ink px-[7px] py-[3px] text-[15px] font-extrabold leading-[1.55] text-fg [box-decoration-break:clone] [-webkit-box-decoration-break:clone]">@caption.Text</span>
                     }
-                    @if (S.CapStyle == "plain")
+                    @if (Style == "plain")
                     {
-                        <span class="anim-fade-up text-[15px] font-extrabold leading-[1.55] text-fg [text-shadow:0_1px_3px_#141312,0_0_12px_#141312]">nobody budgets for the <span class="text-accent">retry storm</span></span>
+                        <span class="text-[15px] font-extrabold leading-[1.55] text-fg [text-shadow:0_1px_3px_#141312,0_0_12px_#141312]">@caption.Text</span>
                     }
-                    @if (S.CapStyle == "karaoke")
+                    @if (Style == "karaoke")
                     {
-                        <span class="anim-fade-up text-[15px] font-extrabold leading-[1.55] text-muted [text-shadow:0_1px_3px_#141312]"><span class="text-accent">nobody budgets</span> for the retry storm</span>
+                        <span class="text-[15px] font-extrabold leading-[1.55] text-muted [text-shadow:0_1px_3px_#141312]">
+                            @foreach (var word in caption.Words ?? [])
+                            {
+                                <span class="@(word.S <= E.Playhead ? "text-accent" : "")">@word.T </span>
+                            }
+                            @if (caption.Words is null or { Count: 0 })
+                            {
+                                @caption.Text
+                            }
+                        </span>
                     }
                 </div>
             }
         </div>
     </div>
     <div class="flex min-w-0 items-center gap-2.5 px-3.5 pb-3 pt-2">
-        <span class="min-w-0 shrink overflow-hidden font-mono text-[13px] tracking-[0.03em] text-accent">00:00:12:04</span>
+        <span class="min-w-0 shrink overflow-hidden font-mono text-[13px] tracking-[0.03em] text-accent">@Fmt.Timecode(E.Doc is null ? _playhead : E.PlayheadOutput)</span>
         <div class="flex min-w-0 flex-1 items-center justify-center gap-2.5">
-            <span title="Mark in" class="cursor-pointer font-mono text-[11px] text-faint hover:text-fg">⟦</span>
-            <span class="cursor-pointer text-[13px] text-muted hover:text-fg">⏮</span>
-            <span class="cursor-pointer text-[13px] text-muted hover:text-fg">◀</span>
-            <span @onclick="S.TogglePlay" class="flex h-8 w-8 cursor-pointer items-center justify-center rounded-full bg-fg text-xs text-ink hover:bg-white active:scale-90">@S.PlayIcon</span>
-            <span class="cursor-pointer text-[13px] text-muted hover:text-fg">▶</span>
-            <span class="cursor-pointer text-[13px] text-muted hover:text-fg">⏭</span>
-            <span title="Mark out" class="cursor-pointer font-mono text-[11px] text-faint hover:text-fg">⟧</span>
+            <span title="Mark in — trim the segment start to here" @onclick="E.MarkIn" class="cursor-pointer font-mono text-[11px] text-faint hover:text-accent">⟦</span>
+            <span title="Previous cut" @onclick="() => JumpSegment(-1)" class="cursor-pointer text-[13px] text-muted hover:text-fg">⏮</span>
+            <span title="Back one frame" @onclick="() => SeekBy(-1.0 / 30)" class="cursor-pointer text-[13px] text-muted hover:text-fg">◀</span>
+            <span @onclick="S.TogglePlay" class="flex h-8 w-8 cursor-pointer items-center justify-center rounded-full bg-fg text-xs text-ink hover:bg-white active:scale-90 @(MediaUrl is null ? "pointer-events-none opacity-40" : "")">@S.PlayIcon</span>
+            <span title="Forward one frame" @onclick="() => SeekBy(1.0 / 30)" class="cursor-pointer text-[13px] text-muted hover:text-fg">▶</span>
+            <span title="Next cut" @onclick="() => JumpSegment(1)" class="cursor-pointer text-[13px] text-muted hover:text-fg">⏭</span>
+            <span title="Mark out — trim the segment end to here" @onclick="E.MarkOut" class="cursor-pointer font-mono text-[11px] text-faint hover:text-accent">⟧</span>
         </div>
         <div class="flex min-w-0 shrink items-center justify-end gap-2 overflow-hidden">
             <div class="flex h-4 shrink-0 items-end gap-0.5">
                 <div class="h-full w-[3px] bg-[linear-gradient(to_top,#5E6E33_0_62%,#D9F24B_62%_78%,#242220_78%)]"></div>
                 <div class="h-full w-[3px] bg-[linear-gradient(to_top,#5E6E33_0_48%,#D9F24B_48%_60%,#242220_60%)]"></div>
             </div>
-            <span class="whitespace-nowrap font-mono text-[11px] text-faint">00:00:42:00</span>
+            <span class="whitespace-nowrap font-mono text-[11px] text-faint">@Fmt.Timecode(E.Doc is null ? _duration : E.OutputDuration)</span>
         </div>
     </div>
 </div>
 
 @code {
-    string AspectClasses => S.ClipFormat switch
-    {
-        "square" => "aspect-square h-[min(100%,100cqw)]",
-        "wide" => "aspect-video w-[min(100%,177.7cqh)]",
-        _ => "aspect-[9/16] h-[min(100%,177.7cqw)]",
-    };
+    private ElementReference _video;
+    private IJSObjectReference? _module;
+    private DotNetObjectReference<ProgramMonitor>? _self;
+    private bool _wasPlaying;
+    private string? _watchedUrl;
+    private string? _watchedSegments;
+    private double _playhead;
+    private double _duration;
 
-    string FormatLabel => S.ClipFormat switch
+    private EditorSession E => S.Edit;
+    private string? MediaUrl => E.PreviewOverrideUrl ?? E.Meta?.SourceUrl ?? S.ActiveMediaUrl;
+    private string Style => E.Doc?.CaptionStyle ?? S.CapStyle;
+
+    string AspectClasses => S.ActiveClip is null
+        ? "aspect-video w-[min(100%,177.7cqh)]"
+        : S.ClipFormat switch
+        {
+            "square" => "aspect-square h-[min(100%,100cqw)]",
+            "wide" => "aspect-video w-[min(100%,177.7cqh)]",
+            _ => "aspect-[9/16] h-[min(100%,177.7cqw)]",
+        };
+
+    string FormatLabel => S.ActiveClip is null ? "16:9" : S.ClipFormat switch
     {
         "square" => "1:1",
         "wide" => "16:9",
         _ => "9:16",
     };
+
+    // Manual-reframe preview: scale about a horizontal origin that matches the
+    // renderer's crop window.
+    private string TransformStyle
+    {
+        get
+        {
+            if (E.Doc is not { Reframe: "manual" } doc || doc.Transform.Scale <= 1.001) return "";
+            var origin = Math.Clamp(0.5 + doc.Transform.PosX / 2.0, 0, 1) * 100;
+            return $"transform:scale({doc.Transform.Scale:0.###});transform-origin:{origin:0.#}% 50%";
+        }
+    }
+
+    private EdlCaption? ActiveCaption => E.Doc?.Captions
+        .FirstOrDefault(c => E.Playhead >= c.Start && E.Playhead <= c.End);
+
+    private IEnumerable<EdlText> ActiveTexts => E.Doc?.Texts
+        .Where(t => E.Playhead >= t.Start && E.Playhead <= t.End) ?? [];
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (MediaUrl is null) return;
+        _module ??= await JS.InvokeAsync<IJSObjectReference>("import", "./js/studio.js");
+        _self ??= DotNetObjectReference.Create(this);
+
+        var segmentsJson = SegmentsJson();
+        if (_watchedUrl != MediaUrl || _watchedSegments != segmentsJson)
+        {
+            _watchedUrl = MediaUrl;
+            _watchedSegments = segmentsJson;
+            await _module.InvokeVoidAsync("watch", _video, _self, SegmentsPayload());
+            _duration = await _module.InvokeAsync<double>("getDuration", _video);
+        }
+        if (_duration <= 0)
+            _duration = await _module.InvokeAsync<double>("getDuration", _video);
+
+        if (E.ConsumeSeek() is { } seek)
+            await _module.InvokeVoidAsync("seek", _video, seek);
+
+        await _module.InvokeVoidAsync("setVolume", _video, E.Doc?.Audio.Voice ?? 1.0);
+
+        if (S.Playing != _wasPlaying)
+        {
+            _wasPlaying = S.Playing;
+            await _module.InvokeVoidAsync("setPlaying", _video, S.Playing);
+        }
+    }
+
+    private string SegmentsJson() => E.Doc is null
+        ? "[]"
+        : string.Join(";", E.Doc.Segments.Select(s => $"{s.SrcStart:0.###}-{s.SrcEnd:0.###}@{s.Speed:0.##}"));
+
+    private object[] SegmentsPayload() => E.Doc is null
+        ? []
+        : E.Doc.Segments.Select(s => (object)new { start = s.SrcStart, end = s.SrcEnd, speed = s.Speed }).ToArray();
+
+    [JSInvokable]
+    public async Task OnPlayhead(double seconds)
+    {
+        _playhead = seconds;
+        E.SetPlayhead(seconds);
+        await InvokeAsync(StateHasChanged);
+    }
+
+    private async Task SeekBy(double delta)
+    {
+        if (_module is null || MediaUrl is null) return;
+        var now = await _module.InvokeAsync<double>("getCurrentTime", _video);
+        await _module.InvokeVoidAsync("seek", _video, now + delta);
+        _playhead = Math.Max(0, now + delta);
+        E.SetPlayhead(_playhead);
+    }
+
+    private void JumpSegment(int direction)
+    {
+        if (E.Doc is null) return;
+        var layout = E.SegmentLayout();
+        if (layout.Count == 0) return;
+        var currentOut = E.PlayheadOutput;
+        var index = layout.FindLastIndex(entry => entry.OutStart <= currentOut + 0.05);
+        var target = Math.Clamp(index + direction, 0, layout.Count - 1);
+        E.RequestSeek(layout[target].Segment.SrcStart);
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        Dispose(); // StudioComponent's Changed unsubscribe
+        try
+        {
+            if (_module is not null)
+            {
+                await _module.InvokeVoidAsync("unwatch", _video);
+                await _module.DisposeAsync();
+            }
+        }
+        catch (JSDisconnectedException)
+        {
+        }
+        _self?.Dispose();
+    }
 }

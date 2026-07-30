@@ -7,7 +7,7 @@ namespace Highlighter.Api.Endpoints;
 
 public static class JobEndpoints
 {
-    public static void MapJobEndpoints(this IEndpointRouteBuilder app)
+    public static IEndpointConventionBuilder MapJobEndpoints(this IEndpointRouteBuilder app)
     {
         var group = app.MapGroup("/api/jobs");
 
@@ -38,6 +38,8 @@ public static class JobEndpoints
                     StreamAsync(job, Math.Clamp(tail ?? 200, 0, 4000), ct));
             })
             .WithName("StreamJobLogs");
+
+        return group;
     }
 
     private static async IAsyncEnumerable<SseItem<object>> StreamAsync(

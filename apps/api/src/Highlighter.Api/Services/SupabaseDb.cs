@@ -54,23 +54,30 @@ public sealed class SupabaseDb
 
     // ---- projects ----
 
-    public Task<JsonArray> ListProjectsAsync(int limit, CancellationToken ct = default) =>
+    /// <summary>Strict per-user scoping: when a user id is present every project
+    /// read/write filters on user_id, so other users' rows (and legacy ownerless
+    /// rows) behave as if they don't exist. Null (auth disabled) leaves queries
+    /// unscoped — pre-auth behavior.</summary>
+    private static string Scope(Guid? userId) => userId is null ? "" : $"&user_id=eq.{userId}";
+
+    public Task<JsonArray> ListProjectsAsync(int limit, Guid? userId = null, CancellationToken ct = default) =>
         GetArrayAsync("projects",
             "select=*,clips(count),transcript_chunks(count),longform_edits(count)"
-            + $"&order=created_at.desc&limit={limit}", ct);
+            + $"&order=created_at.desc&limit={limit}{Scope(userId)}", ct);
 
-    public async Task<JsonObject?> GetProjectDetailAsync(Guid id, CancellationToken ct = default) =>
+    public async Task<JsonObject?> GetProjectDetailAsync(Guid id, Guid? userId = null, CancellationToken ct = default) =>
         FirstOrNull(await GetArrayAsync("projects",
             $"id=eq.{id}&select=*,clips(*),longform_edits(*),publications(*),transcript_chunks(count)"
             + "&clips.order=start_seconds.asc&longform_edits.order=version.desc"
-            + "&publications.order=created_at.desc", ct));
+            + $"&publications.order=created_at.desc{Scope(userId)}", ct));
 
-    public async Task<JsonObject?> GetProjectAsync(Guid id, string select = "*", CancellationToken ct = default) =>
-        FirstOrNull(await GetArrayAsync("projects", $"id=eq.{id}&select={select}", ct));
+    public async Task<JsonObject?> GetProjectAsync(
+        Guid id, string select = "*", Guid? userId = null, CancellationToken ct = default) =>
+        FirstOrNull(await GetArrayAsync("projects", $"id=eq.{id}&select={select}{Scope(userId)}", ct));
 
-    public async Task<string?> GetProjectStatusAsync(Guid id, CancellationToken ct = default)
+    public async Task<string?> GetProjectStatusAsync(Guid id, Guid? userId = null, CancellationToken ct = default)
     {
-        var row = await GetProjectAsync(id, "status", ct);
+        var row = await GetProjectAsync(id, "status", userId, ct);
         return row?["status"]?.GetValue<string>();
     }
 
@@ -86,20 +93,21 @@ public sealed class SupabaseDb
     /// allowed current statuses. Null means the guard matched nothing — someone else
     /// (usually the worker) moved the row first.</summary>
     public async Task<JsonObject?> PatchProjectGuardedAsync(
-        Guid id, IReadOnlyList<string> whenStatusIn, JsonObject patch, CancellationToken ct = default)
+        Guid id, IReadOnlyList<string> whenStatusIn, JsonObject patch,
+        Guid? userId = null, CancellationToken ct = default)
     {
         var guard = string.Join(",", whenStatusIn);
         var body = await SendAsync(HttpMethod.Patch, "projects",
-            $"id=eq.{id}&status=in.({guard})&select=*", patch, "return=representation", ct);
+            $"id=eq.{id}&status=in.({guard})&select=*{Scope(userId)}", patch, "return=representation", ct);
         return FirstOrNull(AsArray(body, "PATCH projects"));
     }
 
     /// <summary>True when a row was deleted. Cascades and the media-cleanup outbox
     /// triggers fire inside Postgres.</summary>
-    public async Task<bool> DeleteProjectAsync(Guid id, CancellationToken ct = default)
+    public async Task<bool> DeleteProjectAsync(Guid id, Guid? userId = null, CancellationToken ct = default)
     {
         var body = await SendAsync(HttpMethod.Delete, "projects",
-            $"id=eq.{id}&select=id", null, "return=representation", ct);
+            $"id=eq.{id}&select=id{Scope(userId)}", null, "return=representation", ct);
         return AsArray(body, "DELETE projects").Count > 0;
     }
 
@@ -127,6 +135,39 @@ public sealed class SupabaseDb
 
     public Task<JsonArray> ListLongformEditsAsync(Guid projectId, CancellationToken ct = default) =>
         GetArrayAsync("longform_edits", $"project_id=eq.{projectId}&select=*&order=version.desc", ct);
+
+    /// <summary>The latest rendered long-form row, or a specific version.</summary>
+    public async Task<JsonObject?> GetLongformEditAsync(
+        Guid projectId, int? version = null, CancellationToken ct = default)
+    {
+        var filter = version is { } wanted ? $"&version=eq.{wanted}" : "";
+        return FirstOrNull(await GetArrayAsync("longform_edits",
+            $"project_id=eq.{projectId}&select=*{filter}&order=version.desc&limit=1", ct));
+    }
+
+    public async Task<JsonObject?> PatchLongformEditAsync(
+        Guid editId, JsonObject patch, CancellationToken ct = default)
+    {
+        var body = await SendAsync(HttpMethod.Patch, "longform_edits",
+            $"id=eq.{editId}&select=*", patch, "return=representation", ct);
+        return FirstOrNull(AsArray(body, "PATCH longform_edits"));
+    }
+
+    public async Task<JsonObject> InsertLongformEditAsync(JsonObject row, CancellationToken ct = default)
+    {
+        var body = await SendAsync(HttpMethod.Post, "longform_edits", "select=*", row,
+            "return=representation", ct);
+        return FirstOrNull(AsArray(body, "POST longform_edits"))
+            ?? throw new PostgrestException("POST longform_edits", null, "insert returned no row");
+    }
+
+    public async Task<JsonObject?> PatchClipAsync(
+        Guid clipId, Guid projectId, JsonObject patch, CancellationToken ct = default)
+    {
+        var body = await SendAsync(HttpMethod.Patch, "clips",
+            $"id=eq.{clipId}&project_id=eq.{projectId}&select=*", patch, "return=representation", ct);
+        return FirstOrNull(AsArray(body, "PATCH clips"));
+    }
 
     public async Task<bool> HasRenderedLongformAsync(Guid projectId, CancellationToken ct = default)
     {

@@ -1,0 +1,129 @@
+@page "/login"
+@rendermode RenderModes.NoPrerender
+@inject AuthApiClient AuthApi
+@inject AuthSession Auth
+@inject NavigationManager Nav
+
+<PageTitle>Sign in · Highlighter</PageTitle>
+
+<div class="flex h-screen min-h-[560px] w-full flex-col items-center justify-center gap-7 bg-ink font-sans text-fg">
+    <div class="anim-fade-up text-[17px] font-extrabold leading-none tracking-[0.05em]">
+        <span class="rounded-[3px] bg-accent pb-[2px] pl-[5px] pr-[5px] pt-[3px] text-ink">HIGH</span><span class="pb-[2px] pl-[3px] pt-[3px]">LIGHTER</span>
+    </div>
+
+    <div class="anim-scale-in w-[400px] rounded-[10px] border border-line3 bg-card2 px-7 py-[26px] shadow-[0_24px_60px_rgba(0,0,0,0.5)]" style="animation-delay:60ms">
+        <div class="grid grid-cols-2 gap-2">
+            <div @onclick="() => SwitchMode(false)"
+                 class="cursor-pointer rounded-md border px-[13px] py-[9px] text-center text-[13px] font-bold @(_signup ? "border-line3 text-muted" : "border-accent bg-[#22241A] text-fg")">
+                Sign in
+            </div>
+            <div @onclick="() => SwitchMode(true)"
+                 class="cursor-pointer rounded-md border px-[13px] py-[9px] text-center text-[13px] font-bold @(_signup ? "border-accent bg-[#22241A] text-fg" : "border-line3 text-muted")">
+                Create account
+            </div>
+        </div>
+
+        <form @onsubmit="SubmitAsync" @onsubmit:preventDefault>
+            <div class="mt-5">
+                <div class="mb-[7px] text-xs font-semibold text-muted">Email</div>
+                <input @bind="_email" @bind:event="oninput" type="email" autocomplete="email"
+                       placeholder="you@example.com"
+                       class="box-border w-full rounded-md border border-line3 bg-ink px-[13px] py-[11px] font-sans text-[13.5px] text-fg outline-none focus:border-[#4A4638]" />
+            </div>
+            <div class="mt-4">
+                <div class="mb-[7px] text-xs font-semibold text-muted">Password</div>
+                <input @bind="_password" @bind:event="oninput" type="password"
+                       autocomplete="@(_signup ? "new-password" : "current-password")"
+                       placeholder="@(_signup ? "At least 6 characters" : "Your password")"
+                       class="box-border w-full rounded-md border border-line3 bg-ink px-[13px] py-[11px] font-sans text-[13.5px] text-fg outline-none focus:border-[#4A4638]" />
+            </div>
+
+            @if (_error is not null)
+            {
+                <div class="anim-drop-in mt-4 rounded-md border border-playhead/30 bg-playhead/10 px-3 py-2 text-[12.5px] leading-[1.5] text-soft">
+                    @_error
+                </div>
+            }
+
+            <button type="submit" disabled="@_busy"
+                    class="mt-5 w-full cursor-pointer rounded-md bg-accent px-5 py-[10px] text-center text-[13px] font-bold text-ink hover:bg-accent-soft active:scale-[0.97] disabled:cursor-default disabled:opacity-60 disabled:hover:bg-accent">
+                @ButtonLabel
+            </button>
+        </form>
+
+        <div class="mt-4 text-center text-[11px] leading-[1.5] text-faint">
+            Sessions are stored encrypted on this device.
+        </div>
+    </div>
+</div>
+
+@code {
+    private bool _signup;
+    private bool _busy;
+    private string _email = "";
+    private string _password = "";
+    private string? _error;
+
+    private string ButtonLabel => (_signup, _busy) switch
+    {
+        (true, true) => "Creating account…",
+        (true, false) => "Create account",
+        (false, true) => "Signing in…",
+        (false, false) => "Sign in",
+    };
+
+    protected override async Task OnInitializedAsync()
+    {
+        await Auth.InitializeAsync();
+        if (Auth.IsAuthenticated)
+        {
+            Nav.NavigateTo("/");
+        }
+    }
+
+    private void SwitchMode(bool signup)
+    {
+        if (_signup == signup) return;
+        _signup = signup;
+        _error = null;
+    }
+
+    private async Task SubmitAsync()
+    {
+        if (_busy) return;
+        var email = _email.Trim();
+        if (email.Length == 0 || !email.Contains('@'))
+        {
+            _error = "Enter a valid email address.";
+            return;
+        }
+        if (_password.Length < 6)
+        {
+            _error = "Passwords need at least 6 characters.";
+            return;
+        }
+
+        _busy = true;
+        _error = null;
+        try
+        {
+            var session = _signup
+                ? await AuthApi.SignupAsync(email, _password)
+                : await AuthApi.LoginAsync(email, _password);
+            await Auth.SignInAsync(session);
+            Nav.NavigateTo("/");
+        }
+        catch (ApiException exception)
+        {
+            _error = exception.UserMessage;
+        }
+        catch (HttpRequestException)
+        {
+            _error = "Can't reach the Highlighter API — is it running on :5199?";
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+}

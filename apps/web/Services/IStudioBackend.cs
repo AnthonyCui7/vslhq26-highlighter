@@ -26,8 +26,8 @@ public interface IStudioBackend
     /// <summary>PUT /api/projects/{id}/longform/{version}/thumbnail {index}</summary>
     Task<string> SelectThumbnailAsync(int index);
 
-    /// <summary>POST /api/projects/{id}/thumbnails/import (multipart)</summary>
-    Task<string> ImportThumbnailAsync(string fileName);
+    /// <summary>POST /api/projects/{id}/thumbnails/import (base64 payload)</summary>
+    Task<string> ImportThumbnailAsync(string fileName, byte[] content);
 
     /// <summary>POST /api/projects/{id}/revise {request} → job (long form only)</summary>
     Task<string> ReviseLongformAsync(string request);
