@@ -4,6 +4,7 @@ using Highlighter.Api.Infrastructure;
 using Highlighter.Api.Services;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
 using Microsoft.AspNetCore.Diagnostics;
+using Microsoft.Extensions.FileProviders;
 using Microsoft.IdentityModel.Tokens;
 using Scalar.AspNetCore;
 using Serilog;
@@ -138,6 +139,15 @@ app.UseExceptionHandler(errorApp => errorApp.Run(async context =>
 }));
 app.UseStatusCodePages();
 app.UseCors();
+// Full-quality local renders: Supabase storage caps objects (~50 MB), so the
+// pipeline points oversized videos at this read-only mirror of outputs/.
+// Range requests are supported, which is what lets the <video> tag seek.
+app.UseStaticFiles(new StaticFileOptions
+{
+    FileProvider = new PhysicalFileProvider(layout.OutputsRoot),
+    RequestPath = "/media",
+    ServeUnknownFileTypes = true,
+});
 app.UseRateLimiter();
 app.UseAuthentication();
 app.UseAuthorization();
