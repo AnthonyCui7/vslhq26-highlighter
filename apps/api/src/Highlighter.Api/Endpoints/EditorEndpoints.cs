@@ -33,16 +33,17 @@ public static class EditorEndpoints
             async (Guid id, Guid clipId, SaveEditorRequest body, ClaimsPrincipal user,
                 SupabaseDb db, CancellationToken ct) =>
             {
-                if (body.Doc is null)
+                if (body?.Doc is null)
                     return Problem(400, "Invalid request", "doc is required");
                 if (!await CanSeeAsync(db, id, AuthHelpers.Uid(user), ct)) return NotFound(id);
                 var row = await db.GetClipAsync(clipId, id, ct);
                 if (row is null)
                     return Problem(404, "Clip not found", $"No clip {clipId} in project {id}");
-                if (EditorDocs.Validate(body.Doc, ClipDuration(row)) is { } invalid)
+                var doc = EditorDocs.Normalize(body.Doc);
+                if (EditorDocs.Validate(doc, ClipDuration(row)) is { } invalid)
                     return Problem(400, "Invalid document", invalid);
 
-                var saved = await new EditorStore(db).SaveClipDocAsync(id, clipId, body.Doc, ct);
+                var saved = await new EditorStore(db).SaveClipDocAsync(id, clipId, doc, ct);
                 if (saved is null)
                     return Problem(404, "Clip not found", $"No clip {clipId} in project {id}");
                 return Results.Ok(await ClipDocResponseAsync(db, id, saved, ct));
@@ -58,7 +59,7 @@ public static class EditorEndpoints
                 if (row is null)
                     return Problem(404, "Clip not found", $"No clip {clipId} in project {id}");
 
-                EditorDoc? doc = body?.Doc;
+                var doc = body?.Doc is null ? null : EditorDocs.Normalize(body.Doc);
                 if (doc is not null)
                 {
                     if (EditorDocs.Validate(doc, ClipDuration(row)) is { } invalid)
@@ -74,7 +75,7 @@ public static class EditorEndpoints
                 if (clip.VerticalUrl is null && clip.VideoUrl is null && clip.CaptionedUrl is null)
                     return Problem(409, "Clip not exportable", "The clip has no rendered media yet");
 
-                var job = exports.StartClipExport(id, clip, doc);
+                var job = exports.StartClipExport(id, clip, doc, AuthHelpers.Uid(user));
                 return Results.Accepted($"/api/jobs/{job.Id}", job.ToDto());
             })
             .WithName("ExportClipEdit");
@@ -97,17 +98,18 @@ public static class EditorEndpoints
             async (Guid id, int? version, SaveEditorRequest body, ClaimsPrincipal user,
                 SupabaseDb db, CancellationToken ct) =>
             {
-                if (body.Doc is null)
+                if (body?.Doc is null)
                     return Problem(400, "Invalid request", "doc is required");
                 if (!await CanSeeAsync(db, id, AuthHelpers.Uid(user), ct)) return NotFound(id);
                 var row = await db.GetLongformEditAsync(id, version, ct);
                 if (row is null)
                     return Problem(404, "No long-form edit",
                         "This project has no long-form cut to edit");
-                if (EditorDocs.Validate(body.Doc, LongformDuration(row)) is { } invalid)
+                var doc = EditorDocs.Normalize(body.Doc);
+                if (EditorDocs.Validate(doc, LongformDuration(row)) is { } invalid)
                     return Problem(400, "Invalid document", invalid);
 
-                var saved = await new EditorStore(db).SaveLongformDraftAsync(row, body.Doc, ct);
+                var saved = await new EditorStore(db).SaveLongformDraftAsync(row, doc, ct);
                 return Results.Ok(LongformDocResponse(saved ?? row));
             })
             .WithName("SaveLongformEditorDoc");
@@ -124,7 +126,7 @@ public static class EditorEndpoints
                 if (row["video_url"]?.GetValue<string>() is null)
                     return Problem(409, "Not exportable", "This version has no rendered video");
 
-                EditorDoc? doc = body?.Doc;
+                var doc = body?.Doc is null ? null : EditorDocs.Normalize(body.Doc);
                 if (doc is not null)
                 {
                     if (EditorDocs.Validate(doc, LongformDuration(row)) is { } invalid)
@@ -136,7 +138,7 @@ public static class EditorEndpoints
                     return Problem(409, "Nothing to export",
                         "No saved editor document — save (or pass) one first");
 
-                var job = exports.StartLongformExport(id, row, doc);
+                var job = exports.StartLongformExport(id, row, doc, AuthHelpers.Uid(user));
                 return Results.Accepted($"/api/jobs/{job.Id}", job.ToDto());
             })
             .WithName("ExportLongformEdit");
@@ -146,13 +148,32 @@ public static class EditorEndpoints
 
     private static double ClipDuration(JsonObject clipRow)
     {
-        var start = clipRow["start_seconds"]?.GetValue<double>() ?? 0;
-        var end = clipRow["end_seconds"]?.GetValue<double>() ?? 0;
+        var start = Dbl(clipRow["start_seconds"]) ?? 0;
+        var end = Dbl(clipRow["end_seconds"]) ?? 0;
         return Math.Max(0, end - start);
     }
 
     private static double LongformDuration(JsonObject editRow) =>
-        editRow["duration_seconds"]?.GetValue<double>() ?? 0;
+        Dbl(editRow["duration_seconds"]) ?? 0;
+
+    /// <summary>PostgREST can serialize numerics as numbers or strings depending
+    /// on column type — read either without throwing.</summary>
+    private static double? Dbl(System.Text.Json.Nodes.JsonNode? node)
+    {
+        if (node is null) return null;
+        try
+        {
+            return node.GetValue<double>();
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or FormatException)
+        {
+            return double.TryParse(node.ToString(),
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var value)
+                ? value
+                : null;
+        }
+    }
 
     private static async Task<EditorDocResponse> ClipDocResponseAsync(
         SupabaseDb db, Guid projectId, JsonObject row, CancellationToken ct)

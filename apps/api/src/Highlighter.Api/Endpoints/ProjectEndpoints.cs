@@ -18,7 +18,8 @@ public static class ProjectEndpoints
 
         group.MapPost("/",
             async (CreateProjectRequest request, ClaimsPrincipal user, SupabaseDb db,
-                PipelineJobService jobs, ILogger<PipelineJobService> log, CancellationToken ct) =>
+                PipelineJobService jobs, SourceTitleService titles,
+                ILogger<PipelineJobService> log, CancellationToken ct) =>
             {
                 if (Validate(request) is { } invalid) return invalid;
                 SourceDetector.TryDetect(request.SourceUrl!, out var source);
@@ -42,7 +43,8 @@ public static class ProjectEndpoints
 
                 try
                 {
-                    jobs.Start("ingest", projectId, WorkerArgs.Ingest(projectId, request), jobId);
+                    jobs.Start("ingest", projectId, WorkerArgs.Ingest(projectId, request), jobId,
+                        AuthHelpers.Uid(user));
                 }
                 catch (WorkerUnavailableException exception)
                 {
@@ -65,6 +67,12 @@ public static class ProjectEndpoints
                         $"{exception.Message} — project {projectId} was marked failed");
                 }
 
+                // No explicit name: swap in the source's real title once yt-dlp
+                // reports it (background, guarded on the placeholder).
+                if (string.IsNullOrWhiteSpace(request.Name)
+                    && inserted["name"]?.GetValue<string>() is { Length: > 0 } placeholder)
+                    titles.QueueRename(projectId, request.SourceUrl!, placeholder);
+
                 return Results.Created($"/api/projects/{projectId}",
                     ProjectShaper.Summary(inserted, jobId));
             })
@@ -73,7 +81,7 @@ public static class ProjectEndpoints
         group.MapDelete("/{id:guid}",
             async (Guid id, bool? force, ClaimsPrincipal user, SupabaseDb db, PipelineJobService jobs,
                 RepoLayout layout, MediaCleanupScheduler cleanup, SupabaseStorage storage,
-                CancellationToken ct) =>
+                ILogger<PipelineJobService> log, CancellationToken ct) =>
             {
                 var uid = AuthHelpers.Uid(user);
                 if (!await CanSeeAsync(db, id, uid, ct)) return NotFound(id);
@@ -91,8 +99,18 @@ public static class ProjectEndpoints
 
                 // Storage objects the DB outbox triggers don't know about: editor
                 // exports and thumbnail variants live under deterministic prefixes.
-                await storage.DeletePrefixAsync($"{id}/editor", ct);
-                await storage.DeletePrefixAsync($"{id}/thumbnails", ct);
+                // Best-effort: the row is already gone, so a sweep failure must
+                // not turn a successful delete into an error response.
+                try
+                {
+                    await storage.DeletePrefixAsync($"{id}/editor", ct);
+                    await storage.DeletePrefixAsync($"{id}/thumbnails", ct);
+                }
+                catch (Exception exception)
+                {
+                    log.LogWarning("Post-delete storage sweep failed for {ProjectId}: {Message}",
+                        id, exception.Message);
+                }
 
                 // The DB cascade + outbox triggers handle remote media; the local
                 // mirror is ours to remove (path is pinned under the projects root).
@@ -113,6 +131,22 @@ public static class ProjectEndpoints
                 return Results.NoContent();
             })
             .WithName("DeleteProject");
+
+        group.MapDelete("/{id:guid}/clips/{clipId:guid}",
+            async (Guid id, Guid clipId, ClaimsPrincipal user, SupabaseDb db,
+                PipelineJobService jobs, MediaCleanupScheduler cleanup, CancellationToken ct) =>
+            {
+                if (!await CanSeeAsync(db, id, AuthHelpers.Uid(user), ct)) return NotFound(id);
+                if (jobs.ActiveForProject(id) is { } active)
+                    return Problem(409, "Project has an active job",
+                        $"Job {active.Id} ({active.Kind}) is running; try again when it finishes");
+                if (!await db.DeleteClipAsync(clipId, id, ct))
+                    return Problem(404, "Clip not found", $"No clip {clipId} in project {id}");
+                // The clip's BEFORE DELETE trigger just enqueued its media.
+                cleanup.RequestDrain();
+                return Results.NoContent();
+            })
+            .WithName("DeleteClip");
 
         group.MapGet("/",
             async (ClaimsPrincipal user, SupabaseDb db, PipelineJobService jobs, int? limit,

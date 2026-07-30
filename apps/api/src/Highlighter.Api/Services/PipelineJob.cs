@@ -19,11 +19,12 @@ public sealed class PipelineJob
 
     internal PipelineJob(
         string id, string kind, Guid? projectId, IReadOnlyList<string> argv,
-        string logPath, int bufferCapacity = 4000)
+        string logPath, Guid? ownerId = null, int bufferCapacity = 4000)
     {
         Id = id;
         Kind = kind;
         ProjectId = projectId;
+        OwnerId = ownerId;
         Argv = argv;
         LogPath = logPath;
         StartedAt = DateTimeOffset.UtcNow;
@@ -33,6 +34,11 @@ public sealed class PipelineJob
     public string Id { get; }
     public string Kind { get; }
     public Guid? ProjectId { get; }
+
+    /// <summary>User the job was started for; null for system jobs (cleanup).
+    /// Job reads are scoped on it exactly like project reads are on user_id.</summary>
+    public Guid? OwnerId { get; }
+
     public IReadOnlyList<string> Argv { get; }
     public string LogPath { get; }
     public DateTimeOffset StartedAt { get; }
@@ -40,9 +46,22 @@ public sealed class PipelineJob
     public int? ExitCode { get; private set; }
     public string? FailureReason { get; private set; }
     public DateTimeOffset? EndedAt { get; private set; }
-    public bool KillRequested { get; internal set; }
+    public bool KillRequested { get; private set; }
 
     internal Process? Process { get; set; }
+
+    /// <summary>In-process jobs have no OS process to signal; force-cancel
+    /// cancels this instead.</summary>
+    internal CancellationTokenSource? ExternalCts { get; set; }
+
+    internal void RequestKill()
+    {
+        lock (_gate) KillRequested = true;
+    }
+
+    /// <summary>True when this job is visible to the given user scope (null
+    /// scope = auth off = everything visible, matching project reads).</summary>
+    public bool VisibleTo(Guid? userId) => userId is null || OwnerId == userId;
 
     public bool IsTerminal => State is JobState.Succeeded or JobState.Failed or JobState.Killed;
 

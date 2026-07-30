@@ -8,19 +8,38 @@
             {
                 <div class="shrink-0 text-[12.5px] text-muted">@Fmt.Kind(p.SourceType) · @Fmt.Duration(p.DurationSeconds) · @Fmt.Added(p.CreatedAt)</div>
             }
+            <div class="ml-auto shrink-0">
+                @if (!_confirmProjectDelete)
+                {
+                    <div @onclick="() => _confirmProjectDelete = true"
+                         class="cursor-pointer rounded-[5px] border border-line2 px-3 py-[5px] text-xs text-muted hover:border-playhead/50 hover:text-playhead">Delete project</div>
+                }
+                else
+                {
+                    <div class="flex items-center gap-2 text-xs">
+                        <span class="text-soft">Delete this project and all its media?</span>
+                        <span @onclick="DeleteProject" class="cursor-pointer rounded-[5px] bg-playhead/80 px-3 py-[5px] font-bold text-ink hover:bg-playhead @(S.DeleteBusy ? "pointer-events-none opacity-60" : "")">@(S.DeleteBusy ? "Deleting…" : "Delete")</span>
+                        <span @onclick="() => _confirmProjectDelete = false" class="cursor-pointer px-1.5 text-muted hover:text-fg">Keep</span>
+                    </div>
+                }
+            </div>
         </div>
 
+        @if (S.DeleteError is not null)
+        {
+            <div class="anim-fade-up mt-4 rounded-md border border-playhead/30 bg-playhead/10 px-4 py-3 text-[13px] text-soft">@S.DeleteError</div>
+        }
         @if (S.DetailError is not null)
         {
             <div class="anim-fade-up mt-4 flex items-center gap-3 rounded-md border border-playhead/30 bg-playhead/10 px-4 py-3 text-[13px] text-soft">
                 <span class="min-w-0 flex-1">@S.DetailError</span>
-                <span @onclick="() => _ = S.RefreshDetailAsync()" class="cursor-pointer font-semibold text-accent hover:text-accent-soft">Retry</span>
+                <span @onclick="S.RetryDetail" class="cursor-pointer font-semibold text-accent hover:text-accent-soft">Retry</span>
             </div>
         }
         @if (S.Project is { Status: "failed", Error: { } error })
         {
             <div class="anim-fade-up mt-4 rounded-md border border-playhead/30 bg-playhead/10 px-4 py-3 text-[13px] leading-[1.55] text-soft">
-                This run failed: @error
+                This run failed: @Fmt.FriendlyPipelineError(error)
             </div>
         }
 
@@ -73,12 +92,14 @@
                             {
                                 <div class="shrink-0 text-[11.5px] text-muted">v@(lf.Version) · @Fmt.Duration(lf.DurationSeconds)</div>
                                 <div @onclick="S.OpenEditorLong" class="ml-auto shrink-0 cursor-pointer rounded-[5px] border border-line2 px-3 py-[5px] text-xs text-soft hover:border-[#4A4638] hover:text-fg active:scale-[0.98]">Open in editor</div>
+                                <div @onclick="() => S.OpenPublish(null)" class="shrink-0 cursor-pointer rounded-[5px] bg-accent px-3 py-[5px] text-xs font-bold text-ink hover:bg-accent-soft active:scale-[0.98]">Publish</div>
                             }
                         </div>
                     </div>
                     <div class="flex min-w-0 flex-1 flex-col">
                         <div class="mb-1.5 font-mono text-[11px] font-semibold tracking-[0.08em] text-muted">IN THIS CUT</div>
-                        <div class="flex flex-1 flex-col overflow-y-auto">
+                        @* Capped + scrollable: a long segment list must not stretch the card. *@
+                        <div class="flex max-h-[300px] flex-col overflow-y-auto pr-1">
                             @if (Segments.Count == 0)
                             {
                                 <div class="px-2.5 py-2 text-[12px] text-faint">Segments appear when the cut is stitched.</div>
@@ -129,7 +150,7 @@
                 <div class="grid grid-cols-4 gap-[14px]">
                     @foreach (var (clip, pos) in S.SortedClips.Select((c, pos) => (c, pos)))
                     {
-                        <div @onclick="() => S.OpenClip(clip)" class="anim-fade-up cursor-pointer overflow-hidden rounded-lg border border-well bg-card hover:-translate-y-[2px] hover:border-[#4A4638]" style="animation-delay:@(120 + 30 * Math.Min(pos, 8))ms">
+                        <div @onclick="() => S.OpenClip(clip)" class="anim-fade-up group cursor-pointer overflow-hidden rounded-lg border border-well bg-card hover:-translate-y-[2px] hover:border-[#4A4638]" style="animation-delay:@(120 + 30 * Math.Min(pos, 8))ms">
                             <div class="relative flex aspect-[9/12] items-center justify-center overflow-hidden bg-[repeating-linear-gradient(-45deg,#1C1B19_0_10px,#201E1C_10px_20px)]">
                                 @if (clip.ThumbnailUrl is { } thumb)
                                 {
@@ -140,6 +161,22 @@
                                     <span class="font-mono text-[10px] text-dim">@(clip.Status == "rendered" ? "highlight frame" : "rendering…")</span>
                                 }
                                 <span class="absolute bottom-2 right-2 rounded-[3px] bg-[rgba(20,19,18,0.85)] px-1.5 py-0.5 font-mono text-[10.5px] text-fg">@Fmt.Duration(clip.DurationSeconds)</span>
+                                @if (_confirmClipDelete == clip.Id)
+                                {
+                                    <div @onclick:stopPropagation class="absolute inset-x-0 top-0 flex items-center justify-between gap-1 bg-[rgba(20,19,18,0.92)] px-2 py-1.5 text-[10.5px]">
+                                        <span class="text-soft">Delete this highlight?</span>
+                                        <span class="flex items-center gap-1.5">
+                                            <span @onclick="() => DeleteClip(clip)" class="cursor-pointer rounded bg-playhead/80 px-2 py-0.5 font-bold text-ink hover:bg-playhead @(S.DeleteBusy ? "pointer-events-none opacity-60" : "")">Yes</span>
+                                            <span @onclick="() => _confirmClipDelete = null" class="cursor-pointer px-1 text-muted hover:text-fg">No</span>
+                                        </span>
+                                    </div>
+                                }
+                                else
+                                {
+                                    <span @onclick="() => _confirmClipDelete = clip.Id" @onclick:stopPropagation
+                                          title="Delete this highlight"
+                                          class="absolute right-1.5 top-1.5 hidden h-[22px] w-[22px] cursor-pointer items-center justify-center rounded-full bg-[rgba(20,19,18,0.85)] text-[11px] text-muted hover:text-playhead group-hover:flex">✕</span>
+                                }
                             </div>
                             <div class="flex items-start gap-[9px] px-3 pb-3 pt-[11px]">
                                 <span title="Content score" class="mt-px flex h-[26px] w-[26px] shrink-0 items-center justify-center rounded-full bg-accent font-mono text-[9.5px] font-medium leading-none text-ink" style="opacity:@Fmt.ScoreOpacity(clip.Score)">@Fmt.Score100(clip.Score)</span>
@@ -158,7 +195,22 @@
 </div>
 
 @code {
+    bool _confirmProjectDelete;
+    Guid? _confirmClipDelete;
+
     bool ShowLongform => S.Project?.Pipeline is "long" or "both" || (S.Detail?.LongformEdits.Count ?? 0) > 0;
     bool ShowShorts => S.Project?.Pipeline is "short" or "both" || (S.Detail?.Clips.Count ?? 0) > 0;
     List<LongformSegmentDto> Segments => (S.LatestLongform?.Segments ?? []).ToList();
+
+    async Task DeleteProject()
+    {
+        await S.DeleteProjectAsync();
+        _confirmProjectDelete = false;
+    }
+
+    async Task DeleteClip(ClipDto clip)
+    {
+        await S.DeleteClipAsync(clip);
+        _confirmClipDelete = null;
+    }
 }

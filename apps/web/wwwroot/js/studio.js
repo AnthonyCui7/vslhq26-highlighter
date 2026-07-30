@@ -13,7 +13,7 @@ export function setPlaying(video, playing) {
 }
 
 export function seek(video, seconds) {
-  if (!video || Number.isNaN(seconds)) return;
+  if (!video || !Number.isFinite(seconds)) return;
   video.currentTime = Math.max(0, seconds);
 }
 
@@ -48,11 +48,23 @@ export function watch(video, dotnet, segments) {
     if (state.segments.length > 0) {
       const seg = state.segments.find(s => t >= s.start - 0.05 && t < s.end);
       if (!seg) {
+        const wasPaused = video.paused;
         const next = state.segments.find(s => s.start >= t);
-        if (next) {
+        if (next && !wasPaused) {
+          // Playing across a cut: jump to the next kept region.
           video.currentTime = next.start;
           if (next.speed) video.playbackRate = next.speed;
+        } else if (next) {
+          // Paused scrub/step into a cut: settle at the next region's start
+          // without changing play state.
+          video.currentTime = next.start;
+        } else if (wasPaused) {
+          // Paused past the end (scrub, frame-step): clamp to the end of the
+          // cut instead of yanking the playhead back to the top.
+          const lastEnd = state.segments[state.segments.length - 1]?.end ?? 0;
+          video.currentTime = Math.max(0, lastEnd - 0.05);
         } else {
+          // Natural end of playback: stop and rewind, ready to replay.
           video.pause();
           video.currentTime = state.segments[0]?.start ?? 0;
         }

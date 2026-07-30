@@ -54,6 +54,12 @@ public sealed class MediaCleanupScheduler(
             {
                 log.LogWarning("Media cleanup check failed: {Message}", exception.Message);
             }
+            catch (Exception exception)
+            {
+                // Never let an unexpected error escape ExecuteAsync — the default
+                // BackgroundService behavior would take the whole API down with it.
+                log.LogError(exception, "Media cleanup tick failed unexpectedly");
+            }
         }
     }
 }

@@ -41,7 +41,7 @@ public static class Stitch
         string concatList, string outputPath, bool reencode)
     {
         var codecArgs = reencode
-            ? new[] { "-c:v", "libx264", "-preset", "veryfast", "-crf", "30", "-c:a", "aac", "-b:a", "128k" }
+            ? new[] { "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-c:a", "aac", "-b:a", "128k" }
             : new[] { "-c", "copy" };
         var command = new List<string>
         {

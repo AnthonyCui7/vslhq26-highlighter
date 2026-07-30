@@ -136,32 +136,52 @@
     private IEnumerable<EdlText> ActiveTexts => E.Doc?.Texts
         .Where(t => E.Playhead >= t.Start && E.Playhead <= t.End) ?? [];
 
+    private bool _disposed;
+    private double _lastVolume = -1;
+
     protected override async Task OnAfterRenderAsync(bool firstRender)
     {
-        if (MediaUrl is null) return;
-        _module ??= await JS.InvokeAsync<IJSObjectReference>("import", "./js/studio.js");
-        _self ??= DotNetObjectReference.Create(this);
-
-        var segmentsJson = SegmentsJson();
-        if (_watchedUrl != MediaUrl || _watchedSegments != segmentsJson)
+        if (MediaUrl is null || _disposed) return;
+        try
         {
-            _watchedUrl = MediaUrl;
-            _watchedSegments = segmentsJson;
-            await _module.InvokeVoidAsync("watch", _video, _self, SegmentsPayload());
-            _duration = await _module.InvokeAsync<double>("getDuration", _video);
+            _module ??= await JS.InvokeAsync<IJSObjectReference>("import", "./js/studio.js");
+            _self ??= DotNetObjectReference.Create(this);
+            if (_disposed) return; // closed while the module import was in flight
+
+            var segmentsJson = SegmentsJson();
+            if (_watchedUrl != MediaUrl || _watchedSegments != segmentsJson)
+            {
+                _watchedUrl = MediaUrl;
+                _watchedSegments = segmentsJson;
+                await _module.InvokeVoidAsync("watch", _video, _self, SegmentsPayload());
+                _duration = await _module.InvokeAsync<double>("getDuration", _video);
+            }
+            if (_duration <= 0)
+                _duration = await _module.InvokeAsync<double>("getDuration", _video);
+
+            if (E.ConsumeSeek() is { } seek)
+                await _module.InvokeVoidAsync("seek", _video, seek);
+
+            var volume = E.Doc?.Audio.Voice ?? 1.0;
+            if (Math.Abs(volume - _lastVolume) > 0.001)
+            {
+                _lastVolume = volume;
+                await _module.InvokeVoidAsync("setVolume", _video, volume);
+            }
+
+            if (S.Playing != _wasPlaying)
+            {
+                _wasPlaying = S.Playing;
+                await _module.InvokeVoidAsync("setPlaying", _video, S.Playing);
+            }
         }
-        if (_duration <= 0)
-            _duration = await _module.InvokeAsync<double>("getDuration", _video);
-
-        if (E.ConsumeSeek() is { } seek)
-            await _module.InvokeVoidAsync("seek", _video, seek);
-
-        await _module.InvokeVoidAsync("setVolume", _video, E.Doc?.Audio.Voice ?? 1.0);
-
-        if (S.Playing != _wasPlaying)
+        catch (Exception exception) when (exception
+            is JSDisconnectedException or JSException
+            or ObjectDisposedException or InvalidOperationException
+            or TaskCanceledException)
         {
-            _wasPlaying = S.Playing;
-            await _module.InvokeVoidAsync("setPlaying", _video, S.Playing);
+            // Closing the editor mid-load races these interop calls; none of
+            // them may tear the circuit down.
         }
     }
 
@@ -183,11 +203,26 @@
 
     private async Task SeekBy(double delta)
     {
-        if (_module is null || MediaUrl is null) return;
-        var now = await _module.InvokeAsync<double>("getCurrentTime", _video);
-        await _module.InvokeVoidAsync("seek", _video, now + delta);
-        _playhead = Math.Max(0, now + delta);
-        E.SetPlayhead(_playhead);
+        if (MediaUrl is null) return;
+        if (E.Doc is not null)
+        {
+            // Step in OUTPUT time: stepping raw source time across a cut lands in
+            // a removed region and the playback loop bounces the playhead away.
+            E.StepOutput(delta);
+            return;
+        }
+        if (_module is null) return;
+        try
+        {
+            var now = await _module.InvokeAsync<double>("getCurrentTime", _video);
+            await _module.InvokeVoidAsync("seek", _video, now + delta);
+            _playhead = Math.Max(0, now + delta);
+            E.SetPlayhead(_playhead);
+        }
+        catch (Exception exception) when (exception
+            is JSDisconnectedException or JSException or ObjectDisposedException)
+        {
+        }
     }
 
     private void JumpSegment(int direction)
@@ -198,11 +233,14 @@
         var currentOut = E.PlayheadOutput;
         var index = layout.FindLastIndex(entry => entry.OutStart <= currentOut + 0.05);
         var target = Math.Clamp(index + direction, 0, layout.Count - 1);
-        E.RequestSeek(layout[target].Segment.SrcStart);
+        // A hair inside the segment, so the playback loop can't mistake the
+        // boundary for a cut region.
+        E.RequestSeek(layout[target].Segment.SrcStart + 0.01);
     }
 
     public async ValueTask DisposeAsync()
     {
+        _disposed = true;
         Dispose(); // StudioComponent's Changed unsubscribe
         try
         {
@@ -212,7 +250,8 @@
                 await _module.DisposeAsync();
             }
         }
-        catch (JSDisconnectedException)
+        catch (Exception exception) when (exception
+            is JSDisconnectedException or JSException or ObjectDisposedException)
         {
         }
         _self?.Dispose();

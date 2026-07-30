@@ -55,7 +55,8 @@
                              @onclick="OnRulerClick">
                             @foreach (var mark in RulerMarks())
                             {
-                                <div class="absolute bottom-0 top-0 border-l border-well pl-[5px] pt-1 font-mono text-[9px] text-faint" style="left:@($"{mark.X}px")">@mark.Label</div>
+                                @* pointer-events-none: clicks must hit the ruler itself so OffsetX is ruler-relative *@
+                                <div class="pointer-events-none absolute bottom-0 top-0 border-l border-well pl-[5px] pt-1 font-mono text-[9px] text-faint" style="left:@($"{mark.X:0.##}px")">@mark.Label</div>
                             }
                         </div>
                     </div>
@@ -112,7 +113,7 @@
                                      @onpointerdown="e => OnSegmentPointerDown(e, segment)"
                                      class="absolute bottom-[3px] top-[3px] overflow-hidden rounded-[3px] border @SegmentCursor @(E.SelectedId == segment.Id ? "border-accent bg-[#25313F]" : "border-[#3E5871] bg-[#22303F]")"
                                      style="left:@Px(outStart); width:@Px(outEnd - outStart)">
-                                    <div class="absolute left-1.5 top-0.5 whitespace-nowrap text-[9.5px] font-semibold text-[#9FB6CE]">
+                                    <div class="pointer-events-none absolute left-1.5 top-0.5 whitespace-nowrap text-[9.5px] font-semibold text-[#9FB6CE]">
                                         @Fmt.Stamp(segment.SrcStart)–@Fmt.Stamp(segment.SrcEnd)
                                         @if (Math.Abs(segment.Speed - 1) > 0.01)
                                         {
@@ -141,7 +142,7 @@
                                 <div class="absolute bottom-[3px] top-[3px] overflow-hidden rounded-[3px] border border-[#3C5A3C] bg-[#1E2A1E]"
                                      style="left:@Px(outStart); width:@Px(outEnd - outStart)">
                                     <div class="absolute inset-x-[3px] inset-y-0.5 flex items-center gap-px opacity-80">
-                                        @foreach (var bar in SampleData.Wave(Math.Max(8, (int)((outEnd - outStart) * E.PxPerSec / 5)), 0.35, 0.5, "#5E8A5E"))
+                                        @foreach (var bar in SampleData.Wave(Math.Clamp((int)((outEnd - outStart) * E.PxPerSec / 5), 8, 240), 0.35, 0.5, "#5E8A5E"))
                                         {
                                             <div class="flex-1 rounded-[1px]" style="height:@bar.H; background:@bar.C"></div>
                                         }
@@ -209,7 +210,11 @@
     {
         double[] steps = [0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300];
         var step = steps.FirstOrDefault(s => s * E.PxPerSec >= 70, 300);
-        for (var t = 0.0; t <= E.OutputDuration; t += step)
+        var duration = E.OutputDuration;
+        if (!double.IsFinite(duration)) yield break;
+        // Long cut + max zoom would otherwise emit thousands of tick divs.
+        if (duration / step > 500) step = duration / 500;
+        for (var t = 0.0; t <= duration; t += step)
             yield return new Mark(t * E.PxPerSec, Fmt.Stamp(t));
     }
 

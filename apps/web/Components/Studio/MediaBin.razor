@@ -87,7 +87,8 @@
             }
             else if (S.ActiveLongform is { } cut)
             {
-                items.Add(new("edit", $"Long-form v{cut.Version}", Fmt.Duration(cut.DurationSeconds), cut.VideoUrl, cut.ThumbnailUrl));
+                if (cut.VideoUrl is not null)
+                    items.Add(new("edit", $"Long-form v{cut.Version}", Fmt.Duration(cut.DurationSeconds), cut.VideoUrl, cut.ThumbnailUrl));
                 foreach (var other in (S.Detail?.LongformEdits ?? []).Where(e => e.Id != cut.Id && e.VideoUrl is not null))
                     items.Add(new("render", $"Long-form v{other.Version}", Fmt.Duration(other.DurationSeconds), other.VideoUrl, other.ThumbnailUrl));
             }

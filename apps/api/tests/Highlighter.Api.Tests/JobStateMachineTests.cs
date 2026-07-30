@@ -49,7 +49,7 @@ public class JobStateMachineTests : IDisposable
     {
         var job = NewJob();
         job.MarkRunning();
-        job.KillRequested = true;
+        job.RequestKill();
         job.MarkExited(137, null);
 
         Assert.Equal(JobState.Killed, job.State);

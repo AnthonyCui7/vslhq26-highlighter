@@ -15,6 +15,7 @@ public static class Capture
     public static void AssertCapturePrerequisites(string downloader = "streamlink")
     {
         AssertBinary("ffmpeg", "brew install ffmpeg");
+        AssertBinary("ffprobe", "brew install ffmpeg");
         if (downloader == "yt-dlp") AssertBinary("yt-dlp", "pip install yt-dlp");
         else AssertBinary("streamlink", "brew install streamlink");
     }
@@ -208,6 +209,8 @@ public static class Capture
 
         var processed = new HashSet<string>();
         var archived = new HashSet<string>();
+        var processedFailures = 0;
+        var archivedFailures = 0;
 
         void Sweep(bool includeLatest)
         {
@@ -222,6 +225,7 @@ public static class Capture
                     archived,
                     includeLatest: includeLatest,
                     handler: (path, index) => onVideoSegment(path, index),
+                    consecutiveFailures: ref archivedFailures,
                     shouldStop: shouldStop);
             }
             ProcessReadyFiles(
@@ -231,6 +235,7 @@ public static class Capture
                 includeLatest: includeLatest,
                 handler: (path, index) => onChunk(
                     path, index, index * chunkSeconds, (index + 1) * chunkSeconds),
+                consecutiveFailures: ref processedFailures,
                 shouldStop: shouldStop);
         }
 
@@ -265,6 +270,10 @@ public static class Capture
             throw;
         }
 
+        // Whether the source ended on its own, before Terminate below reaps it
+        // (a still-running source is normal when maxChunks capped the capture).
+        var sourceEnded = false;
+        try { sourceEnded = source.HasExited; } catch (InvalidOperationException) { }
         Terminate(source);
 
         if (!stopped)
@@ -279,6 +288,24 @@ public static class Capture
                     $"ffmpeg exited with code {ffmpeg.ExitCode}"
                     + (details.Length > 0 ? "\n" + details : ""));
             }
+            if (sourceEnded)
+            {
+                try
+                {
+                    if (source.ExitCode != 0)
+                    {
+                        var tail = sourceStderr.Text();
+                        Console.WriteLine(
+                            $"Warning: {sourceCmd[0]} exited with code {source.ExitCode}; "
+                            + "the source ended early and the capture may be partial."
+                            + (tail.Length > 0 ? "\n" + tail : ""));
+                    }
+                }
+                catch (InvalidOperationException)
+                {
+                    // Exit code unavailable; nothing to report.
+                }
+            }
         }
 
         return processed.Count;
@@ -290,6 +317,7 @@ public static class Capture
         HashSet<string> processed,
         bool includeLatest,
         Action<string, int> handler,
+        ref int consecutiveFailures,
         Func<bool>? shouldStop = null)
     {
         var files = Directory.GetFiles(directory, pattern)
@@ -307,10 +335,39 @@ public static class Capture
                 return;
             }
 
-            var index = int.Parse(
-                Path.GetFileNameWithoutExtension(path).Split('_')[1],
-                System.Globalization.CultureInfo.InvariantCulture);
-            handler(path, index);
+            int index;
+            try
+            {
+                index = int.Parse(
+                    Path.GetFileNameWithoutExtension(path).Split('_')[1],
+                    System.Globalization.CultureInfo.InvariantCulture);
+            }
+            catch (Exception exc) when (exc is FormatException or OverflowException or IndexOutOfRangeException)
+            {
+                Console.WriteLine($"Skipping {name}: could not parse its index ({exc.Message})");
+                processed.Add(name);
+                continue;
+            }
+
+            try
+            {
+                handler(path, index);
+                consecutiveFailures = 0;
+            }
+            catch (Exception exc)
+            {
+                // One bad file must not end the capture, but a persistent outage
+                // must not silently produce an empty run either.
+                consecutiveFailures++;
+                if (consecutiveFailures >= 5)
+                {
+                    Console.WriteLine(
+                        $"Processing {name} failed ({exc.Message}); "
+                        + $"{consecutiveFailures} consecutive failures, giving up");
+                    throw;
+                }
+                Console.WriteLine($"Processing {name} failed (non-fatal): {exc.Message}");
+            }
             processed.Add(name);
         }
     }

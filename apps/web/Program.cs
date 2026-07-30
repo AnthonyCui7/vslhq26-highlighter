@@ -6,6 +6,13 @@ using Highlighter.Web.Services;
 // same file the pipeline uses.
 Highlighter.Pipeline.Config.LoadEnv();
 
+// Inline styles interpolate doubles ("width:12.5px"); a comma-decimal locale
+// would emit invalid CSS and collapse the timeline.
+System.Globalization.CultureInfo.DefaultThreadCurrentCulture =
+    System.Globalization.CultureInfo.InvariantCulture;
+System.Globalization.CultureInfo.DefaultThreadCurrentUICulture =
+    System.Globalization.CultureInfo.InvariantCulture;
+
 var builder = WebApplication.CreateBuilder(args);
 
 // Add services to the container.

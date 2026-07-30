@@ -50,10 +50,6 @@
                 @ButtonLabel
             </button>
         </form>
-
-        <div class="mt-4 text-center text-[11px] leading-[1.5] text-faint">
-            Sessions are stored encrypted on this device.
-        </div>
     </div>
 </div>
 
@@ -120,6 +116,10 @@
         catch (HttpRequestException)
         {
             _error = "Can't reach the Highlighter API — is it running on :5199?";
+        }
+        catch (Exception)
+        {
+            _error = "Signing in hit an unexpected problem — try again.";
         }
         finally
         {

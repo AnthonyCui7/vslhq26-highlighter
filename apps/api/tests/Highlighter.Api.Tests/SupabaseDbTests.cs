@@ -22,6 +22,9 @@ public class SupabaseDbTests
         Assert.Equal(
             "https://stub.supabase.local/rest/v1/projects"
             + "?select=*,clips(count),transcript_chunks(count),longform_edits(count)"
+            + ",thumbs:longform_edits(thumbnail_url,version),clip_thumbs:clips(metadata,score)"
+            + "&thumbs.order=version.desc&thumbs.limit=1"
+            + "&clip_thumbs.order=score.desc.nullslast&clip_thumbs.limit=8"
             + "&order=created_at.desc&limit=100",
             request.Url);
     }

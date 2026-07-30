@@ -5,10 +5,11 @@ namespace Highlighter.Web.Models;
 /// <summary>API values → the display strings the studio UI was designed around.</summary>
 public static class Fmt
 {
-    /// <summary>"2:01:44", "24:36", "0:42" — or "—" until the source is probed.</summary>
+    /// <summary>"2:01:44", "24:36", "0:42" — or "—" until the source is probed.
+    /// TimeSpan.FromSeconds throws on NaN/Infinity, so guard first.</summary>
     public static string Duration(double? seconds)
     {
-        if (seconds is not > 0) return "—";
+        if (seconds is not > 0 || !double.IsFinite(seconds.Value)) return "—";
         var t = TimeSpan.FromSeconds(seconds.Value);
         return t.TotalHours >= 1
             ? $"{(int)t.TotalHours}:{t.Minutes:00}:{t.Seconds:00}"
@@ -18,6 +19,7 @@ public static class Fmt
     /// <summary>Zero-padded position stamp for lists: "05:38", "1:02:11".</summary>
     public static string Stamp(double seconds)
     {
+        if (!double.IsFinite(seconds)) seconds = 0;
         var t = TimeSpan.FromSeconds(Math.Max(0, seconds));
         return t.TotalHours >= 1
             ? $"{(int)t.TotalHours}:{t.Minutes:00}:{t.Seconds:00}"
@@ -27,6 +29,7 @@ public static class Fmt
     /// <summary>Editor timecode "00:00:12:04" (30 fps frame counter).</summary>
     public static string Timecode(double seconds)
     {
+        if (!double.IsFinite(seconds)) seconds = 0;
         var clamped = Math.Max(0, seconds);
         var t = TimeSpan.FromSeconds(clamped);
         var frames = (int)Math.Round(t.Milliseconds / 1000.0 * 30) % 30;
@@ -66,4 +69,30 @@ public static class Fmt
         "added " + createdAt.LocalDateTime.ToString("MMM d", CultureInfo.InvariantCulture);
 
     public static string Count(int n, string noun) => $"{n} {noun}{(n == 1 ? "" : "s")}";
+
+    /// <summary>The pipeline's error column is raw tool output (ffmpeg/yt-dlp
+    /// stderr, absolute paths). Map it to a plain one-liner for the UI; the full
+    /// text stays in the worker logs.</summary>
+    public static string FriendlyPipelineError(string raw)
+    {
+        var lower = raw.ToLowerInvariant();
+        if (lower.Contains("sign in to confirm") || lower.Contains("bot"))
+            return "The source platform blocked the download — try again, or use another video.";
+        if (lower.Contains("yt-dlp") || lower.Contains("streamlink")
+            || lower.Contains("unable to download") || lower.Contains("403"))
+            return "The source video couldn't be downloaded.";
+        if (lower.Contains("worker exited") || lower.Contains("worker terminated")
+            || lower.Contains("spawn failed"))
+            return "The processing run stopped unexpectedly.";
+        if (lower.Contains("transcri") || lower.Contains("speech"))
+            return "Transcription failed while processing the audio.";
+        if (lower.Contains("ffmpeg")) return "Video processing failed.";
+        if (lower.Contains("supabase") || lower.Contains("postgrest") || lower.Contains("storage"))
+            return "Saving results to the database failed.";
+        // Unknown cause: show a trimmed first line, never a wall of tool output.
+        var firstLine = raw.Split('\n')[0].Trim();
+        return firstLine.Length is > 0 and <= 120
+            ? firstLine
+            : "Processing failed — the run's logs have the details.";
+    }
 }

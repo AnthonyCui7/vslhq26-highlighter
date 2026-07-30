@@ -127,12 +127,15 @@ public class StudioState : IDisposable
             ActiveClip = clip;
             ActiveLongform = null;
             AgentContext = "short";
+            // The agent panel is long-form only; a clip editor always opens on
+            // the inspector.
+            Panel = "inspector";
             Playing = false;
         });
         if (ProjectId is { } id)
         {
             Edit.Bind(id);
-            _ = GuardedAsync(() => Edit.LoadAsync(id, clip.Id));
+            _ = GuardedAsync(() => Edit.LoadAsync(id, clip.Id, clip.DurationSeconds));
         }
     }
 
@@ -144,12 +147,13 @@ public class StudioState : IDisposable
             ActiveClip = null;
             ActiveLongform = LatestLongform;
             AgentContext = "long";
+            Panel = "inspector"; // agent panel reseeds per project on demand
             Playing = false;
         });
         if (ProjectId is { } id)
         {
             Edit.Bind(id);
-            _ = GuardedAsync(() => Edit.LoadAsync(id, null));
+            _ = GuardedAsync(() => Edit.LoadAsync(id, null, ActiveLongform?.DurationSeconds));
         }
     }
 
@@ -198,7 +202,22 @@ public class StudioState : IDisposable
         {
             Set(() => ProjectsError = "Can't reach the Highlighter API — is it running on :5199?");
         }
+        catch (Exception)
+        {
+            // Anything else (bad JSON, timeout) must still land as a banner, not
+            // skeletons forever.
+            Set(() => ProjectsError = "Couldn't load projects — try again.");
+        }
         EnsurePolling();
+    }
+
+    /// <summary>Retry for the project page: reload with errors surfaced (the
+    /// quiet refresh swallows failures by design).</summary>
+    public void RetryDetail()
+    {
+        if (ProjectId is not { } id) return;
+        Set(() => DetailError = null);
+        _ = GuardedAsync(() => LoadDetailAsync(id));
     }
 
     private async Task LoadDetailAsync(Guid id)
@@ -283,22 +302,180 @@ public class StudioState : IDisposable
             {
                 Projects = [created, .. (Projects ?? [])];
                 ModalOpen = false;
-                CreateBusy = false;
             });
             EnsurePolling();
         }
         catch (ApiException exception)
         {
-            Set(() => { CreateError = exception.UserMessage; CreateBusy = false; });
+            Set(() => CreateError = exception.UserMessage);
         }
         catch (HttpRequestException)
         {
+            Set(() => CreateError = "Can't reach the Highlighter API — is it running on :5199?");
+        }
+        catch (Exception)
+        {
+            Set(() => CreateError = "Something went wrong starting the project — try again.");
+        }
+        finally
+        {
+            // The busy flag must never survive a failure, or the button wedges.
+            Set(() => CreateBusy = false);
+        }
+    }
+
+    // ---- delete flows ---------------------------------------------------- //
+
+    public bool DeleteBusy { get; private set; }
+    public string? DeleteError { get; private set; }
+
+    /// <summary>Delete the open project (force: a running job is killed). On
+    /// success the view returns to the grid.</summary>
+    public async Task DeleteProjectAsync()
+    {
+        if (ProjectId is not { } id || DeleteBusy) return;
+        Set(() => { DeleteBusy = true; DeleteError = null; });
+        try
+        {
+            await api.DeleteProjectAsync(id, _cts.Token);
+            _searchCache.TryRemove(id, out _);
             Set(() =>
             {
-                CreateError = "Can't reach the Highlighter API — is it running on :5199?";
-                CreateBusy = false;
+                Detail = null;
+                ProjectId = null;
+                Projects = Projects?.Where(p => p.Id != id).ToList();
             });
+            GoProjects();
         }
+        catch (ApiException exception)
+        {
+            Set(() => DeleteError = exception.UserMessage);
+        }
+        catch (Exception)
+        {
+            Set(() => DeleteError = "Couldn't delete the project — try again.");
+        }
+        finally
+        {
+            Set(() => DeleteBusy = false);
+        }
+    }
+
+    public async Task DeleteClipAsync(ClipDto clip)
+    {
+        if (ProjectId is not { } id || DeleteBusy) return;
+        Set(() => { DeleteBusy = true; DeleteError = null; });
+        try
+        {
+            await api.DeleteClipAsync(id, clip.Id, _cts.Token);
+            Set(() =>
+            {
+                if (Detail is { } detail)
+                    Detail = detail with { Clips = detail.Clips.Where(c => c.Id != clip.Id).ToList() };
+                if (ActiveClip?.Id == clip.Id) { EditorOpen = false; ActiveClip = null; }
+            });
+            await RefreshDetailAsync();
+        }
+        catch (ApiException exception)
+        {
+            Set(() => DeleteError = exception.UserMessage);
+        }
+        catch (Exception)
+        {
+            Set(() => DeleteError = "Couldn't delete the highlight — try again.");
+        }
+        finally
+        {
+            Set(() => DeleteBusy = false);
+        }
+    }
+
+    // ---- search (projects, highlights, cuts) ------------------------------ //
+
+    public sealed record SearchHit(
+        string Kind, Guid ProjectId, string ProjectName, string Title, Guid? ClipId);
+
+    public IReadOnlyList<SearchHit> SearchHits { get; private set; } = [];
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, ProjectDetailDto>
+        _searchCache = new();
+    private Timer? _searchTimer;
+
+    /// <summary>Debounced deep search: project names match instantly (the grid
+    /// filter), and after a pause the recent projects' clips and cuts are
+    /// searched too, feeding the dropdown under the search box.</summary>
+    public void QueueSearch()
+    {
+        Notify();
+        _searchTimer?.Dispose();
+        if (Search.Trim().Length < 2)
+        {
+            SearchHits = [];
+            return;
+        }
+        _searchTimer = new Timer(_ => _ = GuardedAsync(RunSearchAsync), null,
+            TimeSpan.FromMilliseconds(300), Timeout.InfiniteTimeSpan);
+    }
+
+    private async Task RunSearchAsync()
+    {
+        var query = Search.Trim();
+        if (query.Length < 2) return;
+        var projects = Projects ?? await api.ListProjectsAsync(_cts.Token);
+        var recent = projects.Take(12).ToList();
+        foreach (var chunk in recent.Where(p => !_searchCache.ContainsKey(p.Id)).Chunk(4))
+            await Task.WhenAll(chunk.Select(async p =>
+            {
+                try
+                {
+                    _searchCache[p.Id] = await api.GetProjectAsync(p.Id, _cts.Token);
+                }
+                catch (Exception)
+                {
+                    // A project that won't load just contributes no deep hits.
+                }
+            }));
+        if (Search.Trim() != query) return; // superseded by more typing
+
+        var hits = new List<SearchHit>();
+        foreach (var p in recent.Where(p =>
+                     p.Name.Contains(query, StringComparison.OrdinalIgnoreCase)))
+            hits.Add(new SearchHit("project", p.Id, p.Name, p.Name, null));
+        foreach (var p in recent)
+        {
+            if (!_searchCache.TryGetValue(p.Id, out var detail)) continue;
+            if (detail.LongformEdits.FirstOrDefault(e =>
+                    e.Status == "rendered"
+                    && (e.Title ?? "").Contains(query, StringComparison.OrdinalIgnoreCase)) is { } cut)
+                hits.Add(new SearchHit("cut", p.Id, p.Name, cut.Title ?? p.Name, null));
+            hits.AddRange(detail.Clips
+                .Where(c => c.Title.Contains(query, StringComparison.OrdinalIgnoreCase))
+                .Take(4)
+                .Select(c => new SearchHit("highlight", p.Id, p.Name, c.Title, c.Id)));
+        }
+        Set(() => SearchHits = hits.Take(12).ToList());
+    }
+
+    /// <summary>Open a search result: the project page, a highlight straight in
+    /// the editor, or the long-form cut in the editor.</summary>
+    public void OpenHit(SearchHit hit)
+    {
+        Set(() => { Search = ""; SearchHits = []; });
+        OpenProject(hit.ProjectId);
+        if (hit.Kind == "project") return;
+        _ = GuardedAsync(async () =>
+        {
+            for (var i = 0; i < 50 && (Detail is null || Detail.Project.Id != hit.ProjectId); i++)
+                await Task.Delay(100, _cts.Token);
+            if (Detail is null || Detail.Project.Id != hit.ProjectId) return;
+            if (hit.ClipId is { } clipId)
+            {
+                if (Detail.Clips.FirstOrDefault(c => c.Id == clipId) is { } clip) OpenClip(clip);
+            }
+            else
+            {
+                OpenEditorLong();
+            }
+        });
     }
 
     private void EnsurePolling()
@@ -351,6 +528,7 @@ public class StudioState : IDisposable
 
     public void Dispose()
     {
+        _searchTimer?.Dispose();
         _cts.Cancel();
         _cts.Dispose();
         GC.SuppressFinalize(this);
@@ -410,6 +588,16 @@ public class StudioState : IDisposable
     public void SetClipFormat(string format) => Set(() => _clipFormats[ActiveClipKey] = format);
     public void ToggleClipCaptions() =>
         Set(() => _clipCaptions[ActiveClipKey] = !_clipCaptions.GetValueOrDefault(ActiveClipKey, true));
+
+    // ---- Publish modal --------------------------------------------------- //
+
+    public bool PublishOpen { get; private set; }
+
+    /// <summary>The highlight being published, or null for the long-form cut.</summary>
+    public ClipDto? PublishClip { get; private set; }
+
+    public void OpenPublish(ClipDto? clip) => Set(() => { PublishOpen = true; PublishClip = clip; });
+    public void ClosePublish() => Set(() => { PublishOpen = false; PublishClip = null; });
 
     // ---- Agent chat ------------------------------------------------------ //
 

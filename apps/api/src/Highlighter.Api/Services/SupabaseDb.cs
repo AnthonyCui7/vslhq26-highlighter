@@ -63,6 +63,11 @@ public sealed class SupabaseDb
     public Task<JsonArray> ListProjectsAsync(int limit, Guid? userId = null, CancellationToken ct = default) =>
         GetArrayAsync("projects",
             "select=*,clips(count),transcript_chunks(count),longform_edits(count)"
+            // Aliased single-row embeds so every card gets a cover image: the
+            // newest long-form thumbnail, else a top-scored clip's frame.
+            + ",thumbs:longform_edits(thumbnail_url,version),clip_thumbs:clips(metadata,score)"
+            + "&thumbs.order=version.desc&thumbs.limit=1"
+            + "&clip_thumbs.order=score.desc.nullslast&clip_thumbs.limit=8"
             + $"&order=created_at.desc&limit={limit}{Scope(userId)}", ct);
 
     public async Task<JsonObject?> GetProjectDetailAsync(Guid id, Guid? userId = null, CancellationToken ct = default) =>
@@ -102,6 +107,17 @@ public sealed class SupabaseDb
         return FirstOrNull(AsArray(body, "PATCH projects"));
     }
 
+    /// <summary>Rename guarded on the current name, so the background title
+    /// lookup never clobbers a name the user chose or edited meanwhile.</summary>
+    public async Task<bool> RenameProjectIfAsync(
+        Guid id, string expectedCurrentName, string newName, CancellationToken ct = default)
+    {
+        var body = await SendAsync(HttpMethod.Patch, "projects",
+            $"id=eq.{id}&name=eq.{Uri.EscapeDataString(expectedCurrentName)}&select=id",
+            new JsonObject { ["name"] = newName }, "return=representation", ct);
+        return AsArray(body, "PATCH projects").Count > 0;
+    }
+
     /// <summary>True when a row was deleted. Cascades and the media-cleanup outbox
     /// triggers fire inside Postgres.</summary>
     public async Task<bool> DeleteProjectAsync(Guid id, Guid? userId = null, CancellationToken ct = default)
@@ -132,6 +148,15 @@ public sealed class SupabaseDb
     public async Task<JsonObject?> GetClipAsync(Guid clipId, Guid projectId, CancellationToken ct = default) =>
         FirstOrNull(await GetArrayAsync("clips",
             $"id=eq.{clipId}&project_id=eq.{projectId}&select=*", ct));
+
+    /// <summary>True when the clip row was deleted; the BEFORE DELETE trigger
+    /// enqueues its media in the cleanup outbox.</summary>
+    public async Task<bool> DeleteClipAsync(Guid clipId, Guid projectId, CancellationToken ct = default)
+    {
+        var body = await SendAsync(HttpMethod.Delete, "clips",
+            $"id=eq.{clipId}&project_id=eq.{projectId}&select=id", null, "return=representation", ct);
+        return AsArray(body, "DELETE clips").Count > 0;
+    }
 
     public Task<JsonArray> ListLongformEditsAsync(Guid projectId, CancellationToken ct = default) =>
         GetArrayAsync("longform_edits", $"project_id=eq.{projectId}&select=*&order=version.desc", ct);

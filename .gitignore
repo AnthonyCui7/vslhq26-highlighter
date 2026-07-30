@@ -3,13 +3,10 @@
 .env.*
 !.env.example
 
-# Generated runtime data and local test harness
-# Unanchored: the pipeline writes these relative to its working directory,
-# so they land under pipeline/ when the module is run from there.
+# Generated runtime data
+# Unanchored: the pipeline writes these relative to its working directory.
 outputs/
 data/
-/tests/
-pipeline/local-poc/
 
 # Python
 __pycache__/

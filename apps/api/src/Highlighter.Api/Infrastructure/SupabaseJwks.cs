@@ -10,11 +10,14 @@ namespace Highlighter.Api.Infrastructure;
 /// 10 minutes or when an unknown kid shows up (key rotation).</summary>
 public class SupabaseJwks(IHttpClientFactory factory, ILogger<SupabaseJwks> log, string? jwksUrl)
 {
+    public const string HttpClientName = "supabase-jwks";
+
     private static readonly TimeSpan CacheTtl = TimeSpan.FromMinutes(10);
 
     private readonly object _gate = new();
     private IReadOnlyList<SecurityKey> _keys = [];
     private DateTimeOffset _fetchedAt = DateTimeOffset.MinValue;
+    private DateTimeOffset _lastAttempt = DateTimeOffset.MinValue;
 
     public static SupabaseJwks FromEnv(IHttpClientFactory factory, ILogger<SupabaseJwks> log)
     {
@@ -36,11 +39,14 @@ public class SupabaseJwks(IHttpClientFactory factory, ILogger<SupabaseJwks> log,
         lock (_gate)
         {
             if (jwksUrl is null) return;
-            // Re-check under the lock so a burst of 401-adjacent requests fetches once.
-            if (_keys.Count > 0 && DateTimeOffset.UtcNow - _fetchedAt < TimeSpan.FromSeconds(30)) return;
+            // One attempt per window, success OR failure — a burst of
+            // 401-adjacent requests can't stampede a slow or downed endpoint,
+            // and a failing fetch is retried at most every 15 seconds.
+            if (DateTimeOffset.UtcNow - _lastAttempt < TimeSpan.FromSeconds(15)) return;
+            _lastAttempt = DateTimeOffset.UtcNow;
             try
             {
-                var json = factory.CreateClient(Services.SupabaseAuth.HttpClientName)
+                var json = factory.CreateClient(HttpClientName)
                     .GetStringAsync(jwksUrl).GetAwaiter().GetResult();
                 _keys = [.. new JsonWebKeySet(json).GetSigningKeys()];
                 _fetchedAt = DateTimeOffset.UtcNow;

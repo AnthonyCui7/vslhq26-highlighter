@@ -394,34 +394,68 @@ public class SupabaseClient
                 $"{Uri.EscapeDataString(pair.Key)}={Uri.EscapeDataString(pair.Value)}"))
             : "";
 
-        using var request = new HttpRequestMessage(
-            new HttpMethod(method), $"{BaseUrl}/rest/v1/{table}{queryString}");
-        if (body is not null)
-            request.Content = new StringContent(JsonUtil.Dumps(body), Encoding.UTF8, "application/json");
-        request.Headers.TryAddWithoutValidation("apikey", Key);
-        request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {Key}");
-        if (prefer is not null) request.Headers.TryAddWithoutValidation("Prefer", prefer);
+        // Transient failures (connection errors, timeouts, 5xx) are retried
+        // with a short backoff; 4xx responses are the caller's bug and are not.
+        const int maxAttempts = 3;
+        var backoffSeconds = new[] { 1, 3 };
+        for (var attempt = 1; ; attempt++)
+        {
+            // A fresh request per attempt: HttpRequestMessage cannot be resent.
+            using var request = new HttpRequestMessage(
+                new HttpMethod(method), $"{BaseUrl}/rest/v1/{table}{queryString}");
+            if (body is not null)
+                request.Content = new StringContent(JsonUtil.Dumps(body), Encoding.UTF8, "application/json");
+            request.Headers.TryAddWithoutValidation("apikey", Key);
+            request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {Key}");
+            if (prefer is not null) request.Headers.TryAddWithoutValidation("Prefer", prefer);
 
-        string responseBody;
-        try
-        {
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-            using var response = Http.Send(request, HttpCompletionOption.ResponseContentRead, cts.Token);
-            responseBody = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-            if (!response.IsSuccessStatusCode)
-                throw new PipelineError($"Supabase {method} {table} failed: {responseBody}");
-        }
-        catch (HttpRequestException exc)
-        {
-            throw new PipelineError($"Supabase {method} {table} failed: {exc.Message}", exc);
-        }
-        catch (TaskCanceledException exc)
-        {
-            throw new PipelineError($"Supabase {method} {table} failed: timed out", exc);
-        }
+            string responseBody;
+            try
+            {
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                using var response = Http.Send(request, HttpCompletionOption.ResponseContentRead, cts.Token);
+                responseBody = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                if (!response.IsSuccessStatusCode)
+                {
+                    if ((int)response.StatusCode >= 500 && attempt < maxAttempts)
+                    {
+                        Console.WriteLine(
+                            $"Supabase {method} {table} returned {(int)response.StatusCode}; "
+                            + $"retrying (attempt {attempt}/{maxAttempts})");
+                        Thread.Sleep(backoffSeconds[attempt - 1] * 1000);
+                        continue;
+                    }
+                    throw new PipelineError($"Supabase {method} {table} failed: {responseBody}");
+                }
+            }
+            catch (HttpRequestException exc)
+            {
+                if (attempt < maxAttempts)
+                {
+                    Console.WriteLine(
+                        $"Supabase {method} {table} connection error ({exc.Message}); "
+                        + $"retrying (attempt {attempt}/{maxAttempts})");
+                    Thread.Sleep(backoffSeconds[attempt - 1] * 1000);
+                    continue;
+                }
+                throw new PipelineError($"Supabase {method} {table} failed: {exc.Message}", exc);
+            }
+            catch (TaskCanceledException exc)
+            {
+                if (attempt < maxAttempts)
+                {
+                    Console.WriteLine(
+                        $"Supabase {method} {table} timed out; "
+                        + $"retrying (attempt {attempt}/{maxAttempts})");
+                    Thread.Sleep(backoffSeconds[attempt - 1] * 1000);
+                    continue;
+                }
+                throw new PipelineError($"Supabase {method} {table} failed: timed out", exc);
+            }
 
-        if (string.IsNullOrEmpty(responseBody)) return null;
-        return JsonUtil.Parse(responseBody);
+            if (string.IsNullOrEmpty(responseBody)) return null;
+            return JsonUtil.Parse(responseBody);
+        }
     }
 }
 

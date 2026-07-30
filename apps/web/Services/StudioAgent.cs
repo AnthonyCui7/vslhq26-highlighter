@@ -25,38 +25,51 @@ public class StudioAgentService(StudioState state, IStudioBackend backend)
         state.SetAgentBusy(true);
         try
         {
-            var providers = Providers.EditorProviders(title: "highlighter studio");
-            while (true)
-            {
-                try
-                {
-                    EnsureSession();
-                    var response = await _agent!.RunAsync(text.Trim(), _session);
-                    state.AddAgentMessage("agent",
-                        string.IsNullOrWhiteSpace(response.Text)
-                            ? "Done — anything else on this cut?"
-                            : response.Text.Trim());
-                    break;
-                }
-                catch (Exception exc) when (_providerIndex + 1 < providers.Count)
-                {
-                    // Conversations do not survive a provider swap; the chat
-                    // list the human sees does.
-                    Console.WriteLine($"Studio agent provider failed; trying the next: {exc.Message}");
-                    _providerIndex += 1;
-                    _agent = null;
-                    _session = null;
-                }
-            }
+            // Task.Run: the framework's tool loop blocks on sync-over-async tool
+            // bodies — off the Blazor sync context that's safe, on it it would
+            // deadlock the circuit.
+            var reply = await Task.Run(() => RunTurnAsync(text.Trim()));
+            state.AddAgentMessage("agent", reply);
         }
         catch (Exception exc)
         {
+            // exc.Message can carry env-var names and endpoints — log it, never
+            // render it.
+            Console.WriteLine($"Studio agent failed: {exc}");
             state.AddAgentMessage("agent",
-                $"The editing agent is unavailable right now: {exc.Message}");
+                "The editing agent isn't available right now — everything in the "
+                + "inspector still works manually.");
         }
         finally
         {
             state.SetAgentBusy(false);
+        }
+    }
+
+    private async Task<string> RunTurnAsync(string text)
+    {
+        var providers = Providers.EditorProviders(title: "highlighter studio");
+        if (providers.Count == 0)
+            throw new InvalidOperationException("no editor model providers configured");
+        while (true)
+        {
+            try
+            {
+                await EnsureSessionAsync();
+                var response = await _agent!.RunAsync(text, _session);
+                return string.IsNullOrWhiteSpace(response.Text)
+                    ? "Done — anything else on this cut?"
+                    : response.Text.Trim();
+            }
+            catch (Exception exc) when (_providerIndex + 1 < providers.Count)
+            {
+                // Conversations do not survive a provider swap; the chat
+                // list the human sees does.
+                Console.WriteLine($"Studio agent provider failed; trying the next: {exc.Message}");
+                _providerIndex += 1;
+                _agent = null;
+                _session = null;
+            }
         }
     }
 
@@ -74,7 +87,10 @@ public class StudioAgentService(StudioState state, IStudioBackend backend)
         ResetAgent();
     }
 
-    private string ContextKey() => $"{state.AgentContext}:{state.ActiveClip?.Id}";
+    /// <summary>Keyed on the project too — without it, every long-form editor
+    /// shares one "long:" context and project B inherits project A's chat.</summary>
+    private string ContextKey() =>
+        $"{state.ProjectId}:{state.AgentContext}:{state.ActiveClip?.Id}:{state.ActiveLongform?.Version}";
 
     private void ResetAgent()
     {
@@ -83,15 +99,17 @@ public class StudioAgentService(StudioState state, IStudioBackend backend)
         _sessionContext = ContextKey();
     }
 
-    private void EnsureSession()
+    private async Task EnsureSessionAsync()
     {
-        if (_agent is not null && _sessionContext == ContextKey()) return;
+        if (_agent is not null && _session is not null && _sessionContext == ContextKey()) return;
         _sessionContext = ContextKey();
         var providers = Providers.EditorProviders(title: "highlighter studio");
-        var provider = providers[Math.Min(_providerIndex, providers.Count - 1)];
+        if (providers.Count == 0)
+            throw new InvalidOperationException("no editor model providers configured");
+        var provider = providers[Math.Clamp(_providerIndex, 0, providers.Count - 1)];
         var client = new PipelineChatClient(provider, timeoutSeconds: 120.0);
         _agent = new ChatClientAgent(client, Instructions(), tools: Tools());
-        _session = _agent.CreateSessionAsync().GetAwaiter().GetResult();
+        _session = await _agent.CreateSessionAsync();
     }
 
     private string Instructions()
@@ -144,8 +162,7 @@ public class StudioAgentService(StudioState state, IStudioBackend backend)
                 args => backend.GenerateThumbnailsAsync(Str(args, "prompt")).GetAwaiter().GetResult()));
             tools.Add(Tool("select_thumbnail", "Make a generated variant the video's thumbnail.",
                 Args(("index", "number", "The variant number to select.")),
-                args => backend.SelectThumbnailAsync(
-                    (int)(args["index"]?.GetValue<double>() ?? 0)).GetAwaiter().GetResult()));
+                args => backend.SelectThumbnailAsync(Int(args, "index")).GetAwaiter().GetResult()));
         }
         else
         {
@@ -189,4 +206,19 @@ public class StudioAgentService(StudioState state, IStudioBackend backend)
 
     private static string Str(JsonObject args, string key) =>
         args[key]?.GetValue<string>() ?? "";
+
+    /// <summary>Models sometimes emit numbers as strings ("2"); read either.</summary>
+    private static int Int(JsonObject args, string key)
+    {
+        var node = args[key];
+        if (node is null) return 0;
+        try
+        {
+            return (int)node.GetValue<double>();
+        }
+        catch (Exception exception) when (exception is InvalidOperationException or FormatException)
+        {
+            return int.TryParse(node.ToString(), out var parsed) ? parsed : 0;
+        }
+    }
 }

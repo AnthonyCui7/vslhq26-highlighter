@@ -397,8 +397,11 @@ public static class Reframe
         var (cropEnable, wideEnable) = ModeEnables(keyframes);
         var filtergraph =
             "[0:v]split=3[bg][fgc][fgw];"
-            + $"[bg]scale={CANVAS_WIDTH}:{CANVAS_HEIGHT}:force_original_aspect_ratio=increase,"
-            + $"crop={CANVAS_WIDTH}:{CANVAS_HEIGHT},gblur=sigma={BLUR_SIGMA},eq=brightness=-0.06[b];"
+            // Stretch the WHOLE frame to fill (not cover+crop): a center crop of a
+            // dark frame blurs to plain black, while the full frame always carries
+            // the shot's palette — and heavy blur hides the distortion.
+            + $"[bg]scale={CANVAS_WIDTH}:{CANVAS_HEIGHT},"
+            + $"gblur=sigma={BLUR_SIGMA},eq=brightness=-0.06[b];"
             + $"[fgc]crop=w={cropSize}:h={cropSize}:x='{xExpression}':y=0,"
             + $"scale={CANVAS_WIDTH}:{CANVAS_WIDTH}[fc];"
             + $"[fgw]scale={CANVAS_WIDTH}:-2[fw];"
@@ -425,7 +428,7 @@ public static class Reframe
             "-preset",
             "veryfast",
             "-crf",
-            "30",
+            "23",
             "-c:a",
             "copy",
             "-movflags",

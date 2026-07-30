@@ -37,7 +37,25 @@ public static class ProjectShaper
             Progress: BuildProgress(status, chunkCount, sourceMinutes, chunkSeconds, maxChunks),
             ActiveJobId: activeJobId,
             CreatedAt: Ts(row["created_at"]),
-            UpdatedAt: Ts(row["updated_at"]));
+            UpdatedAt: Ts(row["updated_at"]),
+            ThumbnailUrl: SummaryThumbnail(row));
+    }
+
+    /// <summary>Card cover: the newest long-form thumbnail, else the best clip
+    /// frame. Works off both list rows (aliased thumbs/clip_thumbs embeds) and
+    /// detail rows (full longform_edits/clips arrays).</summary>
+    private static string? SummaryThumbnail(JsonObject row)
+    {
+        foreach (var edit in Rows(row["thumbs"]).Concat(Rows(row["longform_edits"])))
+            if (Str(edit["thumbnail_url"]) is { } editThumb) return editThumb;
+        foreach (var clip in Rows(row["clip_thumbs"]).Concat(Rows(row["clips"])))
+        {
+            var metadata = clip["metadata"] as JsonObject;
+            var url = Str(metadata?["thumbnail_url"])
+                ?? Str((metadata?["render"] as JsonObject)?["thumbnail_url"]);
+            if (url is not null) return url;
+        }
+        return null;
     }
 
     public static ProjectDetailDto Detail(JsonObject row, bool hasLocalMirror, string? activeJobId = null) =>

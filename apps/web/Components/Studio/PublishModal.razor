@@ -1,0 +1,133 @@
+@inherits StudioComponent
+@inject ApiClient Api
+
+@* Publish popup: pick platforms, set the title, post (or dry-run) through the
+   real upload-post pipeline. Opened from the project page (long-form) and the
+   editor (long-form or the open highlight). *@
+
+<div @onclick="Close" class="anim-fade-in absolute inset-0 z-[70] flex items-center justify-center bg-[rgba(10,9,8,0.7)]">
+    <div @onclick:stopPropagation class="anim-scale-in w-[460px] rounded-[10px] border border-line3 bg-card2 px-6 py-[22px] shadow-[0_24px_60px_rgba(0,0,0,0.5)]">
+        <div class="flex items-center justify-between">
+            <div class="text-[16px] font-bold">Publish @(IsClip ? "highlight" : "long-form cut")</div>
+            <span @onclick="Close" class="cursor-pointer px-1.5 py-0.5 text-[15px] text-muted hover:text-fg">✕</span>
+        </div>
+        <div class="mt-1 truncate text-[12px] text-muted">@SubjectName</div>
+
+        <div class="mt-4">
+            <div class="mb-[7px] text-xs font-semibold text-muted">Platforms</div>
+            <div class="flex flex-wrap gap-2">
+                @foreach (var platform in Platforms)
+                {
+                    <span @onclick="() => Toggle(platform)"
+                          class="cursor-pointer rounded-md border px-3 py-[6px] text-[12px] font-semibold capitalize @(_selected.Contains(platform) ? "border-accent bg-[#22241A] text-accent" : "border-line2 text-muted hover:text-fg")">
+                        @platform
+                    </span>
+                }
+            </div>
+            @if (_selected.Contains("x"))
+            {
+                <div class="mt-2 text-[10.5px] leading-[1.5] text-faint">X posts a promo message linking the video once another platform's post is live.</div>
+            }
+        </div>
+
+        <div class="mt-4">
+            <div class="mb-[7px] text-xs font-semibold text-muted">Title</div>
+            <input @bind="_title" @bind:event="oninput"
+                   class="box-border w-full rounded-md border border-line3 bg-ink px-[12px] py-[9px] font-sans text-[13px] text-fg outline-none focus:border-[#4A4638]" />
+        </div>
+
+        @if (_note is not null)
+        {
+            <div class="anim-drop-in mt-3 rounded-md border border-line2 bg-card px-3 py-2 text-[11.5px] leading-[1.55] text-soft">@_note</div>
+        }
+
+        <div class="mt-5 flex items-center justify-end gap-2.5">
+            <div @onclick="Close" class="cursor-pointer rounded-md px-3.5 py-[8px] text-[13px] text-muted hover:text-fg">Cancel</div>
+            <div @onclick="PostAsync"
+                 class="cursor-pointer rounded-md bg-accent px-5 py-[8px] text-[13px] font-bold text-ink hover:bg-accent-soft active:scale-[0.97] @(_busy || _selected.Count == 0 || _selected.SetEquals(OnlyX) ? "pointer-events-none opacity-60" : "")">
+                @(_busy ? "Posting…" : "Post now")
+            </div>
+        </div>
+    </div>
+</div>
+
+@code {
+    private static readonly string[] Platforms = ["youtube", "tiktok", "instagram", "x"];
+    private static readonly HashSet<string> OnlyX = ["x"];
+
+    private readonly HashSet<string> _selected = ["youtube"];
+    private string _title = "";
+    private bool _busy;
+    private string? _note;
+    private bool _seeded;
+
+    private bool IsClip => S.PublishClip is not null;
+    private string SubjectName => S.PublishClip?.Title ?? S.LongformTitle;
+
+    protected override void OnParametersSet()
+    {
+        if (_seeded) return;
+        _seeded = true;
+        _title = SubjectName;
+    }
+
+    private void Toggle(string platform)
+    {
+        if (!_selected.Remove(platform)) _selected.Add(platform);
+        if (_selected.SetEquals(OnlyX))
+            _note = "X is a promo layer — pick a companion platform too.";
+    }
+
+    private void Close()
+    {
+        if (_busy) return; // the post is in flight; let it finish reporting
+        S.ClosePublish();
+    }
+
+    private async Task PostAsync()
+    {
+        if (S.ProjectId is not { } projectId || _busy) return;
+        _busy = true;
+        _note = "Posting…";
+        try
+        {
+            var request = new PublishRequestDto(
+                Target: IsClip ? "clip" : "longform",
+                ClipId: S.PublishClip?.Id,
+                Version: IsClip ? null : S.LatestLongform?.Version,
+                Platforms: _selected.ToArray(),
+                Title: string.IsNullOrWhiteSpace(_title) ? null : _title.Trim(),
+                DryRun: false);
+            var job = await Api.PublishAsync(projectId, request);
+            for (var i = 0; i < 120; i++) // publishes are minutes at most
+            {
+                await Task.Delay(TimeSpan.FromSeconds(3));
+                var state = await Api.GetJobAsync(job.Id);
+                if (state.State is "starting" or "running") continue;
+                if (state.State == "succeeded")
+                {
+                    var tail = await Api.GetJobLogsAsync(job.Id, tail: 3);
+                    _note = tail.Count > 0 ? tail[^1].Line : "Posted! The links are on the project page.";
+                    _ = S.RefreshDetailAsync();
+                }
+                else
+                {
+                    _note = "Publishing didn't finish — check the platform links and try again.";
+                }
+                break;
+            }
+        }
+        catch (ApiException exception)
+        {
+            _note = exception.UserMessage;
+        }
+        catch (Exception)
+        {
+            _note = "Publishing hit an unexpected problem — try again.";
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+}

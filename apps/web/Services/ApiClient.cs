@@ -26,8 +26,12 @@ public sealed class ApiClient(IHttpClientFactory factory, AuthSession auth)
         SendAsync<CancelResultDto>(() => new HttpRequestMessage(HttpMethod.Post, $"/api/projects/{id}/cancel"), ct);
 
     public async Task DeleteProjectAsync(Guid id, CancellationToken ct = default) =>
-        (await SendRawAsync(() => new HttpRequestMessage(HttpMethod.Delete, $"/api/projects/{id}"), false, ct))
-            .Dispose();
+        (await SendRawAsync(() => new HttpRequestMessage(
+            HttpMethod.Delete, $"/api/projects/{id}?force=true"), false, ct)).Dispose();
+
+    public async Task DeleteClipAsync(Guid projectId, Guid clipId, CancellationToken ct = default) =>
+        (await SendRawAsync(() => new HttpRequestMessage(
+            HttpMethod.Delete, $"/api/projects/{projectId}/clips/{clipId}"), false, ct)).Dispose();
 
     public Task<List<TranscriptChunkDto>> GetTranscriptAsync(Guid id, bool words, CancellationToken ct = default) =>
         GetAsync<List<TranscriptChunkDto>>($"/api/projects/{id}/transcript?includeWords={words}", ct);

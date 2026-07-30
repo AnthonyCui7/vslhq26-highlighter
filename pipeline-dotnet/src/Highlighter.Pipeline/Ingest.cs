@@ -640,9 +640,17 @@ public static class Ingest
             void TryRenderFromSegments(Fork fork, JsonObject decision)
             {
                 // Render now when every needed segment is archived; park otherwise
-                // (fork emitter thread).
+                // (fork emitter thread). Snapshot the segment paths in one locked
+                // block: writers mutate segmentFiles under segmentsGate.
                 var needed = NeededSegments(decision);
-                var missing = needed.Where(index => !segmentFiles.ContainsKey(index)).ToList();
+                List<int> missing;
+                List<string>? segmentPaths = null;
+                lock (segmentsGate)
+                {
+                    missing = needed.Where(index => !segmentFiles.ContainsKey(index)).ToList();
+                    if (missing.Count == 0)
+                        segmentPaths = needed.Select(index => segmentFiles[index]).ToList();
+                }
                 if (missing.Count > 0)
                 {
                     if (!fork.ParkedRenders.TryGetValue(missing.Max(), out var parked))
@@ -661,7 +669,7 @@ public static class Ingest
                     projectDir: projectDir,
                     clipsBucket: clipsBucket,
                     decision: decision,
-                    segmentPaths: needed.Select(index => segmentFiles[index]).ToList(),
+                    segmentPaths: segmentPaths!,
                     firstSegmentStartSeconds: SegmentStart(needed[0]),
                     renderedLog: fork.RenderedLog,
                     pipeline: fork.Mode,
@@ -704,7 +712,20 @@ public static class Ingest
                 {
                     var decisions = fork.ParkedRenders[key];
                     fork.ParkedRenders.Remove(key);
-                    foreach (var decision in decisions) TryRenderFromSegments(fork, decision);
+                    foreach (var decision in decisions)
+                    {
+                        try
+                        {
+                            TryRenderFromSegments(fork, decision);
+                        }
+                        catch (Exception exc)
+                        {
+                            // One bad decision must not drop the rest of the batch.
+                            Console.WriteLine(
+                                "Rendering parked clip candidate "
+                                + $"{JsonUtil.Str(decision["chunk_index"])} failed: {exc.Message}");
+                        }
+                    }
                 }
             }
 
@@ -754,17 +775,27 @@ public static class Ingest
                 {
                     foreach (var decision in fork.ParkedRenders[key])
                     {
-                        StoreClipDecision(
-                            db: db,
-                            records: records!,
-                            projectId: projectId,
-                            decision: decision,
-                            pipeline: fork.Mode,
-                            renderResult: new JsonObject
-                            {
-                                ["status"] = "failed",
-                                ["error"] = "No archived video segment was produced for this clip.",
-                            });
+                        try
+                        {
+                            StoreClipDecision(
+                                db: db,
+                                records: records!,
+                                projectId: projectId,
+                                decision: decision,
+                                pipeline: fork.Mode,
+                                renderResult: new JsonObject
+                                {
+                                    ["status"] = "failed",
+                                    ["error"] = "No archived video segment was produced for this clip.",
+                                });
+                        }
+                        catch (Exception exc)
+                        {
+                            // One bad decision must not skip the cleanup below.
+                            Console.WriteLine(
+                                "Recording unrendered clip candidate "
+                                + $"{JsonUtil.Str(decision["chunk_index"])} failed: {exc.Message}");
+                        }
                     }
                 }
                 fork.ParkedRenders.Clear();
@@ -778,11 +809,16 @@ public static class Ingest
             void DropRemainingSegments()
             {
                 // Delete leftover local segment copies (main thread, after every
-                // fork's coordinator has drained).
-                foreach (var index in segmentFiles.Keys.ToList())
+                // fork's coordinator has drained). The map is only touched under
+                // segmentsGate; the deletes happen outside the lock.
+                List<string> leftovers;
+                lock (segmentsGate)
                 {
-                    var path = segmentFiles[index];
-                    segmentFiles.Remove(index);
+                    leftovers = segmentFiles.Values.ToList();
+                    segmentFiles.Clear();
+                }
+                foreach (var path in leftovers)
+                {
                     try
                     {
                         File.Delete(path);
@@ -905,10 +941,31 @@ public static class Ingest
                 if (storage is not null)
                 {
                     var key = $"{archivePrefix}/{Path.GetFileName(segmentPath)}";
-                    storage.UploadFile(segmentPath, key);
-                    archivedSegments.Add(key);
-                    Console.WriteLine(
-                        $"Archived video segment {segmentIndex} to s3://{storage.Bucket}/{key}");
+                    var uploaded = false;
+                    for (var attempt = 1; attempt <= 3 && !uploaded; attempt++)
+                    {
+                        try
+                        {
+                            storage.UploadFile(segmentPath, key);
+                            uploaded = true;
+                        }
+                        catch (Exception exc)
+                        {
+                            // The archive is best-effort; a failed segment upload
+                            // must not end the capture.
+                            Console.WriteLine(
+                                $"Uploading video segment {segmentIndex} to "
+                                + $"s3://{storage.Bucket}/{key} failed"
+                                + (attempt < 3 ? $" (attempt {attempt}/3, retrying): " : " (giving up): ")
+                                + exc.Message);
+                        }
+                    }
+                    if (uploaded)
+                    {
+                        archivedSegments.Add(key);
+                        Console.WriteLine(
+                            $"Archived video segment {segmentIndex} to s3://{storage.Bucket}/{key}");
+                    }
                 }
                 if (coordinators.Count > 0)
                 {
@@ -922,7 +979,15 @@ public static class Ingest
                 }
                 else
                 {
-                    File.Delete(segmentPath);
+                    try
+                    {
+                        File.Delete(segmentPath);
+                    }
+                    catch (Exception exc) when (exc is IOException or UnauthorizedAccessException)
+                    {
+                        Console.WriteLine(
+                            $"Could not delete local segment {segmentPath}: {exc.Message}");
+                    }
                 }
             }
 
@@ -1082,20 +1147,38 @@ public static class Ingest
                     {
                         // Guarded: matches nothing when the backend flipped the row to
                         // 'stopping' after our last poll, in which case we acknowledge
-                        // the cancel instead of writing 'ready'.
-                        cancelled = db.UpdateProjectStatusGuarded(
-                            projectId,
-                            status: "ready",
-                            whenStatusIn: new[] { "ingesting" },
-                            metadata: merged) is null;
+                        // the cancel instead of writing 'ready'. A Supabase outage
+                        // here must not fail an otherwise finished run.
+                        try
+                        {
+                            cancelled = db.UpdateProjectStatusGuarded(
+                                projectId,
+                                status: "ready",
+                                whenStatusIn: new[] { "ingesting" },
+                                metadata: merged) is null;
+                        }
+                        catch (Exception writeExc)
+                        {
+                            Console.WriteLine(
+                                $"Could not write final 'ready' status: {writeExc.Message}");
+                            cancelled = false;
+                        }
                     }
                     if (cancelled)
                     {
-                        db.UpdateProjectStatusGuarded(
-                            projectId,
-                            status: "cancelled",
-                            whenStatusIn: new[] { "stopping", "cancelled" },
-                            metadata: merged);
+                        try
+                        {
+                            db.UpdateProjectStatusGuarded(
+                                projectId,
+                                status: "cancelled",
+                                whenStatusIn: new[] { "stopping", "cancelled" },
+                                metadata: merged);
+                        }
+                        catch (Exception writeExc)
+                        {
+                            Console.WriteLine(
+                                $"Could not write final 'cancelled' status: {writeExc.Message}");
+                        }
                     }
                 }
                 else
@@ -1135,21 +1218,42 @@ public static class Ingest
                     ("status", "failed"), ("error", exc.Message), ("metadata", metadata));
                 if (db is not null)
                 {
+                    // A Supabase outage during these writes must not mask the
+                    // real error being rethrown below.
                     var merged = MergedProjectMetadata(metadata);
-                    var failed = db.UpdateProjectStatusGuarded(
-                        projectId,
-                        status: "failed",
-                        whenStatusIn: new[] { "created", "ingesting" },
-                        metadata: merged,
-                        error: exc.Message);
-                    if (failed is null)
+                    JsonObject? failed = null;
+                    var failedWriteLanded = false;
+                    try
+                    {
+                        failed = db.UpdateProjectStatusGuarded(
+                            projectId,
+                            status: "failed",
+                            whenStatusIn: new[] { "created", "ingesting" },
+                            metadata: merged,
+                            error: exc.Message);
+                        failedWriteLanded = true;
+                    }
+                    catch (Exception writeExc)
+                    {
+                        Console.WriteLine(
+                            $"Could not write final 'failed' status: {writeExc.Message}");
+                    }
+                    if (failedWriteLanded && failed is null)
                     {
                         // The row was already stopping/cancelled; finish as cancelled.
-                        db.UpdateProjectStatusGuarded(
-                            projectId,
-                            status: "cancelled",
-                            whenStatusIn: new[] { "stopping", "cancelled" },
-                            metadata: merged);
+                        try
+                        {
+                            db.UpdateProjectStatusGuarded(
+                                projectId,
+                                status: "cancelled",
+                                whenStatusIn: new[] { "stopping", "cancelled" },
+                                metadata: merged);
+                        }
+                        catch (Exception writeExc)
+                        {
+                            Console.WriteLine(
+                                $"Could not write final 'cancelled' status: {writeExc.Message}");
+                        }
                     }
                 }
                 throw;
@@ -1347,7 +1451,15 @@ public static class Ingest
         for (var order = 0; order < selections.Count; order++)
         {
             if (selections[order] is not JsonObject selection) continue;
-            var candidate = entries[JsonUtil.Int(selection["index"])];
+            var candidateIndex = JsonUtil.Int(selection["index"]);
+            if (candidateIndex < 0 || candidateIndex >= entries.Count)
+            {
+                Console.WriteLine(
+                    $"Skipping long-form selection {order}: candidate index {candidateIndex} "
+                    + $"is out of range (have {entries.Count} candidates)");
+                continue;
+            }
+            var candidate = entries[candidateIndex];
             var entry = JsonUtil.With(candidate, ("editor_reason", JsonUtil.C(selection["reason"])));
             var start = JsonUtil.Double(selection["start_seconds"]);
             var end = JsonUtil.Double(selection["end_seconds"]);
@@ -1614,6 +1726,8 @@ public static class Ingest
         if (result["thumbnails"] is JsonObject thumbnails
             && thumbnails["variants"] is JsonArray variants
             && JsonUtil.TryDouble(thumbnails["selected_index"], out var selectedIndex)
+            && (int)selectedIndex >= 0
+            && (int)selectedIndex < variants.Count
             && variants[(int)selectedIndex] is JsonObject selected
             && JsonUtil.Truthy(selected["url"]))
         {
@@ -2008,18 +2122,14 @@ public static class Ingest
         }
     }
 
-    /// <summary>Best-effort mid-clip JPEG next to the rendered mp4; null on failure.</summary>
+    /// <summary>Best-effort first-frame JPEG next to the rendered mp4; null on failure.</summary>
     private static string? ExtractClipThumbnail(string clipPath, JsonObject decision)
     {
         try
         {
             var thumbnailPath = Path.ChangeExtension(clipPath, ".jpg");
-            var midpoint = Math.Max(
-                0.0,
-                (JsonUtil.Double(decision["end_seconds"])
-                    - JsonUtil.Double(decision["start_seconds"])) / 2);
             Render.ExtractThumbnail(
-                clipPath: clipPath, outputPath: thumbnailPath, atSeconds: midpoint);
+                clipPath: clipPath, outputPath: thumbnailPath, atSeconds: 0.0);
             return thumbnailPath;
         }
         catch (Exception exc)

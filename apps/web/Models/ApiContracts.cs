@@ -23,7 +23,8 @@ public record ProjectSummaryDto(
     ProgressDto Progress,
     string? ActiveJobId,
     DateTimeOffset CreatedAt,
-    DateTimeOffset UpdatedAt);
+    DateTimeOffset UpdatedAt,
+    string? ThumbnailUrl = null);
 
 public record ProjectDetailDto(
     ProjectSummaryDto Project,

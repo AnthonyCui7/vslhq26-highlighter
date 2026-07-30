@@ -23,10 +23,30 @@ public static class ProjectActionEndpoints
                 CancellationToken ct) =>
             {
                 var uid = AuthHelpers.Uid(user);
+                var job = jobs.ActiveForProject(id);
+
+                // Force-cancel with no tracked process: either the worker is an
+                // orphan of a previous API instance (it still polls the row and
+                // stops on 'cancelled') or it's dead and the row is stranded —
+                // writing 'cancelled' directly converges both. Decided BEFORE any
+                // status write so a 409 can never leave the row half-moved.
+                if (force == true && job is null)
+                {
+                    var current = await db.GetProjectStatusAsync(id, uid, ct);
+                    if (current is null) return NotFound(id);
+                    if (current is not ("created" or "ingesting" or "stopping"))
+                        return Problem(409, "Cancellation not applicable",
+                            $"Project is already '{current}'");
+                    var recovered = await db.PatchProjectGuardedAsync(id,
+                        ["created", "ingesting", "stopping"],
+                        new JsonObject { ["status"] = "cancelled" }, uid, ct);
+                    var recoveredStatus = recovered?["status"]?.GetValue<string>() ?? current;
+                    return Results.Ok(new CancelResultDto(id, recoveredStatus, null, false));
+                }
+
                 // The cancel contract: write 'stopping' and let the worker converge to
                 // 'cancelled' itself (it polls the row every ~10s). Never write
                 // 'cancelled' while a worker may be alive.
-                var job = jobs.ActiveForProject(id);
                 var patched = await db.PatchProjectGuardedAsync(id, ["created", "ingesting"],
                     new JsonObject { ["status"] = "stopping" }, uid, ct);
                 if (patched is null)
@@ -40,15 +60,8 @@ public static class ProjectActionEndpoints
                 }
 
                 var forceKilled = false;
-                if (force == true)
-                {
-                    if (job is null)
-                        return Problem(409, "No tracked worker process",
-                            "Cooperative cancel is requested (row is 'stopping'); a live worker "
-                            + "converges to 'cancelled' within ~10 seconds. Force-kill needs a "
-                            + "process tracked by this API instance.");
+                if (force == true && job is not null)
                     forceKilled = await jobs.ForceKillAsync(job);
-                }
 
                 var finalStatus = await db.GetProjectStatusAsync(id, uid, ct) ?? "stopping";
                 var result = new CancelResultDto(id, finalStatus, job?.Id, forceKilled);
@@ -70,7 +83,8 @@ public static class ProjectActionEndpoints
                     return Problem(409, "Nothing to revise",
                         "No rendered long-form edit exists for this project");
 
-                var job = jobs.Start("revise", id, WorkerArgs.Revise(id, body.Request.Trim()));
+                var job = jobs.Start("revise", id, WorkerArgs.Revise(id, body.Request.Trim()),
+                    ownerId: AuthHelpers.Uid(user));
                 return Results.Accepted($"/api/jobs/{job.Id}", job.ToDto());
             })
             .WithName("ReviseProject");
@@ -121,7 +135,7 @@ public static class ProjectActionEndpoints
 
                 var job = jobs.Start("publish", id, WorkerArgs.Publish(
                     id, target, platforms, body.Title, body.Version, body.Thumbnail,
-                    body.Plain, body.DryRun));
+                    body.Plain, body.DryRun), ownerId: AuthHelpers.Uid(user));
                 return Results.Accepted($"/api/jobs/{job.Id}", job.ToDto());
             })
             .WithName("PublishProject");
@@ -141,7 +155,8 @@ public static class ProjectActionEndpoints
                         + "VOD projects and --no-archive runs cannot be re-clipped");
 
                 var job = jobs.Start("reclip", id, WorkerArgs.Reclip(
-                    id, body.StartSeconds, body.EndSeconds, body.Title, body.Description));
+                    id, body.StartSeconds, body.EndSeconds, body.Title, body.Description),
+                    ownerId: AuthHelpers.Uid(user));
                 return Results.Accepted($"/api/jobs/{job.Id}", job.ToDto());
             })
             .WithName("ReclipProject");
@@ -156,7 +171,8 @@ public static class ProjectActionEndpoints
                 if (await db.GetProjectAsync(id, "id", AuthHelpers.Uid(user), ct) is null) return NotFound(id);
                 if (!layout.HasLocalMirror(id)) return NoMirror(id, "research");
 
-                var job = jobs.Start("research", id, WorkerArgs.Research(id, mode, body?.Focus));
+                var job = jobs.Start("research", id, WorkerArgs.Research(id, mode, body?.Focus),
+                    ownerId: AuthHelpers.Uid(user));
                 return Results.Accepted($"/api/jobs/{job.Id}", job.ToDto());
             })
             .WithName("RerunResearch");
@@ -172,7 +188,8 @@ public static class ProjectActionEndpoints
                         "No rendered long-form edit exists for this project");
 
                 var job = jobs.Start("thumbnails", id,
-                    WorkerArgs.Thumbnails(id, body?.Prompt, body?.Version, select: null));
+                    WorkerArgs.Thumbnails(id, body?.Prompt, body?.Version, select: null),
+                    ownerId: AuthHelpers.Uid(user));
                 return Results.Accepted($"/api/jobs/{job.Id}", job.ToDto());
             })
             .WithName("GenerateThumbnails");
@@ -189,7 +206,8 @@ public static class ProjectActionEndpoints
                 // Selection is a metadata flip, not a render — run it and wait
                 // briefly so callers (the studio agent) get a definite answer.
                 var job = jobs.Start("thumbnails", id,
-                    WorkerArgs.Thumbnails(id, prompt: null, body.Version, select: body.Index));
+                    WorkerArgs.Thumbnails(id, prompt: null, body.Version, select: body.Index),
+                    ownerId: AuthHelpers.Uid(user));
                 var finished = await PipelineJobService.WaitForExitAsync(
                     job, TimeSpan.FromSeconds(20), ct);
                 return finished
@@ -296,7 +314,8 @@ public static class ProjectActionEndpoints
                         "The clip has no rendered file on record");
 
                 var job = jobs.Start("reformat", id,
-                    WorkerArgs.Reformat(id, fileName, format, body?.Captions ?? false));
+                    WorkerArgs.Reformat(id, fileName, format, body?.Captions ?? false),
+                    ownerId: AuthHelpers.Uid(user));
                 return Results.Accepted($"/api/jobs/{job.Id}", job.ToDto());
             })
             .WithName("ReformatClip");

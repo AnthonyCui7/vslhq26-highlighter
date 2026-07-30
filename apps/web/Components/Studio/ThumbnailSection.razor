@@ -6,6 +6,16 @@
     <div class="flex items-center gap-[14px]">
         <div class="text-sm font-bold">Thumbnail</div>
         <div class="text-[11.5px] text-muted">@S.Thumbnails.Count generated · #@S.SelectedThumb selected</div>
+        @if (_selectBusy)
+        {
+            <span class="flex items-center gap-[5px] text-[11.5px] text-accent">
+                <span class="h-1.5 w-1.5 animate-pulse-dc rounded-full bg-accent"></span> selecting…
+            </span>
+        }
+        @if (S.ThumbError is not null && !S.ThumbPromptOpen)
+        {
+            <span class="min-w-0 truncate text-[11px] text-[#E0705A]">@S.ThumbError</span>
+        }
         @if (S.ThumbJobRunning)
         {
             <span class="ml-auto flex items-center gap-[5px] text-[11.5px] text-accent">
@@ -67,7 +77,34 @@
 </div>
 
 @code {
-    async Task Select(int index) => await Backend.SelectThumbnailAsync(index);
+    bool _selectBusy;
+
+    async Task Select(int index)
+    {
+        if (_selectBusy || S.SelectedThumb == index) return;
+        _selectBusy = true;
+        var previous = S.SelectedThumb;
+        S.SelectThumb(index); // optimistic — the strip responds immediately
+        try
+        {
+            var result = await Backend.SelectThumbnailAsync(index);
+            if (result.Contains("failed", StringComparison.OrdinalIgnoreCase))
+            {
+                S.SelectThumb(previous);
+                S.SetThumbJob(false, "Couldn't select that thumbnail — try again.");
+            }
+        }
+        catch (Exception)
+        {
+            S.SelectThumb(previous);
+            S.SetThumbJob(false, "Couldn't select that thumbnail — try again.");
+        }
+        finally
+        {
+            _selectBusy = false;
+            S.Notify();
+        }
+    }
 
     async Task Generate()
     {
@@ -77,9 +114,9 @@
             await Backend.GenerateThumbnailsAsync(
                 string.IsNullOrWhiteSpace(S.ThumbPrompt) ? null : S.ThumbPrompt.Trim());
         }
-        catch (Exception exc)
+        catch (Exception)
         {
-            S.SetThumbJob(false, $"Generation failed: {exc.Message}");
+            S.SetThumbJob(false, "Generation couldn't start — try again.");
         }
     }
 
@@ -94,9 +131,13 @@
             if (result.Contains("failed", StringComparison.OrdinalIgnoreCase))
                 S.SetThumbJob(false, result);
         }
-        catch (Exception exc)
+        catch (IOException)
         {
-            S.SetThumbJob(false, $"Import failed: {exc.Message}");
+            S.SetThumbJob(false, "That image is too large — 8 MB max.");
+        }
+        catch (Exception)
+        {
+            S.SetThumbJob(false, "Import failed — try a different image.");
         }
     }
 }

@@ -268,9 +268,22 @@ public class ClipScoringCoordinator
         // Waits for running scoring calls either way; the cancel flag drops
         // queued ones so a cancel is bounded by the in-flight calls only.
         if (cancelled) _cancelQueued = true;
-        Task.WaitAll(_futures.Values.ToArray());
-        _queue.Add(new FinishEvent());
-        _emitter.Join();
+        try
+        {
+            Task.WaitAll(_futures.Values.ToArray());
+        }
+        catch (AggregateException exc)
+        {
+            foreach (var inner in exc.Flatten().InnerExceptions)
+                Console.WriteLine($"A scoring task faulted: {inner.Message}");
+        }
+        finally
+        {
+            // A WaitAll failure must never skip the finish event: the emitter
+            // would keep running and its final flush would never happen.
+            _queue.Add(new FinishEvent());
+            _emitter.Join();
+        }
     }
 
     private void Dispatch(int index, bool hasNext)
@@ -328,44 +341,44 @@ public class ClipScoringCoordinator
         int visibleStart,
         int visibleEnd)
     {
-        var index = JsonUtil.Int(chunk["chunk_index"]);
+        // Whatever happens below, exactly one ScoredEvent must reach the queue
+        // for this chunk index — the emitter stalls forever on a missing index.
+        var index = -1;
+        var candidates = new List<JsonObject>();
+        var assessment = "";
         _poolGate.Wait();
         try
         {
+            index = JsonUtil.Int(chunk["chunk_index"]);
             if (_cancelQueued)
             {
                 // The port of ThreadPoolExecutor's cancel_futures: work that had
                 // not started when the cancel arrived never runs.
-                _queue.Add(new ScoredEvent(index, new List<JsonObject>(), "Cancelled before scoring."));
+                assessment = "Cancelled before scoring.";
                 return;
             }
-            List<JsonObject> candidates;
-            string assessment;
             try
             {
-                try
-                {
-                    (candidates, assessment) = _scoreChunk(
-                        chunk, contextBefore, contextAfter, visibleStart, visibleEnd);
-                }
-                catch (Exception exc)
-                {
-                    Console.WriteLine($"Scoring chunk {index} failed ({exc.Message}); retrying once");
-                    Thread.Sleep(2000);
-                    (candidates, assessment) = _scoreChunk(
-                        chunk, contextBefore, contextAfter, visibleStart, visibleEnd);
-                }
+                (candidates, assessment) = _scoreChunk(
+                    chunk, contextBefore, contextAfter, visibleStart, visibleEnd);
             }
             catch (Exception exc)
             {
-                Console.WriteLine($"Scoring chunk {index} failed after retry: {exc.Message}");
-                candidates = new List<JsonObject>();
-                assessment = $"LLM scoring failed: {exc.Message}";
+                Console.WriteLine($"Scoring chunk {index} failed ({exc.Message}); retrying once");
+                Thread.Sleep(2000);
+                (candidates, assessment) = _scoreChunk(
+                    chunk, contextBefore, contextAfter, visibleStart, visibleEnd);
             }
-            _queue.Add(new ScoredEvent(index, candidates, assessment));
+        }
+        catch (Exception exc)
+        {
+            Console.WriteLine($"Scoring chunk {index} failed after retry: {exc.Message}");
+            candidates = new List<JsonObject>();
+            assessment = $"LLM scoring failed: {exc.Message}";
         }
         finally
         {
+            _queue.Add(new ScoredEvent(index, candidates, assessment));
             _poolGate.Release();
         }
     }

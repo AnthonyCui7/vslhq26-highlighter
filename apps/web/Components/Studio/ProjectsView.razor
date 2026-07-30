@@ -38,7 +38,14 @@
                 {
                     <div @onclick="() => S.OpenProject(p.Id)" class="anim-fade-up cursor-pointer overflow-hidden rounded-lg border border-well bg-card hover:-translate-y-[2px] hover:border-[#4A4638]" style="animation-delay:@(40 * (i + 1))ms">
                         <div class="relative flex aspect-video items-center justify-center bg-[repeating-linear-gradient(-45deg,#1C1B19_0_10px,#201E1C_10px_20px)]">
-                            <span class="font-mono text-[10px] text-dim">@Fmt.Kind(p.SourceType) source</span>
+                            @if (p.ThumbnailUrl is { } cover)
+                            {
+                                <img src="@cover" alt="" loading="lazy" class="absolute inset-0 h-full w-full object-cover" />
+                            }
+                            else
+                            {
+                                <span class="font-mono text-[10px] text-dim">@Fmt.Kind(p.SourceType) source</span>
+                            }
                             <span class="absolute bottom-2 right-2 rounded-[3px] bg-[rgba(20,19,18,0.85)] px-1.5 py-0.5 font-mono text-[10.5px] text-fg">@Fmt.Duration(p.DurationSeconds)</span>
                             @if (p.Processing)
                             {
@@ -73,13 +80,7 @@
             }
         </div>
 
-        @if (S.Projects is { Count: 0 })
-        {
-            <div class="anim-fade-up mt-5 text-[12.5px] text-muted">
-                No projects yet — paste a VOD or livestream URL to start one.
-            </div>
-        }
-        else if (S.Projects is not null && !S.FilteredProjects.Any())
+        @if (S.Projects is { Count: > 0 } && !S.FilteredProjects.Any())
         {
             <div class="anim-fade-up mt-5 text-[12.5px] text-muted">
                 Nothing matches "@S.Search".

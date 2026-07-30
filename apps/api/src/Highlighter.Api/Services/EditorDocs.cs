@@ -80,11 +80,31 @@ public static class EditorDocs
         return captions;
     }
 
-    /// <summary>Null when valid, else a caller-facing error message.</summary>
+    /// <summary>Fill in every optional/absent piece of a deserialized document —
+    /// a JSON body (or an older persisted doc) can legally omit whole sections,
+    /// and positional records deserialize those to null.</summary>
+    public static EditorDoc Normalize(EditorDoc doc) => doc with
+    {
+        Segments = doc.Segments ?? [],
+        Captions = doc.Captions ?? [],
+        CaptionStyle = string.IsNullOrEmpty(doc.CaptionStyle) ? "boxed" : doc.CaptionStyle,
+        Texts = doc.Texts ?? [],
+        Markers = doc.Markers ?? [],
+        Transform = doc.Transform ?? new EdlTransform(),
+        Audio = doc.Audio ?? new EdlAudio(),
+        Reframe = string.IsNullOrEmpty(doc.Reframe) ? "auto" : doc.Reframe,
+    };
+
+    /// <summary>Null when valid, else a caller-facing error message. Collection
+    /// caps keep a hand-crafted document from turning the export into a
+    /// thousands-of-inputs ffmpeg invocation.</summary>
     public static string? Validate(EditorDoc doc, double sourceDuration)
     {
-        if (doc.Segments is not { Count: > 0 })
+        doc = Normalize(doc);
+        if (doc.Segments.Count == 0)
             return "the timeline needs at least one segment";
+        if (doc.Segments.Count > 200)
+            return "too many segments (max 200)";
         var previousEnd = -1e-3;
         foreach (var segment in doc.Segments)
         {
@@ -106,13 +126,23 @@ public static class EditorDocs
         if (doc.Transform.PosX is < -1.0 or > 1.0) return "transform.posX must be -1..1";
         if (doc.Audio.Voice is < 0 or > 2) return "audio.voice must be 0..2";
         if (doc.Audio.Music is < 0 or > 1) return "audio.music must be 0..1";
+        if (doc.Captions.Count > 500) return "too many captions (max 500)";
         foreach (var caption in doc.Captions)
+        {
             if (caption.End <= caption.Start)
                 return $"caption {caption.Id}: end must be after start";
+            if (caption.Text?.Length > 500)
+                return $"caption {caption.Id}: text is too long (max 500 characters)";
+            if (caption.Words?.Count > 40)
+                return $"caption {caption.Id}: too many words (max 40)";
+        }
+        if (doc.Texts.Count > 50) return "too many text overlays (max 50)";
         foreach (var text in doc.Texts)
         {
             if (text.End <= text.Start) return $"text {text.Id}: end must be after start";
             if (text.Y is < 0 or > 1) return $"text {text.Id}: y must be 0..1";
+            if (text.Text?.Length > 300)
+                return $"text {text.Id}: text is too long (max 300 characters)";
         }
         return null;
     }
@@ -165,7 +195,9 @@ public static class EditorDocs
         if (node is null) return null;
         try
         {
-            return node.Deserialize<EditorDoc>(Json);
+            // Normalized on the way in: a doc persisted by an older writer may
+            // omit sections that deserialize to null.
+            return node.Deserialize<EditorDoc>(Json) is { } doc ? Normalize(doc) : null;
         }
         catch (JsonException)
         {

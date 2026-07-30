@@ -33,6 +33,7 @@ public sealed class EditorSession(ApiClient api, Action notify)
     public bool ExportBusy { get; private set; }
     public string? ExportJobId { get; private set; }
     public string? ExportError { get; private set; }
+    public bool ExportDone { get; private set; }
     public string? ExportDoneUrl { get; private set; }
 
     public bool CanUndo => _undo.Count > 0;
@@ -46,7 +47,7 @@ public sealed class EditorSession(ApiClient api, Action notify)
 
     // ---- lifecycle ------------------------------------------------------- //
 
-    public async Task LoadAsync(Guid projectId, Guid? clipId)
+    public async Task LoadAsync(Guid projectId, Guid? clipId, double? fallbackDuration = null)
     {
         var token = Guid.NewGuid();
         _loadToken = token;
@@ -59,6 +60,7 @@ public sealed class EditorSession(ApiClient api, Action notify)
         ExportBusy = false;
         ExportJobId = null;
         ExportError = null;
+        ExportDone = false;
         ExportDoneUrl = null;
         Playhead = 0;
         _undo.Clear();
@@ -68,17 +70,20 @@ public sealed class EditorSession(ApiClient api, Action notify)
         {
             var response = await api.GetEditorDocAsync(projectId, clipId);
             if (_loadToken != token) return;
-            Meta = response;
-            Doc = response.Doc;
+            Meta = NormalizeMeta(response, fallbackDuration);
+            Doc = Meta.Doc;
             SaveState = "Saved";
             FitZoom();
         }
-        catch (Exception exception) when (exception is ApiException or HttpRequestException)
+        catch (ApiException exception)
         {
             if (_loadToken != token) return;
-            Error = exception is ApiException apiError
-                ? apiError.UserMessage
-                : "Can't reach the Highlighter API.";
+            Error = exception.UserMessage;
+        }
+        catch (Exception)
+        {
+            if (_loadToken != token) return;
+            Error = "Couldn't load the editor — close it and try again.";
         }
         finally
         {
@@ -90,9 +95,39 @@ public sealed class EditorSession(ApiClient api, Action notify)
         }
     }
 
+    /// <summary>Repair holes that would break timeline math: a missing source
+    /// duration (falls back to what the project page knows), the degenerate
+    /// 0.04s default segment that produces, and out-of-range speeds.</summary>
+    private static EditorDocResponse NormalizeMeta(
+        EditorDocResponse response, double? fallbackDuration)
+    {
+        if (response.SourceDuration <= 0 && fallbackDuration is > 0)
+            response = response with { SourceDuration = fallbackDuration.Value };
+        var doc = response.Doc;
+        var segments = (doc.Segments ?? []).Select(s => s with
+        {
+            Speed = s.Speed is >= 0.5 and <= 2.0 ? s.Speed : 1.0,
+        }).ToList();
+        if (segments.Count == 1 && segments[0].SrcStart == 0 && segments[0].SrcEnd <= 0.05
+            && response.SourceDuration > 0.05)
+            segments = [segments[0] with { SrcEnd = response.SourceDuration }];
+        doc = doc with
+        {
+            Segments = segments,
+            Captions = doc.Captions ?? [],
+            Texts = doc.Texts ?? [],
+            Markers = doc.Markers ?? [],
+            Transform = doc.Transform ?? new EdlTransform(),
+            Audio = doc.Audio ?? new EdlAudio(),
+        };
+        return response with { Doc = doc };
+    }
+
     public void Close()
     {
         _ = FlushSaveAsync();
+        _saveTimer?.Dispose();
+        _saveTimer = null;
         _loadToken = Guid.NewGuid();
     }
 
@@ -188,6 +223,16 @@ public sealed class EditorSession(ApiClient api, Action notify)
         return request;
     }
 
+    /// <summary>Step the playhead in OUTPUT time (frame keys, ◀ ▶). Stepping in
+    /// source time would land inside cut regions, where the playback loop
+    /// bounces the playhead away — output time crosses cuts cleanly.</summary>
+    public void StepOutput(double deltaSeconds)
+    {
+        if (Doc is null || OutputDuration <= 0) return;
+        var target = Math.Clamp(PlayheadOutput + deltaSeconds, 0, Math.Max(0, OutputDuration - 0.02));
+        RequestSeek(OutputToSource(target));
+    }
+
     public void SetPreview(string? url)
     {
         PreviewOverrideUrl = url;
@@ -242,8 +287,10 @@ public sealed class EditorSession(ApiClient api, Action notify)
     public void Undo()
     {
         if (Doc is null || _undo.Count == 0) return;
+        var restored = JsonSerializer.Deserialize<EditorDoc>(_undo[^1], Json);
+        if (restored is null) return;
         _redo.Add(JsonSerializer.Serialize(Doc, Json));
-        Doc = JsonSerializer.Deserialize<EditorDoc>(_undo[^1], Json);
+        Doc = restored;
         _undo.RemoveAt(_undo.Count - 1);
         MarkDirty();
         notify();
@@ -252,8 +299,10 @@ public sealed class EditorSession(ApiClient api, Action notify)
     public void Redo()
     {
         if (Doc is null || _redo.Count == 0) return;
+        var restored = JsonSerializer.Deserialize<EditorDoc>(_redo[^1], Json);
+        if (restored is null) return;
         _undo.Add(JsonSerializer.Serialize(Doc, Json));
-        Doc = JsonSerializer.Deserialize<EditorDoc>(_redo[^1], Json);
+        Doc = restored;
         _redo.RemoveAt(_redo.Count - 1);
         MarkDirty();
         notify();
@@ -305,10 +354,20 @@ public sealed class EditorSession(ApiClient api, Action notify)
         var min = index > 0 ? Doc.Segments[index - 1].SrcEnd : 0;
         var max = index < Doc.Segments.Count - 1
             ? Doc.Segments[index + 1].SrcStart
-            : Meta?.SourceDuration ?? segment.SrcEnd;
-        var updated = leftEdge
-            ? segment with { SrcStart = Math.Clamp(newSourceTime, min, segment.SrcEnd - 0.1) }
-            : segment with { SrcEnd = Math.Clamp(newSourceTime, segment.SrcStart + 0.1, max) };
+            : Math.Max(Meta?.SourceDuration is > 0 and var known ? known : 0, segment.SrcEnd);
+        // Math.Clamp throws when min > max (tiny segments, unknown duration) —
+        // collapse the range instead of tearing the circuit down mid-drag.
+        EdlSegment updated;
+        if (leftEdge)
+        {
+            var hi = Math.Max(min, segment.SrcEnd - 0.1);
+            updated = segment with { SrcStart = Math.Clamp(newSourceTime, Math.Min(min, hi), hi) };
+        }
+        else
+        {
+            var lo = segment.SrcStart + 0.1;
+            updated = segment with { SrcEnd = Math.Clamp(newSourceTime, lo, Math.Max(lo, max)) };
+        }
         Apply(doc => doc with
         {
             Segments = doc.Segments.Select(s => s.Id == id ? updated : s).ToList(),
@@ -345,11 +404,13 @@ public sealed class EditorSession(ApiClient api, Action notify)
     public void AddText(double sourceTime)
     {
         var id = NewId("t");
+        var end = Meta?.SourceDuration is > 0 and var duration
+            ? Math.Min(sourceTime + 2.5, duration)
+            : sourceTime + 2.5;
+        if (end <= sourceTime) end = sourceTime + 0.5; // never an inverted window
         Apply(doc => doc with
         {
-            Texts = doc.Texts.Append(new EdlText(id, sourceTime,
-                Math.Min(sourceTime + 2.5, Meta?.SourceDuration ?? sourceTime + 2.5), "New text", 0.4))
-                .ToList(),
+            Texts = doc.Texts.Append(new EdlText(id, sourceTime, end, "New text", 0.4)).ToList(),
         });
         SelectedId = id;
     }
@@ -449,20 +510,37 @@ public sealed class EditorSession(ApiClient api, Action notify)
     public async Task FlushSaveAsync()
     {
         if (Doc is null || Meta is null || SaveState is "Saved" or "Saving…") return;
+        var token = _loadToken;
+        var clipId = Meta.ClipId;
+        var doc = Doc;
         SaveState = "Saving…";
         notify();
         try
         {
-            var response = await api.SaveEditorDocAsync(ProjectIdOrThrow(), Meta.ClipId, Doc);
+            var response = await api.SaveEditorDocAsync(ProjectIdOrThrow(), clipId, doc);
+            // Another clip may have loaded while the save was in flight — its
+            // state is not ours to touch (the save itself still landed).
+            if (_loadToken != token || Meta is null) return;
             Meta = response with { Doc = Meta.Doc };
             SaveState = "Saved";
         }
-        catch (Exception exception) when (exception is ApiException or HttpRequestException)
+        catch (ApiException exception)
         {
+            if (_loadToken != token) return;
             SaveState = "Save failed";
-            Error = exception is ApiException apiError ? apiError.UserMessage : "API unreachable";
+            Error = exception.UserMessage;
         }
-        notify();
+        catch (Exception)
+        {
+            // Any escape here would wedge SaveState at "Saving…" forever.
+            if (_loadToken != token) return;
+            SaveState = "Save failed";
+            Error = "Couldn't save the edit — it will retry on the next change.";
+        }
+        finally
+        {
+            notify();
+        }
     }
 
     private Guid _projectId;
@@ -476,44 +554,52 @@ public sealed class EditorSession(ApiClient api, Action notify)
     public async Task ExportAsync()
     {
         if (Doc is null || Meta is null || ExportBusy) return;
+        var token = _loadToken;
+        var clipId = Meta.ClipId;
         ExportBusy = true;
         ExportError = null;
+        ExportDone = false;
         ExportDoneUrl = null;
         notify();
         try
         {
-            var job = await api.ExportEditAsync(_projectId, Meta.ClipId, Doc);
+            var job = await api.ExportEditAsync(_projectId, clipId, Doc);
             ExportJobId = job.Id;
             SaveState = "Saved"; // export persists the doc server-side
             notify();
             for (var i = 0; i < 360; i++) // ≤ 30 min
             {
                 await Task.Delay(TimeSpan.FromSeconds(5));
+                if (_loadToken != token) return; // a different cut is open now
                 var state = await api.GetJobAsync(job.Id);
                 if (state.State is "starting" or "running") continue;
                 if (state.State == "succeeded")
                 {
-                    var refreshed = await api.GetEditorDocAsync(_projectId, Meta.ClipId);
+                    var refreshed = await api.GetEditorDocAsync(_projectId, clipId);
+                    if (_loadToken != token) return;
                     Meta = refreshed with { Doc = Doc };
-                    ExportDoneUrl = Meta.ClipId is null ? null : refreshed.Export?.Url;
+                    ExportDone = true;
+                    ExportDoneUrl = clipId is null ? null : refreshed.Export?.Url;
                 }
-                else
+                else if (_loadToken == token)
                 {
-                    ExportError = state.FailureReason ?? $"export {state.State}";
+                    ExportError = "The export didn't finish — try again.";
                 }
                 return;
             }
-            ExportError = "export timed out";
+            if (_loadToken == token) ExportError = "The export timed out — try again.";
         }
-        catch (Exception exception) when (exception is ApiException or HttpRequestException)
+        catch (ApiException exception)
         {
-            ExportError = exception is ApiException apiError
-                ? apiError.UserMessage
-                : "API unreachable";
+            if (_loadToken == token) ExportError = exception.UserMessage;
+        }
+        catch (Exception)
+        {
+            if (_loadToken == token) ExportError = "The export failed — try again.";
         }
         finally
         {
-            ExportBusy = false;
+            if (_loadToken == token) ExportBusy = false;
             notify();
         }
     }

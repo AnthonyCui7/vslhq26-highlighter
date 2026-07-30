@@ -267,7 +267,16 @@ public sealed class EditorRenderer(ILogger<EditorRenderer> log)
         process.Start();
         process.BeginOutputReadLine();
         process.BeginErrorReadLine();
-        await process.WaitForExitAsync(ct);
+        try
+        {
+            await process.WaitForExitAsync(ct);
+        }
+        catch (OperationCanceledException)
+        {
+            // Cancellation only stops the wait — the child must die with it.
+            try { process.Kill(entireProcessTree: true); } catch { /* already gone */ }
+            throw;
+        }
         if (process.ExitCode != 0)
         {
             log.LogError("{Tool} exited {Code}", fileName, process.ExitCode);

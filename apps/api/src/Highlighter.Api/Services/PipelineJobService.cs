@@ -14,6 +14,8 @@ namespace Highlighter.Api.Services;
 public sealed class PipelineJobService(RepoLayout layout, SupabaseDb db, ILogger<PipelineJobService> log)
 {
     private const int MaxTerminalJobs = 200;
+    // A single demo machine can't survive unbounded parallel ffmpeg/yt-dlp work.
+    private const int MaxConcurrentJobs = 6;
     private static readonly TimeSpan ForceKillGrace = TimeSpan.FromSeconds(15);
 
     private readonly object _gate = new();
@@ -39,7 +41,8 @@ public sealed class PipelineJobService(RepoLayout layout, SupabaseDb db, ILogger
 
     /// <summary>id may be preassigned (POST /api/projects writes it into the row's
     /// instance_id before the row exists, so it must be known up front).</summary>
-    public PipelineJob Start(string kind, Guid? projectId, IReadOnlyList<string> workerArgs, string? id = null)
+    public PipelineJob Start(string kind, Guid? projectId, IReadOnlyList<string> workerArgs,
+        string? id = null, Guid? ownerId = null)
     {
         var command = layout.ResolveWorkerCommand()
             ?? throw new WorkerUnavailableException(
@@ -52,7 +55,8 @@ public sealed class PipelineJobService(RepoLayout layout, SupabaseDb db, ILogger
         display.AddRange(workerArgs);
         var logName = $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{kind}"
             + $"-{(projectId is { } p ? p.ToString()[..8] : "global")}-{id}.log";
-        var job = new PipelineJob(id, kind, projectId, display, Path.Combine(layout.JobLogRoot, logName));
+        var job = new PipelineJob(id, kind, projectId, display,
+            Path.Combine(layout.JobLogRoot, logName), ownerId);
 
         lock (_gate)
         {
@@ -61,6 +65,7 @@ public sealed class PipelineJobService(RepoLayout layout, SupabaseDb db, ILogger
                     $"Project {pid} already has an active job ({blocker.Id}: {blocker.Kind}).");
             if (kind == "cleanup" && _order.Any(other => other.Kind == "cleanup" && !other.IsTerminal))
                 throw new JobConflictException("A cleanup drain is already running.");
+            EnsureCapacityLocked();
             _jobs[id] = job;
             _order.Add(job);
         }
@@ -85,19 +90,24 @@ public sealed class PipelineJobService(RepoLayout layout, SupabaseDb db, ILogger
     /// rules, and durable log file as worker jobs, but the work runs in-process.
     /// The body returns an exit code; an exception marks the job failed.</summary>
     public PipelineJob StartExternal(string kind, Guid? projectId,
-        IReadOnlyList<string> displayArgv, Func<PipelineJob, CancellationToken, Task<int>> body)
+        IReadOnlyList<string> displayArgv, Func<PipelineJob, CancellationToken, Task<int>> body,
+        Guid? ownerId = null)
     {
         var id = NewJobId();
         var logName = $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{kind}"
             + $"-{(projectId is { } p ? p.ToString()[..8] : "global")}-{id}.log";
         var job = new PipelineJob(id, kind, projectId, displayArgv,
-            Path.Combine(layout.JobLogRoot, logName));
+            Path.Combine(layout.JobLogRoot, logName), ownerId);
+        // In-process jobs have no OS process; force-cancel cancels this token.
+        var cts = new CancellationTokenSource();
+        job.ExternalCts = cts;
 
         lock (_gate)
         {
             if (projectId is { } pid && ActiveForProjectLocked(pid) is { } blocker)
                 throw new JobConflictException(
                     $"Project {pid} already has an active job ({blocker.Id}: {blocker.Kind}).");
+            EnsureCapacityLocked();
             _jobs[id] = job;
             _order.Add(job);
         }
@@ -115,10 +125,16 @@ public sealed class PipelineJobService(RepoLayout layout, SupabaseDb db, ILogger
         {
             try
             {
-                var exitCode = await body(job, CancellationToken.None);
+                var exitCode = await body(job, cts.Token);
                 job.MarkExited(exitCode, null);
                 log.LogInformation("Job {JobId} ({Kind}) finished: {State} (exit {Exit})",
                     id, kind, job.State, exitCode);
+            }
+            catch (OperationCanceledException) when (job.KillRequested)
+            {
+                job.Append("api", "job cancelled by force-cancel");
+                job.MarkExited(-1, null); // KillRequested makes this land as 'killed'
+                log.LogInformation("Job {JobId} ({Kind}) cancelled by force-cancel", id, kind);
             }
             catch (Exception exception)
             {
@@ -129,6 +145,7 @@ public sealed class PipelineJobService(RepoLayout layout, SupabaseDb db, ILogger
             }
             finally
             {
+                cts.Dispose();
                 Evict();
             }
         });
@@ -140,11 +157,12 @@ public sealed class PipelineJobService(RepoLayout layout, SupabaseDb db, ILogger
         lock (_gate) return _jobs.GetValueOrDefault(id);
     }
 
-    public List<JobDto> List(string? state, Guid? projectId)
+    public List<JobDto> List(string? state, Guid? projectId, Guid? userId = null)
     {
         List<PipelineJob> jobs;
         lock (_gate) jobs = _order.AsEnumerable().Reverse().ToList();
         return jobs
+            .Where(job => job.VisibleTo(userId))
             .Where(job => projectId is null || job.ProjectId == projectId)
             .Select(job => job.ToDto())
             .Where(dto => state is null || dto.State == state)
@@ -164,13 +182,30 @@ public sealed class PipelineJobService(RepoLayout layout, SupabaseDb db, ILogger
     /// when there is no live process to signal.</summary>
     public async Task<bool> ForceKillAsync(PipelineJob job)
     {
+        job.RequestKill();
         Process? process;
+        CancellationTokenSource? externalCts;
         lock (_gate)
         {
-            job.KillRequested = true;
             process = job.Process;
+            externalCts = job.ExternalCts;
         }
-        if (process is null) return false;
+        if (process is null)
+        {
+            // In-process job (editor export): cancel its token — the renderer
+            // kills its ffmpeg child on cancellation.
+            if (externalCts is null || job.IsTerminal) return false;
+            job.Append("api", "force-cancel: cancelling in-process job");
+            try
+            {
+                externalCts.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                return false;
+            }
+            return true;
+        }
         try
         {
             if (process.HasExited) return false;
@@ -231,14 +266,26 @@ public sealed class PipelineJobService(RepoLayout layout, SupabaseDb db, ILogger
     /// into its name.</summary>
     public List<JobLogLineDto>? ReadLogFileTail(string jobId, int tail)
     {
+        // The id comes straight off the route and lands in a filesystem glob —
+        // accept only the exact shape NewJobId produces.
+        if (!System.Text.RegularExpressions.Regex.IsMatch(jobId, "^job_[0-9a-f]{12}$"))
+            return null;
         if (!Directory.Exists(layout.JobLogRoot)) return null;
         var path = Directory.EnumerateFiles(layout.JobLogRoot, $"*-{jobId}.log").FirstOrDefault();
         if (path is null) return null;
-        var lines = File.ReadAllLines(path);
-        var start = Math.Max(0, lines.Length - tail);
+        // Stream the file instead of loading it whole — ingest logs get large.
+        var window = new Queue<string>(tail);
+        var total = 0L;
+        foreach (var line in File.ReadLines(path))
+        {
+            total++;
+            if (window.Count == tail) window.Dequeue();
+            window.Enqueue(line);
+        }
         var result = new List<JobLogLineDto>();
-        for (var i = start; i < lines.Length; i++)
-            result.Add(ParseLogLine(lines[i], i + 1));
+        var seq = total - window.Count;
+        foreach (var line in window)
+            result.Add(ParseLogLine(line, ++seq));
         return result;
     }
 
@@ -274,6 +321,14 @@ public sealed class PipelineJobService(RepoLayout layout, SupabaseDb db, ILogger
 
     private PipelineJob? ActiveForProjectLocked(Guid projectId) =>
         _order.LastOrDefault(job => job.ProjectId == projectId && !job.IsTerminal);
+
+    private void EnsureCapacityLocked()
+    {
+        if (_order.Count(job => !job.IsTerminal) >= MaxConcurrentJobs)
+            throw new JobConflictException(
+                $"The server is already running {MaxConcurrentJobs} jobs; "
+                + "wait for one to finish and try again.");
+    }
 
     private void Launch(PipelineJob job, WorkerCommand command, IReadOnlyList<string> workerArgs)
     {

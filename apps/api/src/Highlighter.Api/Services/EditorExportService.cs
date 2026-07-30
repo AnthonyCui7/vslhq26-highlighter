@@ -19,16 +19,18 @@ public sealed class EditorExportService(
 {
     public const string HttpClientName = "media-download";
 
-    public PipelineJob StartClipExport(Guid projectId, ClipDto clip, EditorDoc doc) =>
+    public PipelineJob StartClipExport(Guid projectId, ClipDto clip, EditorDoc doc,
+        Guid? ownerId = null) =>
         jobs.StartExternal("editor-export", projectId,
             ["editor-export", "clip", clip.Id.ToString()],
-            (job, ct) => RunClipExportAsync(job, projectId, clip, doc, ct));
+            (job, ct) => RunClipExportAsync(job, projectId, clip, doc, ct), ownerId);
 
-    public PipelineJob StartLongformExport(Guid projectId, JsonObject editRow, EditorDoc doc) =>
+    public PipelineJob StartLongformExport(Guid projectId, JsonObject editRow, EditorDoc doc,
+        Guid? ownerId = null) =>
         jobs.StartExternal("editor-export", projectId,
             ["editor-export", "longform",
              $"v{(int)(editRow["version"]?.GetValue<double>() ?? 1)}"],
-            (job, ct) => RunLongformExportAsync(job, projectId, editRow, doc, ct));
+            (job, ct) => RunLongformExportAsync(job, projectId, editRow, doc, ct), ownerId);
 
     // ---- clip ------------------------------------------------------------ //
 

@@ -21,9 +21,10 @@ public static class Proc
 
     /// <summary>subprocess.run(command, capture_output=True, text=True[, timeout=...]).
     /// A timeout kills the process tree and throws TimeoutException (the port of
-    /// subprocess.TimeoutExpired).</summary>
+    /// subprocess.TimeoutExpired). Defaults to 30 minutes so a wedged subprocess
+    /// can never hang the worker forever; pass null for no timeout.</summary>
     public static (int Code, string Stdout, string Stderr) Run(
-        IReadOnlyList<string> command, double? timeoutSeconds = null)
+        IReadOnlyList<string> command, double? timeoutSeconds = 1800)
     {
         using var process = Process.Start(StartInfo(command))
             ?? throw new PipelineError($"Could not start {command[0]}");

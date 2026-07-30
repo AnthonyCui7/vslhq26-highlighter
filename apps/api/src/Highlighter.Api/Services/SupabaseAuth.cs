@@ -113,16 +113,20 @@ public sealed class SupabaseAuth
         var user = body["user"] as JsonObject
             ?? throw new AuthFlowException(502, "Supabase auth request failed",
                 "GoTrue returned a session without a user object");
+        var accessToken = body["access_token"]?.GetValue<string>();
+        var refreshToken = body["refresh_token"]?.GetValue<string>();
+        if (string.IsNullOrEmpty(accessToken) || string.IsNullOrEmpty(refreshToken)
+            || !Guid.TryParse(user["id"]?.GetValue<string>(), out var userId))
+            throw new AuthFlowException(502, "Supabase auth request failed",
+                "GoTrue returned an incomplete session");
         var expiresAt = body["expires_at"]?.GetValue<long>() is { } unix
             ? DateTimeOffset.FromUnixTimeSeconds(unix)
             : DateTimeOffset.UtcNow.AddSeconds(body["expires_in"]?.GetValue<double>() ?? 3600);
         return new AuthSessionDto(
-            body["access_token"]!.GetValue<string>(),
-            body["refresh_token"]!.GetValue<string>(),
+            accessToken,
+            refreshToken,
             expiresAt,
-            new AuthUserDto(
-                Guid.Parse(user["id"]!.GetValue<string>()),
-                user["email"]?.GetValue<string>() ?? ""));
+            new AuthUserDto(userId, user["email"]?.GetValue<string>() ?? ""));
     }
 
     private sealed record GoTrueResponse(int Status, bool Success, JsonObject? Body,
