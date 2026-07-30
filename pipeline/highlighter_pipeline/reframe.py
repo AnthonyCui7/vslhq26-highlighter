@@ -4,8 +4,9 @@ One framing call per clip decides where the sharp region sits: the model sees
 frames sampled every few seconds (plus one just after each scene cut, and the
 clip's opening frame), the scene-cut timings, and the clip's editorial
 context, and returns a small set of horizontal crop centers — a starting
-framing, then a new center whenever the speaker or action moves. Spans that cannot be cropped honestly (side-by-side
-call layouts, wide action) are flagged wide and show the whole 16:9 frame
+framing, then a new center whenever the speaker or action moves. Spans whose
+information doesn't fit a square (split layouts, a board or screen beside a
+speaker, wide action) are flagged wide and show the whole 16:9 frame
 fitted to the canvas width instead. Rendering is deterministic: a full-height
 square crop at those centers (or the fitted wide frame) fills the width of a
 720x1280 canvas, with a blurred, darkened zoom-fill of the same frame above
@@ -43,32 +44,31 @@ REFRAME_REASONING_EFFORT = "low"
 
 REFRAME_SYSTEM_PROMPT = """You are the framing director converting a 16:9 highlight clip into a vertical
 short. The vertical canvas shows a full-height square crop of the source at
-full canvas width; a blurred fill covers the rest. Your only decision is where
-that square sits horizontally over time.
+full canvas width; a blurred fill covers the rest. Spans flagged wide show the
+whole 16:9 frame fitted to the canvas width instead — plenty of short-form
+video runs 16:9 inside a vertical canvas. Your decision, over time, is where
+the square sits — or that a span stays wide.
 
 You get frames sampled every few seconds and just after each shot change (each
 labeled with its timestamp in seconds from the start of the clip), the clip's
-scene-cut timings, and editorial context about what happens in it. Return crop keyframes: a starting center_x
-at 0 seconds, then a new keyframe ONLY when the subject clearly sits somewhere
-else in the frame — typically because the shot changed. center_x is the
+scene-cut timings, and editorial context about what happens in it. Return crop
+keyframes: a starting keyframe at 0 seconds, then a new one ONLY when the
+framing should change — typically because the shot changed. center_x is the
 horizontal center of the square as a fraction of the source width (0 = left
 edge, 0.5 = middle, 1 = right edge).
 
-Some shots cannot be cropped honestly: side-by-side call layouts with rapid
-back-and-forth dialogue, wide action involving several people at once, or
-graphics spanning the full frame. For those spans set wide to true — the whole
-16:9 frame is shown fitted to the canvas width instead of a crop. Wide is the
-honest fallback, not the default: use it when cropping would either lose the
-conversation or force constant jumping between speakers.
-
 Rules:
-- Frame what a viewer should watch: the person speaking over the person
-  listening, faces over bodies, the action over the scenery.
+- Frame the story, not just the face. When a board, screen, gameplay, chart,
+  or demo carries the moment, it belongs in frame: crop to it, or go wide when
+  it and the speaker cannot share one square.
+- Crop only when a square genuinely holds everything that matters for the
+  span — one talking head, one clear subject. If the frame's information does
+  not fit a square (side-by-side layouts, a speaker plus what they are
+  reacting to, wide action, full-frame graphics), keep the span wide. When in
+  doubt, wide beats a crop that hides what the clip is about.
 - Framing is static between keyframes and jumps at each keyframe. Never try to
   track or slide — a few well-placed static framings beat many small moves.
-- Add a keyframe only when staying put would leave the subject out of frame or
-  clearly off-center. When one framing covers the whole clip, return just the
-  starting keyframe.
+  When one framing covers the whole clip, return just the starting keyframe.
 - Keyframes belong on shot changes (the scene-cut timings) unless the subject
   clearly moves within a shot.
 - Prefer one wide span over rapid crop-jumping between two speakers trading
@@ -98,7 +98,7 @@ REFRAME_RESPONSE_SCHEMA: dict[str, Any] = {
                     },
                     "wide": {
                         "type": "boolean",
-                        "description": "True when this span cannot be cropped honestly: show the whole 16:9 frame fitted to the canvas width instead.",
+                        "description": "True when this span shows the whole 16:9 frame fitted to the canvas width — the right call whenever the frame's information does not fit one square.",
                     },
                 },
                 "required": ["start_seconds", "center_x", "wide"],

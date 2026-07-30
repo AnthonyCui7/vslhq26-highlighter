@@ -168,36 +168,23 @@ public static class Editor
 
     private static JsonObject RequestEdit(ChatProvider provider, string userPrompt)
     {
-        var body = new JsonObject
-        {
-            ["messages"] = new JsonArray
+        var content = Agents.RunAgentText(
+            provider,
+            instructions: EDITOR_SYSTEM_PROMPT,
+            prompt: userPrompt,
+            timeoutSeconds: 300.0,
+            extraOptions: new JsonObject
             {
-                new JsonObject { ["role"] = "system", ["content"] = EDITOR_SYSTEM_PROMPT },
-                new JsonObject { ["role"] = "user", ["content"] = userPrompt },
-            },
-            ["response_format"] = new JsonObject
-            {
-                ["type"] = "json_schema",
-                ["json_schema"] = new JsonObject
+                ["response_format"] = new JsonObject
                 {
-                    ["name"] = "longform_edit",
-                    ["schema"] = EditResponseSchema(),
+                    ["type"] = "json_schema",
+                    ["json_schema"] = new JsonObject
+                    {
+                        ["name"] = "longform_edit",
+                        ["schema"] = EditResponseSchema(),
+                    },
                 },
-            },
-        };
-        provider.ApplyRequestOptions(body);
-
-        JsonObject response;
-        using (var client = provider.Client(timeoutSeconds: 300.0))
-        {
-            response = client.ChatCompletions(body);
-        }
-
-        if (response["choices"] is not JsonArray choices || choices.Count == 0)
-            throw new PipelineError($"{provider.Label} editor response did not include choices");
-        var content = JsonUtil.StrOrNull(choices[0]?["message"]?["content"]);
-        if (string.IsNullOrEmpty(content))
-            throw new PipelineError($"{provider.Label} editor response did not include text content");
+            });
         return Llm.JsonFromText(content);
     }
 
@@ -225,9 +212,9 @@ public static class Editor
     {
         var candidateMinutes = candidates.Sum(c =>
             JsonUtil.Double(c["end_seconds"]) - JsonUtil.Double(c["start_seconds"])) / 60;
-        var target = string.IsNullOrEmpty(targetLength)
-            ? Defaults.DEFAULT_TARGET_LENGTH_MINUTES
-            : targetLength;
+        var target = Llm.CapTargetMinutes(
+            string.IsNullOrEmpty(targetLength) ? Defaults.DEFAULT_TARGET_LENGTH_MINUTES : targetLength,
+            sourceMinutes);
         var arithmetic = new JsonObject
         {
             ["source_minutes"] = Py.Round(sourceMinutes, 1),

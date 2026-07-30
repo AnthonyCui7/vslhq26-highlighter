@@ -13,7 +13,7 @@
                 <div class="cursor-pointer px-[9px] py-1 text-[12.5px] leading-none text-muted hover:bg-elevate hover:text-fg">↺</div>
                 <div class="cursor-pointer border-l border-line2 px-[9px] py-1 text-[12.5px] leading-none text-muted hover:bg-elevate hover:text-fg">↻</div>
             </div>
-            <div class="cursor-pointer rounded-[5px] border border-line2 px-2.5 py-[5px] font-mono text-[11.5px] text-muted hover:text-fg">1080 × 1920 ▾</div>
+            <div class="cursor-pointer rounded-[5px] border border-line2 px-2.5 py-[5px] font-mono text-[11.5px] text-muted hover:text-fg">@FormatChip</div>
             <div class="cursor-pointer rounded-[5px] border border-line2 px-3 py-[5px] text-[12.5px] text-soft hover:border-[#4A4638] hover:text-fg active:scale-[0.98]">Export</div>
             <div class="cursor-pointer rounded-[5px] bg-accent px-[13px] py-[5px] text-[12.5px] font-bold text-ink hover:bg-accent-soft active:scale-95">Publish</div>
         </div>
@@ -28,3 +28,12 @@
 
     <TimelinePanel />
 </div>
+
+@code {
+    string FormatChip => S.ClipFormat switch
+    {
+        "square" => "1080 × 1080 ▾",
+        "wide" => "1920 × 1080 ▾",
+        _ => "1080 × 1920 ▾",
+    };
+}

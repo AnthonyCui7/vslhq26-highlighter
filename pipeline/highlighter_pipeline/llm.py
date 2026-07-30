@@ -274,9 +274,26 @@ def parse_target_minutes(target: str | None) -> tuple[float, float] | None:
     return None
 
 
+def cap_target_minutes(target: str | None, source_minutes: float | None) -> str | None:
+    """Clamp a target-runtime string to what the source actually has: an edit
+    cannot run longer than its footage. Unparseable targets and unknown source
+    lengths (livestreams) pass through unchanged."""
+    bounds = parse_target_minutes(target)
+    if not bounds or not source_minutes or source_minutes <= 0:
+        return target
+    low, high = bounds
+    if high <= source_minutes:
+        return target
+    capped = round(source_minutes, 1)
+    if low >= source_minutes:
+        return f"{capped:g}"
+    return f"{low:g}-{capped:g}"
+
+
 def _budget_calibration(target: str, source_minutes: float | None) -> str:
     """Precomputed keep-rate sentence for the long-form prompt; empty when the
     source length is unknown (livestreams) or the target does not parse."""
+    target = cap_target_minutes(target, source_minutes) or target
     bounds = parse_target_minutes(target)
     if not bounds or not source_minutes or source_minutes <= 0:
         return ""

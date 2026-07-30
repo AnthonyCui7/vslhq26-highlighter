@@ -228,35 +228,23 @@ public static class Research
     private static JsonObject RequestAzureResearch(
         ChatProvider provider, string prompt, string systemPrompt, JsonObject schema)
     {
-        var body = new JsonObject
-        {
-            ["messages"] = new JsonArray
+        var content = Agents.RunAgentText(
+            provider,
+            instructions: systemPrompt,
+            prompt: prompt,
+            timeoutSeconds: 300.0,
+            extraOptions: new JsonObject
             {
-                new JsonObject { ["role"] = "system", ["content"] = systemPrompt },
-                new JsonObject { ["role"] = "user", ["content"] = prompt },
-            },
-            ["response_format"] = new JsonObject
-            {
-                ["type"] = "json_schema",
-                ["json_schema"] = new JsonObject
+                ["response_format"] = new JsonObject
                 {
-                    ["name"] = "content_research",
-                    ["schema"] = schema,
+                    ["type"] = "json_schema",
+                    ["json_schema"] = new JsonObject
+                    {
+                        ["name"] = "content_research",
+                        ["schema"] = schema,
+                    },
                 },
-            },
-        };
-        provider.ApplyRequestOptions(body);
-
-        JsonObject response;
-        using (var client = provider.Client(timeoutSeconds: 300.0))
-        {
-            response = client.ChatCompletions(body);
-        }
-        var content = response["choices"] is JsonArray choices && choices.Count > 0
-            ? JsonUtil.StrOrNull(choices[0]?["message"]?["content"])
-            : null;
-        if (string.IsNullOrEmpty(content))
-            throw new PipelineError($"{provider.Label} research response did not include content");
+            });
         var context = JsonFromText(content) as JsonObject
             ?? throw new PipelineError($"{provider.Label} research response was not a JSON object");
         if (!context.ContainsKey("sources")) context["sources"] = new JsonArray();
@@ -269,42 +257,32 @@ public static class Research
         if (string.IsNullOrEmpty(apiKey))
             throw new PipelineError("OPENROUTER_API_KEY is required for content research");
 
-        var body = new JsonObject
-        {
-            ["model"] = model,
-            ["messages"] = new JsonArray
+        var provider = new ChatProvider(
+            Name: "openrouter",
+            Label: $"Web-grounded research ({model})",
+            BaseUrl: Providers.OPENROUTER_BASE_URL,
+            ApiKey: apiKey,
+            Model: model,
+            Temperature: 0.3,
+            SupportsJsonSchema: true,
+            ExtraBody: new JsonObject
             {
-                new JsonObject { ["role"] = "system", ["content"] = systemPrompt },
-                new JsonObject { ["role"] = "user", ["content"] = prompt },
+                ["plugins"] = new JsonArray
+                {
+                    new JsonObject { ["id"] = "web", ["max_results"] = 5 },
+                },
             },
-            ["temperature"] = 0.3,
-            ["max_tokens"] = 8000,
-            ["plugins"] = new JsonArray
+            DefaultHeaders: new Dictionary<string, string>
             {
-                new JsonObject { ["id"] = "web", ["max_results"] = 5 },
-            },
-        };
-
-        JsonObject response;
-        using (var client = new ChatCompletionsClient(
-                   Providers.OPENROUTER_BASE_URL,
-                   apiKey,
-                   timeoutSeconds: 300.0,
-                   headers: new Dictionary<string, string>
-                   {
-                       ["HTTP-Referer"] = "http://localhost",
-                       ["X-OpenRouter-Title"] = "highlighter research",
-                   }))
-        {
-            response = client.ChatCompletions(body);
-        }
-
-        if (response["choices"] is not JsonArray choices || choices.Count == 0)
-            throw new PipelineError("Research response did not include choices");
-        var content = JsonUtil.StrOrNull(choices[0]?["message"]?["content"]);
-        if (string.IsNullOrEmpty(content))
-            throw new PipelineError("Research response did not include text content");
-
+                ["HTTP-Referer"] = "http://localhost",
+                ["X-OpenRouter-Title"] = "highlighter research",
+            });
+        var content = Agents.RunAgentText(
+            provider,
+            instructions: systemPrompt,
+            prompt: prompt,
+            timeoutSeconds: 300.0,
+            extraOptions: new JsonObject { ["max_tokens"] = 8000 });
         var context = JsonFromText(content) as JsonObject
             ?? throw new PipelineError("Research response was not a JSON object");
         if (!context.ContainsKey("sources")) context["sources"] = new JsonArray();

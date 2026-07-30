@@ -4,7 +4,7 @@ from highlighter_pipeline.editor import (
     _cap_candidates,
     _validate_selections,
 )
-from highlighter_pipeline.llm import parse_target_minutes
+from highlighter_pipeline.llm import cap_target_minutes, parse_target_minutes
 
 
 def candidate(start, end, score=0.5, title="t"):
@@ -48,6 +48,28 @@ class TestParseTargetMinutes:
 
     def test_inverted_range_rejected(self):
         assert parse_target_minutes("15-7") is None
+
+
+class TestCapTargetMinutes:
+    def test_range_capped_to_source(self):
+        assert cap_target_minutes("7-15", 4.5) == "4.5"
+
+    def test_range_partially_capped(self):
+        assert cap_target_minutes("7-15", 10.0) == "7-10"
+
+    def test_source_covers_range(self):
+        assert cap_target_minutes("7-15", 40.0) == "7-15"
+
+    def test_single_number_capped(self):
+        assert cap_target_minutes("10", 4.5) == "4.5"
+
+    def test_unknown_source_passes_through(self):
+        assert cap_target_minutes("7-15", None) == "7-15"
+        assert cap_target_minutes("7-15", 0) == "7-15"
+
+    def test_unparseable_target_passes_through(self):
+        assert cap_target_minutes("abc", 4.5) == "abc"
+        assert cap_target_minutes(None, 4.5) is None
 
 
 class TestValidateSelections:

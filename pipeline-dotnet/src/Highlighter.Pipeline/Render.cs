@@ -213,6 +213,35 @@ public static class Render
         });
     }
 
+    /// <summary>The container's first timestamp in seconds, or null when
+    /// unreadable. Archive segments keep the capture run's continuous
+    /// timeline, so this is a segment's measured position — the difference
+    /// from the first segment's value places it on the same clock the
+    /// transcript chunks use.</summary>
+    public static double? ProbeStartTime(string path)
+    {
+        var (code, stdout, _) = Proc.Run(new[]
+        {
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=start_time",
+            "-of",
+            "csv=p=0",
+            path,
+        });
+        if (code != 0)
+            return null;
+        return double.TryParse(
+            stdout.Trim(),
+            System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture,
+            out var value)
+            ? value
+            : null;
+    }
+
     private static void ValidateWindow(double startSeconds, double endSeconds)
     {
         if (endSeconds <= startSeconds)

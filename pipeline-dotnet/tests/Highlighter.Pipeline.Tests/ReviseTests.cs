@@ -336,3 +336,45 @@ public class ReviseTests : IDisposable
         }
     }
 }
+
+public class InheritedRenderTests
+{
+    [Fact]
+    public void NewestVersionWithArtifactsWins()
+    {
+        var rows = new List<JsonObject>
+        {
+            JsonUtil.ParseObject(
+                """{"version":1,"metadata":{"render":{"title":"Old Title","thumbnails":{"variants":[{"index":1,"url":"https://v1/1.png"}],"selected_index":0}}}}"""),
+            JsonUtil.ParseObject("""{"version":2,"metadata":{"render":{"title":"New Title"}}}"""),
+        };
+        var inherited = Revise.InheritedRender(rows);
+        Assert.Equal("New Title", JsonUtil.Str(inherited["title"]));
+        var variants = (JsonArray)((JsonObject)inherited["thumbnails"]!)["variants"]!;
+        Assert.Equal("https://v1/1.png", JsonUtil.Str(((JsonObject)variants[0]!)["url"]));
+    }
+
+    [Fact]
+    public void EmptyRowsInheritNothing()
+    {
+        Assert.Empty(Revise.InheritedRender(new List<JsonObject>()));
+        Assert.Empty(Revise.InheritedRender(new List<JsonObject>
+        {
+            JsonUtil.ParseObject("""{"version":1,"metadata":{"render":{}}}"""),
+        }));
+    }
+
+    [Fact]
+    public void SelectedVariantUrlResolvesAndRejects()
+    {
+        var thumbs = JsonUtil.ParseObject(
+            """{"variants":[{"url":"https://a"},{"url":"https://b"}],"selected_index":1}""");
+        Assert.Equal("https://b", Revise.SelectedVariantUrl(thumbs));
+        Assert.Null(Revise.SelectedVariantUrl(
+            JsonUtil.ParseObject("""{"variants":[{"url":"https://a"}]}""")));
+        Assert.Null(Revise.SelectedVariantUrl(
+            JsonUtil.ParseObject("""{"variants":[],"selected_index":0}""")));
+        Assert.Null(Revise.SelectedVariantUrl(
+            JsonUtil.ParseObject("""{"variants":[{}],"selected_index":0}""")));
+    }
+}

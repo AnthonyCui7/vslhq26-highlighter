@@ -51,6 +51,18 @@ highlighter-publish <project-id> longform --platforms youtube,x --thumbnail 2
 highlighter-publish <project-id> clip_00003_10000_20500_short.mp4 --platforms tiktok,instagram
 ```
 
+After a run, three verbs keep working the finished project: regenerate
+long-form thumbnails with human guidance (or just switch the selection),
+rerun the content research, and add a square 1:1 center-crop render
+(optionally captioned) to a clip's media set:
+
+```bash
+highlighter-thumbnails <project-id> --prompt "lean into the reunion emotion"
+highlighter-thumbnails <project-id> --select 2
+highlighter-research <project-id> --mode long --focus "what retains viewers here"
+highlighter-reformat <project-id> clip_00003_10000_20500_short.mp4 --captions
+```
+
 Burned captions use the `pycaps` CLI (not on PyPI; runs auto-skip with a log
 line when it's missing):
 
@@ -77,6 +89,10 @@ Key modules:
   `AZURE_OPENAI_EDIT_DEPLOYMENT`/`AZURE_OPENAI_AUDIO_DEPLOYMENT`. Reasoning
   deployments run at the highest effort their family accepts
   (`AZURE_REASONING_EFFORT` to override).
+- `agents.py` — Microsoft Agent Framework orchestration over those providers:
+  research, pass 2, thumbnail concepts, and the revision loop run as
+  framework agents (sessions plus framework-run function-invocation loops)
+  through a pipeline chat client that keeps the exact request wire format.
 - `llm.py` — clip-candidate detection over transcript + audio.
 - `shots.py` — TransNetV2 shot-boundary detection per segment: scene cuts feed
   the editor prompts and snap final clip boundaries to the source's own edit
@@ -84,13 +100,19 @@ Key modules:
   (auto-skips with a log line when missing).
 - `editor.py` — long-form pass 2: one global editor call makes the final cut
   from every pass-1 candidate, with keep-rate arithmetic precomputed in minutes.
-- `revise.py` — long-form revision loop: a tool-calling editor agent with
+- `revise.py` — long-form revision loop: an Agent Framework editor agent with
   access to the transcript, audio, scene cuts, and research; reruns pipeline
   stages on demand and assembles each new version from existing renders (or
-  fresh source fetches) into a `longform_edits` row.
+  fresh source fetches) into a `longform_edits` row. New versions inherit the
+  newest generated thumbnails and title — a re-cut keeps what it doesn't
+  touch.
 - `reframe.py` — short-form auto-reframe: one framing call per clip (frames
   sampled every 5s plus one after each scene cut; `--reframe-interval`) picks
-  the horizontal crop centers; ffmpeg renders the blur-pad 9:16 vertical.
+  the horizontal crop centers — or keeps a span wide when the frame's
+  information doesn't fit a square (boards, screens, split layouts); ffmpeg
+  renders the blur-pad 9:16 vertical either way.
+- `reformat.py` — square 1:1 center-crop renders for finished clips
+  (`highlighter-reformat`), optionally with the same burned captions.
 - `captions.py` — burned captions on the verticals: the chunk word timings are
   reshaped into Whisper's JSON and handed to the pycaps CLI, which renders a
   captioned copy next to each clean vertical (`clips.captioned_url`).

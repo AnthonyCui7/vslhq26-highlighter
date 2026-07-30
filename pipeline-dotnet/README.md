@@ -19,7 +19,10 @@ External dependencies stay identical to the Python pipeline: `ffmpeg`/`ffprobe`,
 `yt-dlp`, `streamlink` on PATH; Azure AI Speech and the Azure OpenAI
 deployments in the same per-role model layer, Supabase, and optionally S3 via
 the same env vars (the monorepo root `.env` is discovered by walking up from
-the working directory, exactly like the Python `load_env`).
+the working directory, exactly like the Python `load_env`). The research,
+final-cut, thumbnail, and revision layers run as Microsoft Agent Framework
+agents (`Microsoft.Agents.AI`, mirroring the Python `agent-framework-core`
+integration) over the same providers.
 
 ## Build & run
 
@@ -31,14 +34,17 @@ dotnet run --project src/Highlighter.Cli -- revise <project-id> "tighten the mid
 
 Subcommands mirror the Python console scripts one-to-one:
 
-| Python entry point    | C# equivalent            |
-|-----------------------|--------------------------|
-| `highlighter-ingest`  | `highlighter ingest`     |
-| `highlighter-revise`  | `highlighter revise`     |
-| `highlighter-publish` | `highlighter publish`    |
-| `highlighter-reclip`  | `highlighter reclip`     |
-| `highlighter-cleanup` | `highlighter cleanup`    |
-| `highlighter-db-smoke`| `highlighter db-smoke`   |
+| Python entry point       | C# equivalent            |
+|--------------------------|--------------------------|
+| `highlighter-ingest`     | `highlighter ingest`     |
+| `highlighter-revise`     | `highlighter revise`     |
+| `highlighter-publish`    | `highlighter publish`    |
+| `highlighter-thumbnails` | `highlighter thumbnails` |
+| `highlighter-research`   | `highlighter research`   |
+| `highlighter-reformat`   | `highlighter reformat`   |
+| `highlighter-reclip`     | `highlighter reclip`     |
+| `highlighter-cleanup`    | `highlighter cleanup`    |
+| `highlighter-db-smoke`   | `highlighter db-smoke`   |
 
 External tools match the Python pipeline too: burned captions shell out to the
 same `pycaps` CLI and auto-skip with a log line when it isn't installed.

@@ -31,9 +31,18 @@ from .defaults import (
     DEFAULT_SUPABASE_CLIPS_BUCKET,
     DEFAULT_TARGET_LENGTH_MINUTES,
 )
+from agent_framework import Agent, AgentSession, FunctionTool
+
+from .agents import (
+    PipelineChatClient,
+    raw_parts_message,
+    text_message,
+    tool_result_with_audio,
+)
 from .llm import (
     _encode_audio_context_mp3,
     _timestamp_markers,
+    cap_target_minutes,
     detect_clip_candidates,
 )
 from .providers import Provider, audio_providers
@@ -306,6 +315,31 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
+def _inherited_render(longform_edits: list[dict[str, Any]]) -> dict[str, Any]:
+    """The newest version's generated thumbnails and title, for carrying into
+    the next version's row."""
+    inherited: dict[str, Any] = {}
+    for row in sorted(longform_edits, key=lambda r: r.get("version") or 0, reverse=True):
+        render = (row.get("metadata") or {}).get("render") or {}
+        if "title" not in inherited and render.get("title"):
+            inherited["title"] = render["title"]
+        thumbnails = render.get("thumbnails") or {}
+        if "thumbnails" not in inherited and thumbnails.get("variants"):
+            inherited["thumbnails"] = thumbnails
+        if "title" in inherited and "thumbnails" in inherited:
+            break
+    return inherited
+
+
+def _selected_variant_url(thumbnails: dict[str, Any]) -> str | None:
+    """The hosted URL of the selected thumbnail variant, if it has one."""
+    variants = thumbnails.get("variants") or []
+    index = thumbnails.get("selected_index")
+    if isinstance(index, int) and 0 <= index < len(variants):
+        return variants[index].get("url") or None
+    return None
+
+
 def _run_agent(
     *,
     state: dict[str, Any],
@@ -343,10 +377,58 @@ def _run_agent_attempt(
     records: ProjectRecords,
     request: str,
 ) -> tuple[dict[str, Any], list[str]]:
-    messages: list[Any] = [
-        {"role": "system", "content": REVISE_SYSTEM_PROMPT},
-        {"role": "user", "content": _opening_message(state, request)},
-    ]
+    """One provider's revision conversation, run as an Agent Framework agent:
+    the framework owns the session and the function-invocation loop, the
+    pipeline chat client keeps the wire behavior (assistant messages replay
+    verbatim, tool audio arrives in the following user message)."""
+    import asyncio
+
+    client = PipelineChatClient(provider, timeout=300.0)
+    tools_used: list[str] = []
+    holder: dict[str, Any] = {}
+
+    def _tracked(name: str, args: dict[str, Any]) -> None:
+        tools_used.append(name)
+        print(f"[agent] {name}({_summarize_args(args)})")
+
+    def _delegate(name: str, **args: Any) -> Any:
+        _tracked(name, args)
+        text, parts = _run_tool(name, args, state, records)
+        return tool_result_with_audio(text, parts) if parts else text
+
+    def _apply_edit(selections: Any = None, notes: str = "") -> str:
+        args = {"selections": selections, "notes": notes}
+        _tracked("apply_edit", args)
+        if holder.get("edit") is not None:
+            return "Unknown tool: apply_edit"
+        validated, problem = _validate_selections(selections, state["source_end_seconds"])
+        if problem:
+            return problem
+        holder["edit"] = {"selections": validated, "notes": str(notes or "")}
+        # A committed edit ends the conversation: the client answers the
+        # loop's next request itself instead of spending another model call.
+        client.short_circuit_text = "Edit accepted."
+        return "Edit accepted."
+
+    definitions = {tool["function"]["name"]: tool["function"] for tool in TOOLS}
+
+    def _tool(name: str, func: Any) -> FunctionTool:
+        return FunctionTool(
+            name=name,
+            description=definitions[name]["description"],
+            func=func,
+            input_model=definitions[name]["parameters"],
+        )
+
+    tools = [
+        _tool(name, (lambda name: lambda **args: _delegate(name, **args))(name))
+        for name in definitions
+        if name != "apply_edit"
+    ] + [_tool("apply_edit", _apply_edit)]
+
+    agent = Agent(client, REVISE_SYSTEM_PROMPT, tools=tools)
+    session = AgentSession()
+    opening: list[Any] = [text_message("user", _opening_message(state, request))]
     if provider.name == "azure":
         # The gpt-audio deployments reject any request whose input contains no
         # audio at all, and the opening turns have none until listen_audio
@@ -354,79 +436,20 @@ def _run_agent_attempt(
         # turn carries audio.
         orientation = _orientation_audio_parts(state)
         if orientation:
-            messages.append({"role": "user", "content": orientation})
-    tools_used: list[str] = []
+            opening.append(raw_parts_message("user", orientation))
 
-    with provider.client(timeout=300.0) as client:
-        for turn in range(MAX_AGENT_TURNS):
-            forcing = turn >= MAX_AGENT_TURNS - 2
-            response = client.chat.completions.create(
-                messages=messages,
-                tools=TOOLS,
-                # The last turns force the commit; a named tool_choice is
-                # stronger than pleading in a user message.
-                tool_choice=(
-                    {"type": "function", "function": {"name": "apply_edit"}}
-                    if forcing
-                    else "auto"
-                ),
-                **provider.request_kwargs(),
-            )
-            if not response.choices:
-                raise RuntimeError("Revision agent response did not include choices")
-            message = response.choices[0].message
-            # Replayed verbatim: reasoning_details carries the Gemini thought
-            # signatures, and the provider rejects a history without them.
-            messages.append(message)
-
-            calls = message.tool_calls or []
-            if not calls:
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": "Continue with a tool call; call apply_edit once the new cut is ready.",
-                    }
-                )
-                continue
-
-            audio_parts: list[dict[str, Any]] = []
-            edit: dict[str, Any] | None = None
-            for call in calls:
-                name = call.function.name
-                try:
-                    call_args = json.loads(call.function.arguments or "{}")
-                except json.JSONDecodeError as exc:
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call.id,
-                            "content": f"Invalid JSON arguments: {exc}",
-                        }
-                    )
-                    continue
-                tools_used.append(name)
-                print(f"[agent] {name}({_summarize_args(call_args)})")
-
-                if name == "apply_edit" and edit is None:
-                    selections, problem = _validate_selections(
-                        call_args.get("selections"), state["source_end_seconds"]
-                    )
-                    if problem:
-                        result_text = problem
-                    else:
-                        edit = {"selections": selections, "notes": str(call_args.get("notes") or "")}
-                        result_text = "Edit accepted."
-                else:
-                    result_text, parts = _run_tool(name, call_args, state, records)
-                    audio_parts.extend(parts)
-                messages.append(
-                    {"role": "tool", "tool_call_id": call.id, "content": result_text}
-                )
-
-            if audio_parts:
-                messages.append({"role": "user", "content": audio_parts})
-            if edit is not None:
-                return edit, sorted(set(tools_used))
+    next_input: Any = opening
+    while client.requests < MAX_AGENT_TURNS:
+        # The last turns force the commit; a named tool_choice is stronger
+        # than pleading in a user message.
+        forcing = client.requests >= MAX_AGENT_TURNS - 2
+        client.forced_tool_choice = (
+            {"type": "function", "function": {"name": "apply_edit"}} if forcing else None
+        )
+        asyncio.run(agent.run(next_input, session=session))
+        if holder.get("edit") is not None:
+            return holder["edit"], sorted(set(tools_used))
+        next_input = "Continue with a tool call; call apply_edit once the new cut is ready."
 
     raise RuntimeError(
         f"The revision agent did not produce a valid edit within {MAX_AGENT_TURNS} turns"
@@ -500,13 +523,14 @@ def _opening_message(state: dict[str, Any], request: str) -> str:
         for r in state["revisions"]
     ]
     source_minutes = state["source_minutes"] or state["source_end_seconds"] / 60
+    target_length = cap_target_minutes(state["target_length"], source_minutes)
     return "\n".join(
         [
             f"Revision request: {request}",
             "",
             f"Source: ~{source_minutes:.0f} minutes captured "
             f"(0s to {state['source_end_seconds']:.0f}s). "
-            f"Target runtime: {state['target_length']} minutes.",
+            f"Target runtime: {target_length} minutes.",
             f"Current edit (version {state['current_version']}):",
             *current_lines,
             f"Editor notes: {editor_meta.get('edit_notes') or '(none)'}",
@@ -835,6 +859,19 @@ def _apply_revision(
         thumbnail_path = None
         print(f"Revision thumbnail extraction failed (non-fatal): {exc}")
 
+    # A re-cut alone regenerates neither thumbnails nor the title; carry the
+    # newest version's artifacts into this row so they stay with the edit
+    # (the midpoint frame is only the fallback when none exist).
+    inherited = _inherited_render(state["longform_edits"])
+    if inherited.get("title"):
+        result["title"] = inherited["title"]
+    thumbnails = inherited.get("thumbnails")
+    if thumbnails:
+        result["thumbnails"] = thumbnails
+        selected_url = _selected_variant_url(thumbnails)
+        if selected_url:
+            result["thumbnail_url"] = selected_url
+
     revision_meta = {"request": request, "notes": edit["notes"], "tools_used": tools_used}
     clips_bucket = os.environ.get("SUPABASE_CLIPS_BUCKET", DEFAULT_SUPABASE_CLIPS_BUCKET)
     if db is not None:
@@ -848,10 +885,12 @@ def _apply_revision(
             )
             if thumbnail_path is not None:
                 thumbnail_key = f"projects/{project_id}/longform/{thumbnail_path.name}"
-                result["thumbnail_url"] = db.upload_storage_object(
+                midframe_url = db.upload_storage_object(
                     bucket=clips_bucket, key=thumbnail_key, path=thumbnail_path
                 )
                 result["thumbnail_storage_path"] = thumbnail_key
+                if not result.get("thumbnail_url"):
+                    result["thumbnail_url"] = midframe_url
             db.insert_longform_edit(
                 project_id=project_id,
                 version=version,

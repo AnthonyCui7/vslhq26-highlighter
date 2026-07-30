@@ -1,11 +1,62 @@
+import json
+
 import pytest
 
 from highlighter_pipeline.publish import (
     _multipart_body,
     _parse_platforms,
     _pick_clip_media,
+    _resolve_thumbnail,
     _result_url,
 )
+
+
+class TestResolveThumbnail:
+    def test_newest_version_variants_win(self, tmp_path):
+        rows = [
+            {
+                "version": 1,
+                "metadata": {
+                    "render": {
+                        "thumbnails": {"variants": [{"index": 2, "url": "https://old/2.png"}]}
+                    }
+                },
+            },
+            {
+                "version": 2,
+                "metadata": {
+                    "render": {
+                        "thumbnails": {"variants": [{"index": 2, "url": "https://new/2.png"}]}
+                    }
+                },
+            },
+        ]
+        path = tmp_path / "longform_edits.jsonl"
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        url, upload = _resolve_thumbnail(
+            "2", project_dir=tmp_path, project_id="p", db=None, dry_run=True
+        )
+        assert url == "https://new/2.png"
+        assert upload is None
+
+    def test_falls_back_to_older_version_with_variants(self, tmp_path):
+        rows = [
+            {
+                "version": 1,
+                "metadata": {
+                    "render": {
+                        "thumbnails": {"variants": [{"index": 1, "url": "https://v1/1.png"}]}
+                    }
+                },
+            },
+            {"version": 2, "metadata": {"render": {}}},
+        ]
+        path = tmp_path / "longform_edits.jsonl"
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        url, _ = _resolve_thumbnail(
+            "1", project_dir=tmp_path, project_id="p", db=None, dry_run=True
+        )
+        assert url == "https://v1/1.png"
 
 
 class TestParsePlatforms:

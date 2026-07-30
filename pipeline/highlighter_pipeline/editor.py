@@ -17,7 +17,8 @@ from .defaults import (
     DEFAULT_LLM_REASONING_EFFORT,
     DEFAULT_TARGET_LENGTH_MINUTES,
 )
-from .llm import parse_target_minutes
+from .agents import run_agent_text
+from .llm import cap_target_minutes, parse_target_minutes
 from .providers import Provider, editor_providers, run_with_fallback
 
 # Above this, the weakest candidates are dropped from the prompt: a model
@@ -161,24 +162,18 @@ def select_longform_segments(
 
 
 def _request_edit(provider: Provider, user_prompt: str) -> dict[str, Any]:
-    with provider.client(timeout=300.0) as client:
-        response = client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": EDITOR_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            response_format={
+    content = run_agent_text(
+        provider=provider,
+        instructions=EDITOR_SYSTEM_PROMPT,
+        prompt=user_prompt,
+        timeout=300.0,
+        extra_options={
+            "response_format": {
                 "type": "json_schema",
                 "json_schema": {"name": "longform_edit", "schema": EDIT_RESPONSE_SCHEMA},
-            },
-            **provider.request_kwargs(),
-        )
-
-    if not response.choices:
-        raise RuntimeError(f"{provider.label} editor response did not include choices")
-    content = response.choices[0].message.content
-    if not content:
-        raise RuntimeError(f"{provider.label} editor response did not include text content")
+            }
+        },
+    )
     return _json_from_text(content)
 
 
@@ -206,7 +201,9 @@ def _budget_arithmetic(
     candidate_minutes = (
         sum(c["end_seconds"] - c["start_seconds"] for c in candidates) / 60
     )
-    target = target_length or DEFAULT_TARGET_LENGTH_MINUTES
+    target = cap_target_minutes(
+        target_length or DEFAULT_TARGET_LENGTH_MINUTES, source_minutes
+    )
     arithmetic: dict[str, Any] = {
         "source_minutes": round(source_minutes, 1),
         "candidate_count": len(candidates),

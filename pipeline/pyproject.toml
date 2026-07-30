@@ -3,7 +3,7 @@ name = "highlighter-pipeline"
 version = "0.1.0"
 description = "Highlighter core pipeline: capture, transcription, and clip detection."
 requires-python = ">=3.11"
-dependencies = ["openai"]
+dependencies = ["openai", "agent-framework-core>=1.12"]
 
 [project.optional-dependencies]
 # TransNetV2 shot-boundary detection (scene cuts + boundary snapping).
@@ -19,3 +19,6 @@ highlighter-reclip = "highlighter_pipeline.reclip:main"
 highlighter-revise = "highlighter_pipeline.revise:main"
 highlighter-cleanup = "highlighter_pipeline.cleanup:main"
 highlighter-publish = "highlighter_pipeline.publish:main"
+highlighter-thumbnails = "highlighter_pipeline.thumbnails:main"
+highlighter-research = "highlighter_pipeline.research:main"
+highlighter-reformat = "highlighter_pipeline.reformat:main"

@@ -307,13 +307,15 @@ public static class Publish
 
     /// <summary>A generated variant number (1-3) or a path to the user's own image.
     /// Returns (public URL, cleanup metadata for an uploaded custom file).</summary>
-    private static (string Url, JsonObject? Upload) ResolveThumbnail(
+    public static (string Url, JsonObject? Upload) ResolveThumbnail(
         string raw, string projectDir, string projectId, SupabaseClient? db, bool dryRun)
     {
         if (raw.All(char.IsDigit))
         {
             var wanted = int.Parse(raw, System.Globalization.CultureInfo.InvariantCulture);
-            foreach (var row in ReadJsonl(Path.Combine(projectDir, "longform_edits.jsonl")))
+            var rows = ReadJsonl(Path.Combine(projectDir, "longform_edits.jsonl"))
+                .OrderByDescending(row => JsonUtil.DoubleOr(row["version"], 0));
+            foreach (var row in rows)
             {
                 var thumbnails = (row["metadata"]?["render"] as JsonObject)?["thumbnails"] as JsonObject;
                 foreach (var variantNode in thumbnails?["variants"] as JsonArray ?? new JsonArray())

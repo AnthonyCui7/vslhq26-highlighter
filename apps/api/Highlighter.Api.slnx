@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/Highlighter.Api/Highlighter.Api.csproj" />
+  <Project Path="tests/Highlighter.Api.Tests/Highlighter.Api.Tests.csproj" />
+</Solution>

@@ -141,6 +141,16 @@ def capture_audio_chunks(
         "-reset_timestamps",
         "1",
     ]
+    # Archive segments keep the continuous capture timeline: copy cuts land on
+    # keyframes, so a segment's true start drifts past its nominal boundary,
+    # and the preserved timestamps are how downstream rendering recovers the
+    # real position (render reads it back with probe_start_time).
+    archive_segment_args = [
+        "-f",
+        "segment",
+        "-segment_time",
+        str(chunk_seconds),
+    ]
 
     ffmpeg_args = [
         "ffmpeg",
@@ -172,7 +182,7 @@ def capture_audio_chunks(
                 "-c",
                 "copy",
                 *duration_args,
-                *segment_args,
+                *archive_segment_args,
                 str(archive_dir / "video_%05d.ts"),
             ]
         )

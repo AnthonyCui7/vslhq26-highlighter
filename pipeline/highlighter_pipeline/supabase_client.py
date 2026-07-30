@@ -228,6 +228,47 @@ class SupabaseClient:
             prefer="return=minimal",
         )
 
+    def update_longform_edit(
+        self,
+        *,
+        project_id: str,
+        version: int,
+        thumbnail_url: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Patch a long-form version row (metadata is replaced whole, so send
+        the full merged object). The delete trigger reads metadata at delete
+        time, so later updates stay cleanup-safe."""
+        body: dict[str, Any] = {}
+        if thumbnail_url is not None:
+            body["thumbnail_url"] = thumbnail_url
+        if metadata is not None:
+            body["metadata"] = metadata
+        if not body:
+            return
+        self._request(
+            "PATCH",
+            "longform_edits",
+            query={"project_id": f"eq.{project_id}", "version": f"eq.{version}"},
+            body=body,
+            prefer="return=minimal",
+        )
+
+    def update_clip_media(
+        self, *, project_id: str, filename: str, fields: dict[str, Any]
+    ) -> None:
+        """Patch a clip row matched by its rendered filename."""
+        self._request(
+            "PATCH",
+            "clips",
+            query={
+                "project_id": f"eq.{project_id}",
+                "metadata->render->>filename": f"eq.{filename}",
+            },
+            body=fields,
+            prefer="return=minimal",
+        )
+
     def get_project(self, project_id: str) -> dict[str, Any]:
         rows = self._request(
             "GET",

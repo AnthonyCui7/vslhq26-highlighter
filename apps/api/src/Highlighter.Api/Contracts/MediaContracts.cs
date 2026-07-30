@@ -1,0 +1,59 @@
+namespace Highlighter.Api.Contracts;
+
+public record ClipDto(
+    Guid Id,
+    string Title,
+    string? Description,
+    double StartSeconds,
+    double EndSeconds,
+    double DurationSeconds,
+    double? Score,
+    string Status,
+    string Pipeline,
+    string? VideoUrl,
+    string? VerticalUrl,
+    string? CaptionedUrl,
+    string? ThumbnailUrl,
+    string? FileName,
+    DateTimeOffset CreatedAt);
+
+public record LongformEditDto(
+    Guid Id,
+    int Version,
+    string Status,
+    string? VideoUrl,
+    string? ThumbnailUrl,
+    double? DurationSeconds,
+    IReadOnlyList<LongformSegmentDto> Segments,
+    string? RevisionRequest,
+    DateTimeOffset CreatedAt);
+
+public record LongformSegmentDto(
+    int? ChunkIndex, string? Title, double StartSeconds, double EndSeconds);
+
+public record PublicationDto(
+    Guid Id,
+    string Target,
+    string Platform,
+    string? Url,
+    string? Title,
+    string? FileName,
+    int? LongformVersion,
+    DateTimeOffset CreatedAt);
+
+public record TranscriptChunkDto(
+    int ChunkIndex,
+    double StartSeconds,
+    double EndSeconds,
+    string Transcript,
+    IReadOnlyList<WordDto>? Words);
+
+/// <summary>absolute_start/absolute_end are VOD-clock timings (the pipeline adds
+/// them per word) — the caption-friendly values a frontend should prefer.</summary>
+public record WordDto(
+    string Word,
+    string? PunctuatedWord,
+    double Start,
+    double End,
+    double? AbsoluteStart,
+    double? AbsoluteEnd);

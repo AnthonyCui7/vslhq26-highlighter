@@ -1,5 +1,10 @@
 using Highlighter.Web.Components;
 using Highlighter.Web.Models;
+using Highlighter.Web.Services;
+
+// The studio agent's model credentials live in the monorepo root .env, the
+// same file the pipeline uses.
+Highlighter.Pipeline.Config.LoadEnv();
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -8,6 +13,8 @@ builder.Services.AddRazorComponents()
     .AddInteractiveServerComponents();
 
 builder.Services.AddScoped<StudioState>();
+builder.Services.AddScoped<IStudioBackend, SampleStudioBackend>();
+builder.Services.AddScoped<StudioAgentService>();
 
 var app = builder.Build();
 

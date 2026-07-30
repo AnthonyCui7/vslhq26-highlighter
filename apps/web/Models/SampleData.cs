@@ -4,11 +4,13 @@ namespace Highlighter.Web.Models;
 
 public record ProjectInfo(string Title, string Dur, string Kind, string Outputs, string Status, bool Processing, bool HasLong);
 
-public record ClipInfo(int Index, string Title, string Dur, int Score, int At)
+public record ClipInfo(int Index, string Title, string Dur, int Score, int At, bool HasCaptions = true)
 {
     public string ScoreOpacity =>
         (0.35 + 0.65 * Math.Max(0, (Score - 50) / 50.0)).ToString("0.00", CultureInfo.InvariantCulture);
 }
+
+public record ThumbVariant(int Index, string Direction, string OverlayText, string Fill);
 
 public record SegmentInfo(string At, string Title, string Dur);
 
@@ -42,9 +44,23 @@ public static class SampleData
         new(2, "Why evals lie to you in production", "0:36", 88, 65),
         new(3, "The retry storm that took down prod", "0:51", 86, 101),
         new(4, "Ship the boring architecture first", "0:44", 81, 19),
-        new(5, "Guest’s origin story: fired, then funded", "0:39", 78, 8),
+        new(5, "Guest’s origin story: fired, then funded", "0:39", 78, 8, HasCaptions: false),
         new(6, "Rapid fire: overrated AI tools", "0:33", 74, 121),
-        new(7, "The one metric that predicted churn", "0:47", 71, 72),
+        new(7, "The one metric that predicted churn", "0:47", 71, 72, HasCaptions: false),
+    ];
+
+    public const string LongformTitle = "The $40k Weekend: Anatomy of an Agent Swarm Meltdown";
+
+    // Generated long-form thumbnail concepts; each mock frame is a distinct
+    // gradient standing in for the rendered image.
+    public static readonly IReadOnlyList<ThumbVariant> Thumbnails =
+    [
+        new(1, "Disaster Close-Up", "$40K IN 48 HRS",
+            "linear-gradient(135deg, #3B1D1D 0%, #6E2B18 55%, #D9F24B 130%)"),
+        new(2, "Split-Screen Debate", "WHO'S RIGHT?",
+            "linear-gradient(120deg, #16324F 0%, #1D1B2E 50%, #532B4D 100%)"),
+        new(3, "Terminal Horror", "retry storm",
+            "linear-gradient(160deg, #101418 0%, #16281C 60%, #2F5D33 120%)"),
     ];
 
     public static readonly IReadOnlyList<SegmentInfo> Segments =

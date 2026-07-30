@@ -66,6 +66,35 @@ public class TestParseTargetMinutes
     public void InvertedRangeRejected() => Assert.Null(Llm.ParseTargetMinutes("15-7"));
 }
 
+public class TestCapTargetMinutes
+{
+    [Fact]
+    public void RangeCappedToSource() => Assert.Equal("4.5", Llm.CapTargetMinutes("7-15", 4.5));
+
+    [Fact]
+    public void RangePartiallyCapped() => Assert.Equal("7-10", Llm.CapTargetMinutes("7-15", 10.0));
+
+    [Fact]
+    public void SourceCoversRange() => Assert.Equal("7-15", Llm.CapTargetMinutes("7-15", 40.0));
+
+    [Fact]
+    public void SingleNumberCapped() => Assert.Equal("4.5", Llm.CapTargetMinutes("10", 4.5));
+
+    [Fact]
+    public void UnknownSourcePassesThrough()
+    {
+        Assert.Equal("7-15", Llm.CapTargetMinutes("7-15", null));
+        Assert.Equal("7-15", Llm.CapTargetMinutes("7-15", 0));
+    }
+
+    [Fact]
+    public void UnparseableTargetPassesThrough()
+    {
+        Assert.Equal("abc", Llm.CapTargetMinutes("abc", 4.5));
+        Assert.Null(Llm.CapTargetMinutes(null, 4.5));
+    }
+}
+
 public class TestValidateSelections
 {
     [Fact]

@@ -33,10 +33,16 @@ def captions_available() -> bool:
 
 
 def build_whisper_transcript(
-    *, words: list[dict], clip_start_seconds: float, clip_end_seconds: float
+    *,
+    words: list[dict],
+    clip_start_seconds: float,
+    clip_end_seconds: float,
 ) -> dict | None:
     """Map word timings onto Whisper's segments[].words[] JSON shape, with
-    times relative to the clip. Returns None when no words fall in the clip."""
+    times relative to the clip. Clips are cut at their measured source
+    positions, so the word clock and the rendered video agree as-is.
+    Returns None when no words fall in the clip."""
+    clip_duration = max(0.0, clip_end_seconds - clip_start_seconds)
     clip_words = []
     for word in words:
         start = word.get("absolute_start", word.get("start"))
@@ -45,11 +51,15 @@ def build_whisper_transcript(
             continue
         if start >= clip_end_seconds:
             continue
+        relative_start = start - clip_start_seconds
+        relative_end = end - clip_start_seconds
+        if relative_end <= 0.0 or relative_start >= clip_duration:
+            continue
         clip_words.append(
             {
                 "word": str(word.get("punctuated_word") or word.get("word") or ""),
-                "start": round(max(0.0, start - clip_start_seconds), 3),
-                "end": round(min(end, clip_end_seconds) - clip_start_seconds, 3),
+                "start": round(max(0.0, relative_start), 3),
+                "end": round(min(clip_duration, relative_end), 3),
             }
         )
     clip_words = [word for word in clip_words if word["word"]]
@@ -90,14 +100,14 @@ def caption_clip(
 ) -> Path | None:
     """Render a captioned copy of a vertical clip. Best-effort: any failure
     logs one line and returns None so the clean vertical still ships."""
-    transcript = build_whisper_transcript(
-        words=words,
-        clip_start_seconds=clip_start_seconds,
-        clip_end_seconds=clip_end_seconds,
-    )
-    if transcript is None:
-        return None
     try:
+        transcript = build_whisper_transcript(
+            words=words,
+            clip_start_seconds=clip_start_seconds,
+            clip_end_seconds=clip_end_seconds,
+        )
+        if transcript is None:
+            return None
         with tempfile.NamedTemporaryFile(
             "w", suffix=".json", prefix="captions-", delete=False
         ) as handle:

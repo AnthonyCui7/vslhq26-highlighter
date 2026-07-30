@@ -64,6 +64,7 @@ public class TestBuildWhisperTranscript
         Assert.Equal(10.0, JsonUtil.Double(words[^1]["end"]));
     }
 
+
     [Fact]
     public void SegmentsSplitOnSilence()
     {

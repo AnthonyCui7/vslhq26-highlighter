@@ -37,10 +37,15 @@ public static class Captions
     }
 
     /// <summary>Map word timings onto Whisper's segments[].words[] JSON shape, with
-    /// times relative to the clip. Returns null when no words fall in the clip.</summary>
+    /// times relative to the clip. Clips are cut at their measured source
+    /// positions, so the word clock and the rendered video agree as-is.
+    /// Returns null when no words fall in the clip.</summary>
     public static JsonObject? BuildWhisperTranscript(
-        JsonArray words, double clipStartSeconds, double clipEndSeconds)
+        JsonArray words,
+        double clipStartSeconds,
+        double clipEndSeconds)
     {
+        var clipDuration = Math.Max(0.0, clipEndSeconds - clipStartSeconds);
         var clipWords = new List<JsonObject>();
         foreach (var node in words)
         {
@@ -50,13 +55,16 @@ public static class Captions
             if (!JsonUtil.TryDouble(start, out var startSeconds)) continue;
             if (!JsonUtil.TryDouble(end, out var endSeconds)) continue;
             if (endSeconds <= clipStartSeconds || startSeconds >= clipEndSeconds) continue;
+            var relativeStart = startSeconds - clipStartSeconds;
+            var relativeEnd = endSeconds - clipStartSeconds;
+            if (relativeEnd <= 0.0 || relativeStart >= clipDuration) continue;
             var text = JsonUtil.StrOrNull(word["punctuated_word"]) ?? JsonUtil.StrOrNull(word["word"]) ?? "";
             if (text.Length == 0) continue;
             clipWords.Add(new JsonObject
             {
                 ["word"] = text,
-                ["start"] = Py.Round(Math.Max(0.0, startSeconds - clipStartSeconds), 3),
-                ["end"] = Py.Round(Math.Min(endSeconds, clipEndSeconds) - clipStartSeconds, 3),
+                ["start"] = Py.Round(Math.Max(0.0, relativeStart), 3),
+                ["end"] = Py.Round(Math.Min(clipDuration, relativeEnd), 3),
             });
         }
         if (clipWords.Count == 0) return null;
@@ -104,10 +112,13 @@ public static class Captions
         string outputPath,
         string template = Defaults.DEFAULT_CAPTION_TEMPLATE)
     {
-        var transcript = BuildWhisperTranscript(words, clipStartSeconds, clipEndSeconds);
-        if (transcript is null) return null;
         try
         {
+            var transcript = BuildWhisperTranscript(
+                words,
+                clipStartSeconds,
+                clipEndSeconds);
+            if (transcript is null) return null;
             var transcriptPath = Path.Combine(
                 Path.GetTempPath(), $"captions-{Guid.NewGuid():N}.json");
             File.WriteAllText(transcriptPath, JsonUtil.Dumps(transcript));

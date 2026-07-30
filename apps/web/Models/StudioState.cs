@@ -1,9 +1,13 @@
 namespace Highlighter.Web.Models;
 
+/// <summary>One message in the studio agent conversation.</summary>
+public record AgentChatMessage(string Role, string Text);
+
 /// <summary>
 /// UI state for the studio, mirroring the Claude Design component's state machine
 /// (view, proj, editorOpen, activeClip, mode, binTab, panel, tool, activeCaption,
-/// capStyle, modalOpen, playing, sortOpen, sortBy, snap).
+/// capStyle, modalOpen, playing, sortOpen, sortBy, snap) plus the states behind
+/// the thumbnail picker, the per-clip delivery options, and the agent chat.
 /// </summary>
 public class StudioState
 {
@@ -41,8 +45,10 @@ public class StudioState
 
     public void GoProjects() => Set(() => { View = "projects"; EditorOpen = false; SortOpen = false; });
     public void OpenProject(int i) => Set(() => { View = "project"; Proj = i; SortOpen = false; });
-    public void OpenClip(int idx) => Set(() => { EditorOpen = true; ActiveClip = idx; });
-    public void OpenEditorLong() => Set(() => { EditorOpen = true; ActiveClip = 0; });
+    public void OpenClip(int idx) =>
+        Set(() => { EditorOpen = true; ActiveClip = idx; AgentContext = "short"; });
+    public void OpenEditorLong() =>
+        Set(() => { EditorOpen = true; ActiveClip = 0; AgentContext = "long"; });
     public void CloseEditor() => Set(() => EditorOpen = false);
     public void ToggleSort() => Set(() => SortOpen = !SortOpen);
     public void SortByScore() => Set(() => { SortBy = "score"; SortOpen = false; });
@@ -57,4 +63,53 @@ public class StudioState
     public void OpenNewJob() => Set(() => ModalOpen = true);
     public void CloseNewJob() => Set(() => ModalOpen = false);
     public void SetMode(string mode) => Set(() => Mode = mode);
+
+    // ---- Long-form thumbnails ------------------------------------------ //
+
+    public List<ThumbVariant> Thumbnails { get; } = new(SampleData.Thumbnails);
+    public int SelectedThumb { get; private set; } = 1;
+    public bool ThumbPromptOpen { get; private set; }
+    public string ThumbPrompt { get; set; } = "";
+    public bool ThumbJobRunning { get; private set; }
+    public string? ThumbError { get; private set; }
+
+    public void SelectThumb(int index) => Set(() => SelectedThumb = index);
+    public void ToggleThumbPrompt() => Set(() => { ThumbPromptOpen = !ThumbPromptOpen; ThumbError = null; });
+    public void SetThumbJob(bool running, string? error = null) =>
+        Set(() => { ThumbJobRunning = running; ThumbError = error; });
+    public void AddThumb(ThumbVariant variant) =>
+        Set(() => { Thumbnails.Add(variant); ThumbPromptOpen = false; ThumbPrompt = ""; });
+
+    // ---- Per-clip delivery options -------------------------------------- //
+
+    private readonly Dictionary<int, string> _clipFormats = new();
+    private readonly Dictionary<int, bool> _clipCaptions = new();
+
+    public string ClipFormat => _clipFormats.GetValueOrDefault(ActiveClip, "auto");
+    public bool ClipCaptionsOn =>
+        CaptionsAvailableForFormat && _clipCaptions.GetValueOrDefault(ActiveClip, true);
+
+    /// <summary>Captions exist for the auto vertical and the square render;
+    /// the wide 16:9 ships clean, and some clips never got a caption pass.</summary>
+    public bool CaptionsAvailableForFormat =>
+        ClipFormat is "auto" or "square" && SampleData.Clips[ActiveClip].HasCaptions;
+
+    public void SetClipFormat(string format) => Set(() => _clipFormats[ActiveClip] = format);
+    public void ToggleClipCaptions() =>
+        Set(() => _clipCaptions[ActiveClip] = !_clipCaptions.GetValueOrDefault(ActiveClip, true));
+
+    // ---- Agent chat ------------------------------------------------------ //
+
+    public List<AgentChatMessage> AgentMessages { get; } = new();
+    public string AgentInput { get; set; } = "";
+    public bool AgentBusy { get; private set; }
+
+    /// <summary>"long" when the editor is open on the long-form cut, "short"
+    /// for a highlight clip — the agent's capabilities differ per context.</summary>
+    public string AgentContext { get; set; } = "short";
+
+    public void AddAgentMessage(string role, string text) =>
+        Set(() => AgentMessages.Add(new AgentChatMessage(role, text)));
+    public void SetAgentBusy(bool busy) => Set(() => AgentBusy = busy);
+    public void Notify() => Changed?.Invoke();
 }

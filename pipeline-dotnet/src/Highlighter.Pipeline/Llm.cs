@@ -272,10 +272,25 @@ public static class Llm
         return null;
     }
 
+    /// <summary>Clamp a target-runtime string to what the source actually has: an
+    /// edit cannot run longer than its footage. Unparseable targets and unknown
+    /// source lengths (livestreams) pass through unchanged.</summary>
+    public static string? CapTargetMinutes(string? target, double? sourceMinutes)
+    {
+        var bounds = ParseTargetMinutes(target);
+        if (bounds is null || sourceMinutes is not double minutes || minutes <= 0) return target;
+        var (low, high) = bounds.Value;
+        if (high <= minutes) return target;
+        var capped = Math.Round(minutes, 1, MidpointRounding.ToEven);
+        if (low >= minutes) return Py.G(capped);
+        return $"{Py.G(low)}-{Py.G(capped)}";
+    }
+
     /// <summary>Precomputed keep-rate sentence for the long-form prompt; empty when the
     /// source length is unknown (livestreams) or the target does not parse.</summary>
     private static string BudgetCalibration(string target, double? sourceMinutes)
     {
+        target = CapTargetMinutes(target, sourceMinutes) ?? target;
         var bounds = ParseTargetMinutes(target);
         if (bounds is null || sourceMinutes is not double minutes || minutes <= 0) return "";
         var midpoint = (bounds.Value.Low + bounds.Value.High) / 2;

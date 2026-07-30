@@ -15,6 +15,7 @@ import os
 from typing import Any
 
 from .defaults import DEFAULT_RESEARCH_MODEL
+from .agents import run_agent_text
 from .providers import OPENROUTER_BASE_URL, Provider, azure_editor_provider
 
 # Fields both modes research: who the creator is, who watches, and what the
@@ -203,24 +204,22 @@ def _research_prompt(
 def _request_azure_research(
     provider: Provider, prompt: str, *, system_prompt: str, schema: dict[str, Any]
 ) -> dict[str, Any]:
-    with provider.client(timeout=300.0) as client:
-        response = client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt},
-            ],
-            response_format={
+    content = run_agent_text(
+        provider=provider,
+        instructions=system_prompt,
+        prompt=prompt,
+        timeout=300.0,
+        extra_options={
+            "response_format": {
                 "type": "json_schema",
                 "json_schema": {
                     "name": "content_research",
                     "schema": schema,
                 },
-            },
-            **provider.request_kwargs(),
-        )
-    if not response.choices or not response.choices[0].message.content:
-        raise RuntimeError(f"{provider.label} research response did not include content")
-    context = _json_from_text(response.choices[0].message.content)
+            }
+        },
+    )
+    context = _json_from_text(content)
     if not isinstance(context, dict):
         raise RuntimeError(f"{provider.label} research response was not a JSON object")
     context.setdefault("sources", [])
@@ -230,41 +229,30 @@ def _request_azure_research(
 def _web_grounded_research(
     prompt: str, *, model: str, system_prompt: str
 ) -> dict[str, Any]:
-    try:
-        from openai import OpenAI
-    except ImportError as exc:
-        raise RuntimeError("Content research requires the 'openai' package") from exc
-
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
         raise RuntimeError("OPENROUTER_API_KEY is required for content research")
 
-    client = OpenAI(
+    provider = Provider(
+        name="openrouter",
+        label=f"Web-grounded research ({model})",
         base_url=OPENROUTER_BASE_URL,
         api_key=api_key,
-        timeout=300.0,
+        model=model,
+        temperature=0.3,
+        extra_body={"plugins": [{"id": "web", "max_results": 5}]},
         default_headers={
             "HTTP-Referer": "http://localhost",
             "X-OpenRouter-Title": "highlighter research",
         },
     )
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.3,
-        max_tokens=8000,
-        extra_body={"plugins": [{"id": "web", "max_results": 5}]},
+    content = run_agent_text(
+        provider=provider,
+        instructions=system_prompt,
+        prompt=prompt,
+        timeout=300.0,
+        extra_options={"max_tokens": 8000},
     )
-
-    if not response.choices:
-        raise RuntimeError("Research response did not include choices")
-    content = response.choices[0].message.content
-    if not content:
-        raise RuntimeError("Research response did not include text content")
-
     context = _json_from_text(content)
     if not isinstance(context, dict):
         raise RuntimeError("Research response was not a JSON object")
@@ -288,3 +276,62 @@ def _json_from_text(text: str) -> Any:
         if start == -1 or end <= start:
             raise
         return json.loads(stripped[start : end + 1])
+
+
+def main() -> None:
+    """Rerun content research for a finished project and cache the refreshed
+    context in the project's records."""
+    import argparse
+
+    from .config import load_env
+    from .defaults import DEFAULT_OUTPUT_ROOT
+    from .records import ProjectRecords
+    from .supabase_client import SupabaseClient
+
+    load_env()
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser.add_argument("project_id")
+    parser.add_argument("--mode", choices=["short", "long"], default="long")
+    parser.add_argument("--focus", default=None, help="What the research should dig into.")
+    parser.add_argument("--output-root", default=None)
+    args = parser.parse_args()
+
+    from pathlib import Path
+
+    output_root = Path(args.output_root or os.environ.get("OUTPUT_ROOT", DEFAULT_OUTPUT_ROOT))
+    project_dir = output_root / "projects" / args.project_id
+    if not (project_dir / "project.json").exists():
+        raise RuntimeError(f"No local project record at {project_dir}")
+    records = ProjectRecords(project_dir)
+    project = json.loads((project_dir / "project.json").read_text())
+    metadata = project.get("metadata") or {}
+    ingest = metadata.get("ingest") or {}
+
+    instructions = "\n".join(
+        part
+        for part in (
+            ingest.get("user_instructions"),
+            f"Research focus: {args.focus}" if args.focus else None,
+        )
+        if part
+    )
+    context = research_content_context(
+        source_context={
+            "platform": metadata.get("platform"),
+            "source_type": project.get("source_type"),
+            "name": project.get("name"),
+            "source_url": project.get("source_url"),
+        },
+        pipeline_mode=args.mode,
+        user_instructions=instructions or None,
+    )
+    records.write_research(context, mode="short" if args.mode == "short" else None)
+
+    key = "content_research_short" if args.mode == "short" else "content_research"
+    records.update_project(metadata={**metadata, key: context})
+    if not args.project_id.startswith("local-"):
+        db = SupabaseClient()
+        remote = db.get_project(args.project_id).get("metadata") or {}
+        db.update_project_metadata(args.project_id, {**remote, key: context})
+    sources = len(context.get("sources") or [])
+    print(f"Refreshed {args.mode}-form research with {sources} source(s)")

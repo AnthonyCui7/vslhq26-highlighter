@@ -230,6 +230,43 @@ public class SupabaseClient
         return row;
     }
 
+    /// <summary>Patch a long-form version row (metadata is replaced whole, so
+    /// send the full merged object). The delete trigger reads metadata at
+    /// delete time, so later updates stay cleanup-safe.</summary>
+    public void UpdateLongformEdit(
+        string projectId, int version, string? thumbnailUrl = null, JsonObject? metadata = null)
+    {
+        var body = new JsonObject();
+        if (thumbnailUrl is not null) body["thumbnail_url"] = thumbnailUrl;
+        if (metadata is not null) body["metadata"] = JsonUtil.CloneObj(metadata);
+        if (body.Count == 0) return;
+        Request(
+            "PATCH",
+            "longform_edits",
+            query: new()
+            {
+                ["project_id"] = $"eq.{projectId}",
+                ["version"] = $"eq.{version}",
+            },
+            body: body,
+            prefer: "return=minimal");
+    }
+
+    /// <summary>Patch a clip row matched by its rendered filename.</summary>
+    public void UpdateClipMedia(string projectId, string filename, JsonObject fields)
+    {
+        Request(
+            "PATCH",
+            "clips",
+            query: new()
+            {
+                ["project_id"] = $"eq.{projectId}",
+                ["metadata->render->>filename"] = $"eq.{filename}",
+            },
+            body: fields,
+            prefer: "return=minimal");
+    }
+
     public List<JsonObject> PendingCleanupJobs(int limit = 100)
     {
         var rows = Request(

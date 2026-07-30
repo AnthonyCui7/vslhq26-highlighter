@@ -23,6 +23,7 @@ from urllib.request import Request, urlopen
 
 from .config import required_env
 from .defaults import DEFAULT_LLM_REASONING_EFFORT, DEFAULT_THUMBNAIL_MODEL
+from .agents import run_agent_text
 from .llm import _json_from_text
 from .providers import (
     OPENROUTER_BASE_URL,
@@ -102,21 +103,26 @@ def generate_thumbnails(
     research_context: dict | None,
     output_dir: Path,
     reasoning_effort: str = DEFAULT_LLM_REASONING_EFFORT,
+    guidance: str | None = None,
+    start_index: int = 1,
 ) -> dict | None:
     """Generate up to THUMBNAIL_COUNT thumbnail variants for a stitched
     long-form video. Returns {"variants": [{index, direction, overlay_text,
-    local_path}], "selected_index": int} or None when nothing rendered."""
+    local_path}], "selected_index": int} or None when nothing rendered.
+    guidance folds a human's direction into the concept call; start_index
+    continues an existing variant numbering."""
     concepts = _thumbnail_concepts(
         entries=entries,
         title=title,
         research_context=research_context,
         reasoning_effort=reasoning_effort,
+        guidance=guidance,
     )
     reference_images = _reference_images(longform_path, entries)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     variants: list[dict] = []
-    for number, concept in enumerate(concepts, start=1):
+    for number, concept in enumerate(concepts, start=start_index):
         prompt = _image_prompt(concept, title)
         try:
             try:
@@ -158,8 +164,11 @@ def _thumbnail_concepts(
     title: str | None,
     research_context: dict | None,
     reasoning_effort: str,
+    guidance: str | None = None,
 ) -> list[dict]:
-    prompt = _concepts_prompt(entries=entries, title=title, research_context=research_context)
+    prompt = _concepts_prompt(
+        entries=entries, title=title, research_context=research_context, guidance=guidance
+    )
     providers = editor_providers(
         title="highlighter thumbnails", openrouter_reasoning_effort=reasoning_effort
     )
@@ -177,11 +186,17 @@ def _thumbnail_concepts(
 
 
 def _concepts_prompt(
-    *, entries: list[dict], title: str | None, research_context: dict | None
+    *,
+    entries: list[dict],
+    title: str | None,
+    research_context: dict | None,
+    guidance: str | None = None,
 ) -> str:
     lines = ["Video brief:"]
     if title:
         lines.append(f"- Title: {title}")
+    if guidance:
+        lines.append(f"- Human guidance: {guidance}")
     lines.append("- Segments, in order:")
     for entry in entries:
         summary = entry.get("description") or ""
@@ -194,26 +209,21 @@ def _concepts_prompt(
 
 
 def _request_concepts(provider: Provider, prompt: str) -> dict[str, Any]:
-    with provider.client(timeout=180.0) as client:
-        response = client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": CONCEPTS_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            response_format={
+    content = run_agent_text(
+        provider=provider,
+        instructions=CONCEPTS_SYSTEM_PROMPT,
+        prompt=prompt,
+        timeout=180.0,
+        extra_options={
+            "response_format": {
                 "type": "json_schema",
                 "json_schema": {
                     "name": "thumbnail_concepts",
                     "schema": THUMBNAIL_CONCEPTS_SCHEMA,
                 },
-            },
-            **provider.request_kwargs(),
-        )
-    if not response.choices:
-        raise RuntimeError(f"{provider.label} concepts response did not include choices")
-    content = response.choices[0].message.content
-    if not content:
-        raise RuntimeError(f"{provider.label} concepts response did not include text content")
+            }
+        },
+    )
     return _json_from_text(content)
 
 
@@ -425,3 +435,119 @@ def _nano_banana_image(*, prompt: str, reference_images: list[str]) -> tuple[byt
         raise RuntimeError("image response contained no image data")
     extension = ".png" if "image/png" in prefix else ".jpg"
     return base64.b64decode(encoded), extension
+
+
+def main() -> None:
+    """Regenerate long-form thumbnails for a finished project: fresh concepts
+    (optionally steered by a human prompt) render as new variants appended to
+    the newest version's set."""
+    import argparse
+
+    from .config import load_env
+    from .defaults import DEFAULT_OUTPUT_ROOT, DEFAULT_SUPABASE_CLIPS_BUCKET
+    from .records import ProjectRecords
+    from .supabase_client import SupabaseClient
+
+    load_env()
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser.add_argument("project_id")
+    parser.add_argument("--prompt", default=None, help="Human guidance for the concepts.")
+    parser.add_argument("--version", type=int, default=None, help="Long-form version (default: newest).")
+    parser.add_argument("--select", type=int, default=None, help="Just select variant N as the thumbnail.")
+    parser.add_argument("--output-root", default=None)
+    args = parser.parse_args()
+
+    output_root = Path(args.output_root or os.environ.get("OUTPUT_ROOT", DEFAULT_OUTPUT_ROOT))
+    project_dir = output_root / "projects" / args.project_id
+    if not (project_dir / "project.json").exists():
+        raise RuntimeError(f"No local project record at {project_dir}")
+    db = None if args.project_id.startswith("local-") else SupabaseClient()
+    records = ProjectRecords(project_dir)
+
+    rows = [
+        json.loads(line)
+        for line in (project_dir / "longform_edits.jsonl").read_text().splitlines()
+        if line.strip()
+    ]
+    if not rows:
+        raise RuntimeError("No long-form edit on record for this project")
+    if args.version is not None:
+        matching = [row for row in rows if (row.get("version") or 1) == args.version]
+        if not matching:
+            raise RuntimeError(f"No long-form version {args.version} on record")
+        row = matching[-1]
+    else:
+        row = max(rows, key=lambda r: r.get("version") or 1)
+    version = row.get("version") or 1
+    render = (row.get("metadata") or {}).get("render") or {}
+    thumbnails = render.get("thumbnails") or {"variants": [], "selected_index": 0}
+    variants = list(thumbnails.get("variants") or [])
+
+    if args.select is not None:
+        chosen = next((v for v in variants if v.get("index") == args.select), None)
+        if chosen is None or not chosen.get("url"):
+            raise RuntimeError(f"No hosted thumbnail #{args.select} on record")
+        thumbnails["selected_index"] = variants.index(chosen)
+        render["thumbnails"] = thumbnails
+        _persist_render(db, records, row, version, render, thumbnail_url=chosen["url"])
+        print(f"Selected thumbnail #{args.select} for version {version}")
+        return
+
+    longform_path = project_dir / "longform" / str(render.get("filename") or "longform.mp4")
+    if not longform_path.exists():
+        raise RuntimeError(f"Long-form video not found at {longform_path}")
+
+    research_file = project_dir / "research.json"
+    research = json.loads(research_file.read_text()) if research_file.exists() else None
+    entries = render.get("segment_windows") or []
+    start_index = max((v.get("index") or 0 for v in variants), default=0) + 1
+
+    result = generate_thumbnails(
+        longform_path=longform_path,
+        entries=entries,
+        title=render.get("title"),
+        research_context=research,
+        output_dir=project_dir / "thumbnails",
+        guidance=args.prompt,
+        start_index=start_index,
+    )
+    if result is None:
+        raise RuntimeError("No thumbnails were generated")
+
+    bucket = os.environ.get("SUPABASE_CLIPS_BUCKET", DEFAULT_SUPABASE_CLIPS_BUCKET)
+    for variant in result["variants"]:
+        if db is None:
+            continue
+        local_path = Path(variant["local_path"])
+        key = f"projects/{args.project_id}/thumbnails/{local_path.name}"
+        try:
+            variant["url"] = db.upload_storage_object(bucket=bucket, key=key, path=local_path)
+            variant["storage_path"] = key
+        except Exception as exc:
+            print(f"Thumbnail upload failed (kept locally at {local_path}): {exc}")
+
+    thumbnails["variants"] = variants + result["variants"]
+    render["thumbnails"] = thumbnails
+    _persist_render(db, records, row, version, render, thumbnail_url=None)
+    print(
+        f"Added {len(result['variants'])} thumbnail variant(s) to version {version}; "
+        f"the set now has {len(thumbnails['variants'])}."
+    )
+
+
+def _persist_render(db, records, row, version, render, *, thumbnail_url):
+    """Write an updated render dict back to the version row, locally and in
+    the database."""
+    metadata = dict(row.get("metadata") or {})
+    metadata["render"] = render
+    row["metadata"] = metadata
+    if thumbnail_url:
+        row["thumbnail_url"] = thumbnail_url
+    records.update_longform_edit(version, row)
+    if db is not None:
+        db.update_longform_edit(
+            project_id=row.get("project_id") or "",
+            version=version,
+            thumbnail_url=thumbnail_url,
+            metadata=metadata,
+        )

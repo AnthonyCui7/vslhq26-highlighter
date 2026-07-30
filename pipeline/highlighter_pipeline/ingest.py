@@ -20,6 +20,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -58,6 +59,7 @@ from .reframe import plan_crop_track, render_vertical
 from .render import (
     clip_filename,
     extract_thumbnail,
+    probe_start_time,
     render_clip_from_segments,
     trim_clip,
 )
@@ -446,6 +448,11 @@ def main() -> None:
         # threads touch these.
         segment_files: dict[int, Path] = {}
         segments_lock = threading.Lock()
+        # Measured container start per archive segment: copy cuts land on
+        # keyframes at or after the nominal boundary, so a segment's true
+        # position drifts past index * chunk_seconds — clip windows and scene
+        # cuts are placed with these instead of nominal arithmetic.
+        segment_starts: dict[int, float] = {}
         # Scene cuts per archive segment (absolute seconds) and every word's
         # absolute span, so boundary snapping never lands inside speech.
         chunk_cuts: dict[int, list[float]] = {}
@@ -561,13 +568,13 @@ def main() -> None:
                 return
             _try_render_from_segments(fork, decision)
 
+        def _segment_start(index: int) -> float:
+            with segments_lock:
+                return _measured_segment_start(segment_starts, index, chunk_seconds)
+
         def _needed_segments(decision: dict) -> list[int]:
-            """Archive segment indexes a clip window spans (end is exclusive
-            when it lands exactly on a segment boundary)."""
-            first = int(decision["start_seconds"] // chunk_seconds)
-            last = int(
-                max(decision["start_seconds"], decision["end_seconds"] - 0.001)
-                // chunk_seconds
+            first, last = _window_segment_range(
+                decision["start_seconds"], decision["end_seconds"], chunk_seconds, _segment_start
             )
             return list(range(first, last + 1))
 
@@ -591,7 +598,7 @@ def main() -> None:
                 clips_bucket=clips_bucket,
                 decision=decision,
                 segment_paths=[segment_files[index] for index in needed],
-                first_segment_start_seconds=needed[0] * chunk_seconds,
+                first_segment_start_seconds=_segment_start(needed[0]),
                 rendered_log=fork.rendered_log,
                 pipeline=fork.mode,
                 filename_suffix=fork.filename_suffix,
@@ -745,9 +752,15 @@ def main() -> None:
         coordinators = [fork.coordinator for fork in forks if fork.coordinator is not None]
 
         def _handle_video_segment(segment_path: Path, segment_index: int) -> None:
+            probed = probe_start_time(segment_path)
+            if probed is None:
+                print(f"Segment {segment_index} start probe failed; using nominal timing")
+            else:
+                with segments_lock:
+                    segment_starts[segment_index] = probed
             if shot_detector is not None:
                 try:
-                    cuts = shot_detector.detect_cuts(segment_path, segment_index * chunk_seconds)
+                    cuts = shot_detector.detect_cuts(segment_path, _segment_start(segment_index))
                     chunk_cuts[segment_index] = cuts
                     print(f"Detected {len(cuts)} scene cut(s) in segment {segment_index}")
                 except Exception as exc:
@@ -967,6 +980,39 @@ def main() -> None:
                     metadata=merged,
                 )
         raise
+
+
+def _window_segment_range(
+    start_seconds: float,
+    end_seconds: float,
+    chunk_seconds: int,
+    segment_start: Callable[[int], float],
+) -> tuple[int, int]:
+    """Archive segment indexes a clip window spans (end is exclusive when it
+    lands exactly on a segment boundary). Measured starts sit at or after the
+    nominal boundary, so a window can begin in the previous segment's tail or
+    end before a nominal segment's content starts."""
+    first = int(start_seconds // chunk_seconds)
+    last = int(max(start_seconds, end_seconds - 0.001) // chunk_seconds)
+    while first > 0 and segment_start(first) > start_seconds:
+        first -= 1
+    while last > first and segment_start(last) >= end_seconds:
+        last -= 1
+    return first, last
+
+
+def _measured_segment_start(
+    segment_starts: dict[int, float], index: int, chunk_seconds: int
+) -> float:
+    """A segment's real position on the capture clock: its archived container
+    timestamp relative to segment 0's. Copy cuts wait for a keyframe, so this
+    sits at or after index * chunk_seconds — which is the fallback whenever a
+    probe is missing."""
+    base = segment_starts.get(0)
+    start = segment_starts.get(index)
+    if base is None or start is None:
+        return index * chunk_seconds
+    return start - base
 
 
 def _cuts_near_window(

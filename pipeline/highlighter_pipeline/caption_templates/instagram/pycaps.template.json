@@ -1,13 +1,15 @@
 {
     "css": "styles.css",
     "layout": {
-        "y_words_space": 4,
-        "max_width_ratio": 0.86,
-        "max_number_of_lines": 2,
+        "x_words_space": 0,
+        "y_words_space": 0,
+        "max_width_ratio": 0.88,
+        "max_number_of_lines": 1,
         "min_number_of_lines": 1,
+        "on_text_overflow_strategy": "exceed_width",
         "vertical_align": {
             "align": "center",
-            "offset": 0.42
+            "offset": 0.38
         }
     },
     "splitters": [
@@ -17,7 +19,7 @@
         {
             "type": "limit_by_chars",
             "min_chars": 6,
-            "max_chars": 20
+            "max_chars": 14
         }
     ],
     "animations": []

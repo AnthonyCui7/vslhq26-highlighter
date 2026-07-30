@@ -93,16 +93,19 @@ public static class Thumbnails
         string? title,
         JsonObject? researchContext,
         string outputDir,
-        string reasoningEffort = Defaults.DEFAULT_LLM_REASONING_EFFORT)
+        string reasoningEffort = Defaults.DEFAULT_LLM_REASONING_EFFORT,
+        string? guidance = null,
+        int startIndex = 1)
     {
-        var concepts = ThumbnailConcepts(entries, title, researchContext, reasoningEffort);
+        var concepts = ThumbnailConcepts(entries, title, researchContext, reasoningEffort, guidance);
         var referenceImages = ReferenceImages(longformPath, entries);
 
         Directory.CreateDirectory(outputDir);
         var variants = new JsonArray();
-        for (var number = 1; number <= concepts.Count; number++)
+        for (var offset = 0; offset < concepts.Count; offset++)
         {
-            var concept = concepts[number - 1];
+            var number = startIndex + offset;
+            var concept = concepts[offset];
             var prompt = ImagePrompt(concept, title);
             string outputPath;
             try
@@ -147,9 +150,10 @@ public static class Thumbnails
         IReadOnlyList<JsonObject> entries,
         string? title,
         JsonObject? researchContext,
-        string reasoningEffort)
+        string reasoningEffort,
+        string? guidance = null)
     {
-        var prompt = ConceptsPrompt(entries, title, researchContext);
+        var prompt = ConceptsPrompt(entries, title, researchContext, guidance);
         var providers = Providers.EditorProviders(
             title: "highlighter thumbnails", openrouterReasoningEffort: reasoningEffort);
         var (decision, _) = Providers.RunWithFallback(
@@ -165,10 +169,12 @@ public static class Thumbnails
     }
 
     public static string ConceptsPrompt(
-        IReadOnlyList<JsonObject> entries, string? title, JsonObject? researchContext)
+        IReadOnlyList<JsonObject> entries, string? title, JsonObject? researchContext,
+        string? guidance = null)
     {
         var lines = new List<string> { "Video brief:" };
         if (!string.IsNullOrEmpty(title)) lines.Add($"- Title: {title}");
+        if (!string.IsNullOrEmpty(guidance)) lines.Add($"- Human guidance: {guidance}");
         lines.Add("- Segments, in order:");
         foreach (var entry in entries)
         {
@@ -187,35 +193,23 @@ public static class Thumbnails
 
     private static JsonObject RequestConcepts(ChatProvider provider, string prompt)
     {
-        var body = new JsonObject
-        {
-            ["messages"] = new JsonArray
+        var content = Agents.RunAgentText(
+            provider,
+            instructions: CONCEPTS_SYSTEM_PROMPT,
+            prompt: prompt,
+            timeoutSeconds: 180.0,
+            extraOptions: new JsonObject
             {
-                new JsonObject { ["role"] = "system", ["content"] = CONCEPTS_SYSTEM_PROMPT },
-                new JsonObject { ["role"] = "user", ["content"] = prompt },
-            },
-            ["response_format"] = new JsonObject
-            {
-                ["type"] = "json_schema",
-                ["json_schema"] = new JsonObject
+                ["response_format"] = new JsonObject
                 {
-                    ["name"] = "thumbnail_concepts",
-                    ["schema"] = ThumbnailConceptsSchema(),
+                    ["type"] = "json_schema",
+                    ["json_schema"] = new JsonObject
+                    {
+                        ["name"] = "thumbnail_concepts",
+                        ["schema"] = ThumbnailConceptsSchema(),
+                    },
                 },
-            },
-        };
-        provider.ApplyRequestOptions(body);
-
-        JsonObject response;
-        using (var client = provider.Client(timeoutSeconds: 180.0))
-        {
-            response = client.ChatCompletions(body);
-        }
-        if (response["choices"] is not JsonArray choices || choices.Count == 0)
-            throw new PipelineError($"{provider.Label} concepts response did not include choices");
-        var content = JsonUtil.StrOrNull(choices[0]?["message"]?["content"]);
-        if (string.IsNullOrEmpty(content))
-            throw new PipelineError($"{provider.Label} concepts response did not include text content");
+            });
         return Llm.JsonFromText(content);
     }
 

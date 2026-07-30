@@ -325,6 +325,41 @@ public static class Revise
             .ToList();
     }
 
+    /// <summary>The newest version's generated thumbnails and title, for
+    /// carrying into the next version's row.</summary>
+    public static JsonObject InheritedRender(IReadOnlyList<JsonObject> longformEdits)
+    {
+        var inherited = new JsonObject();
+        var rows = longformEdits.OrderByDescending(row => JsonUtil.DoubleOr(row["version"], 0));
+        foreach (var row in rows)
+        {
+            var render = (row["metadata"] as JsonObject)?["render"] as JsonObject;
+            if (render is null) continue;
+            if (!inherited.ContainsKey("title") && JsonUtil.Truthy(render["title"]))
+                inherited["title"] = JsonUtil.C(render["title"]);
+            if (!inherited.ContainsKey("thumbnails")
+                && render["thumbnails"] is JsonObject thumbnails
+                && thumbnails["variants"] is JsonArray variants
+                && variants.Count > 0)
+            {
+                inherited["thumbnails"] = JsonUtil.CloneObj(thumbnails);
+            }
+            if (inherited.ContainsKey("title") && inherited.ContainsKey("thumbnails")) break;
+        }
+        return inherited;
+    }
+
+    /// <summary>The hosted URL of the selected thumbnail variant, if it has one.</summary>
+    public static string? SelectedVariantUrl(JsonObject thumbnails)
+    {
+        if (thumbnails["variants"] is not JsonArray variants) return null;
+        if (!JsonUtil.TryDouble(thumbnails["selected_index"], out var indexValue)) return null;
+        var index = (int)indexValue;
+        if (index < 0 || index >= variants.Count) return null;
+        var url = JsonUtil.StrOrNull((variants[index] as JsonObject)?["url"]);
+        return string.IsNullOrEmpty(url) ? null : url;
+    }
+
     /// <summary>Run the tool loop until apply_edit lands, trying each provider in
     /// the audio chain with a fresh loop (histories do not survive a provider
     /// swap). Returns (edit, toolsUsed); throws when no provider produced a
@@ -362,13 +397,73 @@ public static class Revise
         throw lastError;
     }
 
+    /// <summary>One provider's revision conversation, run as an Agent Framework
+    /// agent: the framework owns the session and the function-invocation loop,
+    /// the pipeline chat client keeps the wire behavior (assistant messages
+    /// replay verbatim, tool audio arrives in the following user message).</summary>
     private static (JsonObject Edit, List<string> ToolsUsed) RunAgentAttempt(
         ChatProvider provider, ReviseState state, ProjectRecords records, string request)
     {
-        var messages = new JsonArray
+        using var client = new PipelineChatClient(provider, timeoutSeconds: 300.0);
+        var toolsUsed = new List<string>();
+        JsonObject? edit = null;
+
+        void Tracked(string name, JsonObject args)
         {
-            new JsonObject { ["role"] = "system", ["content"] = REVISE_SYSTEM_PROMPT },
-            new JsonObject { ["role"] = "user", ["content"] = OpeningMessage(state, request) },
+            toolsUsed.Add(name);
+            Console.WriteLine($"[agent] {name}({SummarizeArgs(args)})");
+        }
+
+        object? Delegate(string name, JsonObject args)
+        {
+            Tracked(name, args);
+            var (text, parts) = RunTool(name, args, state, records);
+            if (parts.Count == 0) return text;
+            var audio = new JsonArray();
+            foreach (var part in parts) audio.Add(JsonUtil.C(part));
+            return Agents.ToolResultWithAudio(text, audio);
+        }
+
+        object? ApplyEdit(JsonObject args)
+        {
+            Tracked("apply_edit", args);
+            if (edit is not null) return "Unknown tool: apply_edit";
+            var (selections, problem) = ValidateSelections(
+                args["selections"], state.SourceEndSeconds);
+            if (problem is not null) return problem;
+            var selectionsArray = new JsonArray();
+            foreach (var selection in selections) selectionsArray.Add(selection);
+            edit = new JsonObject
+            {
+                ["selections"] = selectionsArray,
+                ["notes"] = JsonUtil.Truthy(args["notes"]) ? JsonUtil.Str(args["notes"]) : "",
+            };
+            // A committed edit ends the conversation: the client answers the
+            // loop's next request itself instead of spending another model call.
+            client.ShortCircuitText = "Edit accepted.";
+            return "Edit accepted.";
+        }
+
+        var tools = new List<Microsoft.Extensions.AI.AITool>();
+        foreach (var node in Tools())
+        {
+            if (node is not JsonObject declaration) continue;
+            var function = (JsonObject)declaration["function"]!;
+            var name = JsonUtil.Str(function["name"]);
+            var description = JsonUtil.Str(function["description"]);
+            var schema = (JsonObject)function["parameters"]!.DeepClone();
+            tools.Add(name == "apply_edit"
+                ? new RawSchemaFunction(name, description, schema, ApplyEdit)
+                : new RawSchemaFunction(name, description, schema, args => Delegate(name, args)));
+        }
+
+        var agent = new Microsoft.Agents.AI.ChatClientAgent(
+            client, instructions: REVISE_SYSTEM_PROMPT, tools: tools);
+        var session = agent.CreateSessionAsync().GetAwaiter().GetResult();
+
+        var opening = new List<Microsoft.Extensions.AI.ChatMessage>
+        {
+            Agents.TextMessage(Microsoft.Extensions.AI.ChatRole.User, OpeningMessage(state, request)),
         };
         if (provider.Name == "azure")
         {
@@ -379,123 +474,34 @@ public static class Revise
             var orientation = OrientationAudioParts(state);
             if (orientation.Count > 0)
             {
-                var orientationContent = new JsonArray();
-                foreach (var part in orientation) orientationContent.Add(part);
-                messages.Add(new JsonObject { ["role"] = "user", ["content"] = orientationContent });
+                var parts = new JsonArray();
+                foreach (var part in orientation) parts.Add(JsonUtil.C(part));
+                opening.Add(Agents.RawPartsMessage(Microsoft.Extensions.AI.ChatRole.User, parts));
             }
         }
-        var toolsUsed = new List<string>();
 
-        using var client = provider.Client(timeoutSeconds: 300.0);
-        for (var turn = 0; turn < MAX_AGENT_TURNS; turn++)
+        IEnumerable<Microsoft.Extensions.AI.ChatMessage> nextInput = opening;
+        while (client.Requests < MAX_AGENT_TURNS)
         {
-            var forcing = turn >= MAX_AGENT_TURNS - 2;
-            var body = new JsonObject
-            {
-                ["messages"] = (JsonArray)messages.DeepClone(),
-                ["tools"] = Tools(),
-                // The last turns force the commit; a named tool_choice is
-                // stronger than pleading in a user message.
-                ["tool_choice"] = forcing
-                    ? new JsonObject
-                    {
-                        ["type"] = "function",
-                        ["function"] = new JsonObject { ["name"] = "apply_edit" },
-                    }
-                    : "auto",
-            };
-            provider.ApplyRequestOptions(body);
-            var response = client.ChatCompletions(body);
-            if (response["choices"] is not JsonArray choices || choices.Count == 0)
-                throw new PipelineError("Revision agent response did not include choices");
-            var message = choices[0]?["message"] as JsonObject
-                ?? throw new PipelineError("Revision agent response did not include a message");
-            // Replayed verbatim: reasoning_details carries the Gemini thought
-            // signatures, and the provider rejects a history without them.
-            messages.Add(message.DeepClone());
-
-            var calls = message["tool_calls"] as JsonArray ?? new JsonArray();
-            if (calls.Count == 0)
-            {
-                messages.Add(new JsonObject
+            // The last turns force the commit; a named tool_choice is stronger
+            // than pleading in a user message.
+            var forcing = client.Requests >= MAX_AGENT_TURNS - 2;
+            client.ForcedToolChoice = forcing
+                ? new JsonObject
                 {
-                    ["role"] = "user",
-                    ["content"] = "Continue with a tool call; call apply_edit once the new cut is ready.",
-                });
-                continue;
-            }
-
-            var audioParts = new List<JsonObject>();
-            JsonObject? edit = null;
-            foreach (var callNode in calls)
-            {
-                if (callNode is not JsonObject call) continue;
-                var name = JsonUtil.Str(call["function"]?["name"]);
-                var rawArguments = JsonUtil.StrOrNull(call["function"]?["arguments"]);
-                JsonObject callArgs;
-                try
-                {
-                    callArgs = JsonUtil.ParseObject(
-                        string.IsNullOrEmpty(rawArguments) ? "{}" : rawArguments);
+                    ["type"] = "function",
+                    ["function"] = new JsonObject { ["name"] = "apply_edit" },
                 }
-                catch (System.Text.Json.JsonException exc)
-                {
-                    messages.Add(new JsonObject
-                    {
-                        ["role"] = "tool",
-                        ["tool_call_id"] = JsonUtil.C(call["id"]),
-                        ["content"] = $"Invalid JSON arguments: {exc.Message}",
-                    });
-                    continue;
-                }
-                toolsUsed.Add(name);
-                Console.WriteLine($"[agent] {name}({SummarizeArgs(callArgs)})");
-
-                string resultText;
-                if (name == "apply_edit" && edit is null)
-                {
-                    var (selections, problem) = ValidateSelections(
-                        callArgs["selections"], state.SourceEndSeconds);
-                    if (problem is not null)
-                    {
-                        resultText = problem;
-                    }
-                    else
-                    {
-                        var selectionsArray = new JsonArray();
-                        foreach (var selection in selections) selectionsArray.Add(selection);
-                        edit = new JsonObject
-                        {
-                            ["selections"] = selectionsArray,
-                            ["notes"] = JsonUtil.Truthy(callArgs["notes"])
-                                ? JsonUtil.Str(callArgs["notes"])
-                                : "",
-                        };
-                        resultText = "Edit accepted.";
-                    }
-                }
-                else
-                {
-                    var (text, parts) = RunTool(name, callArgs, state, records);
-                    resultText = text;
-                    audioParts.AddRange(parts);
-                }
-                messages.Add(new JsonObject
-                {
-                    ["role"] = "tool",
-                    ["tool_call_id"] = JsonUtil.C(call["id"]),
-                    ["content"] = resultText,
-                });
-            }
-
-            if (audioParts.Count > 0)
-            {
-                var content = new JsonArray();
-                foreach (var part in audioParts) content.Add(part);
-                messages.Add(new JsonObject { ["role"] = "user", ["content"] = content });
-            }
+                : null;
+            agent.RunAsync(nextInput, session).GetAwaiter().GetResult();
             if (edit is not null)
                 return (edit, toolsUsed.Distinct().OrderBy(t => t, StringComparer.Ordinal).ToList());
+            nextInput = new[]
+            {
+                Agents.TextMessage(
+                    Microsoft.Extensions.AI.ChatRole.User,
+                    "Continue with a tool call; call apply_edit once the new cut is ready."),
+            };
         }
 
         throw new PipelineError(
@@ -599,13 +605,14 @@ public static class Revise
                 $"v{JsonUtil.PyStr(r["version"])}: {JsonUtil.PyStr(r["request"])} -> {JsonUtil.PyStr(r["notes"])}")
             .ToList();
         var sourceMinutes = state.SourceMinutes ?? state.SourceEndSeconds / 60;
+        var targetLength = Llm.CapTargetMinutes(state.TargetLength, sourceMinutes);
         var lines = new List<string>
         {
             $"Revision request: {request}",
             "",
             $"Source: ~{Py.F(sourceMinutes, 0)} minutes captured "
             + $"(0s to {Py.F(state.SourceEndSeconds, 0)}s). "
-            + $"Target runtime: {state.TargetLength} minutes.",
+            + $"Target runtime: {targetLength} minutes.",
             $"Current edit (version {state.CurrentVersion}):",
         };
         lines.AddRange(currentLines);
@@ -1002,6 +1009,18 @@ public static class Revise
             Console.WriteLine($"Revision thumbnail extraction failed (non-fatal): {exc.Message}");
         }
 
+        // A re-cut alone regenerates neither thumbnails nor the title; carry the
+        // newest version's artifacts into this row so they stay with the edit
+        // (the midpoint frame is only the fallback when none exist).
+        var inherited = InheritedRender(state.LongformEdits);
+        if (JsonUtil.Truthy(inherited["title"])) result["title"] = JsonUtil.C(inherited["title"]);
+        if (inherited["thumbnails"] is JsonObject inheritedThumbs)
+        {
+            result["thumbnails"] = JsonUtil.CloneObj(inheritedThumbs);
+            var selectedUrl = SelectedVariantUrl(inheritedThumbs);
+            if (selectedUrl is not null) result["thumbnail_url"] = selectedUrl;
+        }
+
         var revisionMeta = new JsonObject
         {
             ["request"] = request,
@@ -1023,9 +1042,11 @@ public static class Revise
                 {
                     var thumbnailKey =
                         $"projects/{projectId}/longform/{Path.GetFileName(thumbnailPath)}";
-                    result["thumbnail_url"] = db.UploadStorageObject(
+                    var midframeUrl = db.UploadStorageObject(
                         bucket: clipsBucket, key: thumbnailKey, path: thumbnailPath);
                     result["thumbnail_storage_path"] = thumbnailKey;
+                    if (!JsonUtil.Truthy(result["thumbnail_url"]))
+                        result["thumbnail_url"] = midframeUrl;
                 }
                 db.InsertLongformEdit(
                     projectId: projectId,

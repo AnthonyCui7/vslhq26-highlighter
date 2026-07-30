@@ -176,6 +176,11 @@ public static class Ingest
         // threads touch these.
         var segmentFiles = new Dictionary<int, string>();
         var segmentsGate = new object();
+        // Measured container start per archive segment: copy cuts land on
+        // keyframes at or after the nominal boundary, so a segment's true
+        // position drifts past index * chunkSeconds — clip windows and scene
+        // cuts are placed with these instead of nominal arithmetic.
+        var segmentStarts = new Dictionary<int, double>();
         // Scene cuts per archive segment (absolute seconds) and every word's
         // absolute span, so boundary snapping never lands inside speech.
         var chunkCuts = new Dictionary<int, List<double>>();
@@ -614,14 +619,21 @@ public static class Ingest
                 TryRenderFromSegments(fork, decision);
             }
 
+            double SegmentStart(int index)
+            {
+                lock (segmentsGate)
+                {
+                    return MeasuredSegmentStart(segmentStarts, index, chunkSeconds);
+                }
+            }
+
             List<int> NeededSegments(JsonObject decision)
             {
-                // Archive segment indexes a clip window spans (end is exclusive
-                // when it lands exactly on a segment boundary).
-                var first = (int)(JsonUtil.Double(decision["start_seconds"]) / chunkSeconds);
-                var last = (int)(Math.Max(
+                var (first, last) = WindowSegmentRange(
                     JsonUtil.Double(decision["start_seconds"]),
-                    JsonUtil.Double(decision["end_seconds"]) - 0.001) / chunkSeconds);
+                    JsonUtil.Double(decision["end_seconds"]),
+                    chunkSeconds,
+                    SegmentStart);
                 return Enumerable.Range(first, last - first + 1).ToList();
             }
 
@@ -650,7 +662,7 @@ public static class Ingest
                     clipsBucket: clipsBucket,
                     decision: decision,
                     segmentPaths: needed.Select(index => segmentFiles[index]).ToList(),
-                    firstSegmentStartSeconds: needed[0] * (double)chunkSeconds,
+                    firstSegmentStartSeconds: SegmentStart(needed[0]),
                     renderedLog: fork.RenderedLog,
                     pipeline: fork.Mode,
                     filenameSuffix: fork.FilenameSuffix,
@@ -857,12 +869,25 @@ public static class Ingest
 
             void HandleVideoSegment(string segmentPath, int segmentIndex)
             {
+                var probed = Render.ProbeStartTime(segmentPath);
+                if (probed is null)
+                {
+                    Console.WriteLine(
+                        $"Segment {segmentIndex} start probe failed; using nominal timing");
+                }
+                else
+                {
+                    lock (segmentsGate)
+                    {
+                        segmentStarts[segmentIndex] = probed.Value;
+                    }
+                }
                 if (shotDetector is not null)
                 {
                     try
                     {
                         var cuts = shotDetector.DetectCuts(
-                            segmentPath, segmentIndex * (double)chunkSeconds);
+                            segmentPath, SegmentStart(segmentIndex));
                         lock (cutsGate)
                         {
                             chunkCuts[segmentIndex] = cuts;
@@ -2102,6 +2127,38 @@ public static class Ingest
             + $"{JsonUtil.Str(decision["chunk_index"])}: {JsonUtil.Str(decision["title"])} "
             + $"({JsonUtil.Str(decision["start_seconds"])}s-{JsonUtil.Str(decision["end_seconds"])}s, "
             + $"score {JsonUtil.Str(decision["score"])})");
+    }
+
+    /// <summary>Archive segment indexes a clip window spans (end is exclusive
+    /// when it lands exactly on a segment boundary). Measured starts sit at or
+    /// after the nominal boundary, so a window can begin in the previous
+    /// segment's tail or end before a nominal segment's content starts.</summary>
+    public static (int First, int Last) WindowSegmentRange(
+        double startSeconds,
+        double endSeconds,
+        int chunkSeconds,
+        Func<int, double> segmentStart)
+    {
+        var first = (int)(startSeconds / chunkSeconds);
+        var last = (int)(Math.Max(startSeconds, endSeconds - 0.001) / chunkSeconds);
+        while (first > 0 && segmentStart(first) > startSeconds) first--;
+        while (last > first && segmentStart(last) >= endSeconds) last--;
+        return (first, last);
+    }
+
+    /// <summary>A segment's real position on the capture clock: its archived
+    /// container timestamp relative to segment 0's. Copy cuts wait for a
+    /// keyframe, so this sits at or after index * chunkSeconds — which is the
+    /// fallback whenever a probe is missing.</summary>
+    public static double MeasuredSegmentStart(
+        Dictionary<int, double> segmentStarts, int index, int chunkSeconds)
+    {
+        if (!segmentStarts.TryGetValue(0, out var baseStart)
+            || !segmentStarts.TryGetValue(index, out var start))
+        {
+            return index * (double)chunkSeconds;
+        }
+        return start - baseStart;
     }
 
     /// <summary>Words overlapping a clip window, pulled from the chunks that cover it.</summary>

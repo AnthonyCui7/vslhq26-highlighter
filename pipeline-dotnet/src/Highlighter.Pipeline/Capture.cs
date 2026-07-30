@@ -137,6 +137,17 @@ public static class Capture
             "-reset_timestamps",
             "1",
         };
+        // Archive segments keep the continuous capture timeline: copy cuts land
+        // on keyframes, so a segment's true start drifts past its nominal
+        // boundary, and the preserved timestamps are how downstream rendering
+        // recovers the real position (render reads it back with ProbeStartTime).
+        var archiveSegmentArgs = new List<string>
+        {
+            "-f",
+            "segment",
+            "-segment_time",
+            Py.S(chunkSeconds),
+        };
 
         var ffmpegArgs = new List<string>
         {
@@ -163,7 +174,7 @@ public static class Capture
             // full source archive, no re-encode
             ffmpegArgs.AddRange(new[] { "-map", "0", "-c", "copy" });
             ffmpegArgs.AddRange(durationArgs);
-            ffmpegArgs.AddRange(segmentArgs);
+            ffmpegArgs.AddRange(archiveSegmentArgs);
             ffmpegArgs.Add(Path.Combine(archiveDir, "video_%05d.ts"));
         }
 

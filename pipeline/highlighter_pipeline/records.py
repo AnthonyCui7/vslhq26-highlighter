@@ -66,6 +66,21 @@ class ProjectRecords:
         name = "research.json" if mode is None else f"research_{mode}.json"
         self._write_json(name, context)
 
+    def update_longform_edit(self, version: int, row: dict[str, Any]) -> None:
+        """Replace the recorded row for a long-form version in place."""
+        self._rewrite_jsonl(
+            "longform_edits.jsonl", lambda old: (old.get("version") or 1) == version, row
+        )
+
+    def update_clip(self, filename: str, row: dict[str, Any]) -> None:
+        """Replace the recorded row for a clip (matched by rendered filename)."""
+        self._rewrite_jsonl(
+            "clips.jsonl",
+            lambda old: ((old.get("metadata") or {}).get("render") or {}).get("filename")
+            == filename,
+            row,
+        )
+
     def _write_json(self, name: str, payload: dict[str, Any]) -> None:
         with self._lock:
             (self.project_dir / name).write_text(
@@ -76,3 +91,20 @@ class ProjectRecords:
         with self._lock:
             with (self.project_dir / name).open("a") as file:
                 file.write(json.dumps(row, default=str) + "\n")
+
+    def _rewrite_jsonl(self, name: str, matches: Any, row: dict[str, Any]) -> None:
+        with self._lock:
+            path = self.project_dir / name
+            rows = (
+                [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+                if path.exists()
+                else []
+            )
+            replaced = False
+            for index, old in enumerate(rows):
+                if matches(old):
+                    rows[index] = row
+                    replaced = True
+            if not replaced:
+                rows.append(row)
+            path.write_text("".join(json.dumps(r, default=str) + "\n" for r in rows))

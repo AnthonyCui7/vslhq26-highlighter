@@ -1,0 +1,317 @@
+using System.Diagnostics;
+using System.Globalization;
+using System.Text;
+using System.Text.Json.Nodes;
+using Highlighter.Api.Contracts;
+using Highlighter.Api.Infrastructure;
+
+namespace Highlighter.Api.Services;
+
+/// <summary>Spawns and supervises worker processes. The registry is in-memory by
+/// design: project rows stay authoritative, cooperative cancel survives an API
+/// restart (the worker polls the DB), and the per-job log files are the durable
+/// record. One active job per project; cleanup drains are globally single-flight.</summary>
+public sealed class PipelineJobService(RepoLayout layout, SupabaseDb db, ILogger<PipelineJobService> log)
+{
+    private const int MaxTerminalJobs = 200;
+    private static readonly TimeSpan ForceKillGrace = TimeSpan.FromSeconds(15);
+
+    private readonly object _gate = new();
+    private readonly Dictionary<string, PipelineJob> _jobs = [];
+    private readonly List<PipelineJob> _order = [];
+
+    public static string NewJobId() => "job_" + Guid.NewGuid().ToString("N")[..12];
+
+    /// <summary>id may be preassigned (POST /api/projects writes it into the row's
+    /// instance_id before the row exists, so it must be known up front).</summary>
+    public PipelineJob Start(string kind, Guid? projectId, IReadOnlyList<string> workerArgs, string? id = null)
+    {
+        var command = layout.ResolveWorkerCommand()
+            ?? throw new WorkerUnavailableException(
+                "Pipeline worker binary not found: run `dotnet build pipeline-dotnet` "
+                + "or set Pipeline:WorkerCommand.");
+
+        id ??= NewJobId();
+        var display = new List<string> { command.FileName };
+        display.AddRange(command.PrefixArgs);
+        display.AddRange(workerArgs);
+        var logName = $"{DateTime.UtcNow:yyyyMMdd-HHmmss}-{kind}"
+            + $"-{(projectId is { } p ? p.ToString()[..8] : "global")}-{id}.log";
+        var job = new PipelineJob(id, kind, projectId, display, Path.Combine(layout.JobLogRoot, logName));
+
+        lock (_gate)
+        {
+            if (projectId is { } pid && ActiveForProjectLocked(pid) is { } blocker)
+                throw new JobConflictException(
+                    $"Project {pid} already has an active job ({blocker.Id}: {blocker.Kind}).");
+            if (kind == "cleanup" && _order.Any(other => other.Kind == "cleanup" && !other.IsTerminal))
+                throw new JobConflictException("A cleanup drain is already running.");
+            _jobs[id] = job;
+            _order.Add(job);
+        }
+
+        try
+        {
+            Launch(job, command, workerArgs);
+            log.LogInformation("Job {JobId} ({Kind}) started for project {ProjectId}: {Command}",
+                id, kind, projectId, string.Join(' ', display));
+        }
+        catch (Exception exception)
+        {
+            log.LogError(exception, "Job {JobId} ({Kind}): worker spawn failed", id, kind);
+            job.MarkFailed($"spawn failed: {exception.Message}");
+            throw new WorkerUnavailableException(
+                $"Failed to launch the pipeline worker: {exception.Message} (job {id}, log: {job.LogPath})");
+        }
+        return job;
+    }
+
+    public PipelineJob? Get(string id)
+    {
+        lock (_gate) return _jobs.GetValueOrDefault(id);
+    }
+
+    public List<JobDto> List(string? state, Guid? projectId)
+    {
+        List<PipelineJob> jobs;
+        lock (_gate) jobs = _order.AsEnumerable().Reverse().ToList();
+        return jobs
+            .Where(job => projectId is null || job.ProjectId == projectId)
+            .Select(job => job.ToDto())
+            .Where(dto => state is null || dto.State == state)
+            .ToList();
+    }
+
+    public PipelineJob? ActiveForProject(Guid projectId)
+    {
+        lock (_gate) return ActiveForProjectLocked(projectId);
+    }
+
+    public string? ActiveJobIdForProject(Guid projectId) => ActiveForProject(projectId)?.Id;
+
+    /// <summary>Escalating stop for a registry-tracked process: SIGTERM (via
+    /// /bin/kill — Process.Kill() is SIGKILL on Unix and would rob the worker of
+    /// its own terminal status write), a grace period, then SIGKILL. Returns false
+    /// when there is no live process to signal.</summary>
+    public async Task<bool> ForceKillAsync(PipelineJob job)
+    {
+        Process? process;
+        lock (_gate)
+        {
+            job.KillRequested = true;
+            process = job.Process;
+        }
+        if (process is null) return false;
+        try
+        {
+            if (process.HasExited) return false;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+
+        job.Append("api", "force-cancel: sending SIGTERM");
+        try
+        {
+            var term = new Process
+            {
+                StartInfo = new ProcessStartInfo("/bin/kill") { UseShellExecute = false },
+            };
+            term.StartInfo.ArgumentList.Add("-TERM");
+            term.StartInfo.ArgumentList.Add(process.Id.ToString(CultureInfo.InvariantCulture));
+            term.Start();
+            await term.WaitForExitAsync();
+            term.Dispose();
+        }
+        catch (Exception exception)
+        {
+            log.LogWarning("Job {JobId}: SIGTERM delivery failed: {Message}", job.Id, exception.Message);
+        }
+
+        using var grace = new CancellationTokenSource(ForceKillGrace);
+        try
+        {
+            await process.WaitForExitAsync(grace.Token);
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+        }
+
+        job.Append("api", $"force-cancel: still alive after {ForceKillGrace.TotalSeconds:0}s, sending SIGKILL");
+        try
+        {
+            process.Kill(entireProcessTree: true);
+        }
+        catch (InvalidOperationException)
+        {
+        }
+        try
+        {
+            await process.WaitForExitAsync();
+        }
+        catch (InvalidOperationException)
+        {
+        }
+        return true;
+    }
+
+    /// <summary>Durable-log fallback for jobs the (in-memory) registry no longer
+    /// knows — typically after an API restart. Finds the file by the job id baked
+    /// into its name.</summary>
+    public List<JobLogLineDto>? ReadLogFileTail(string jobId, int tail)
+    {
+        if (!Directory.Exists(layout.JobLogRoot)) return null;
+        var path = Directory.EnumerateFiles(layout.JobLogRoot, $"*-{jobId}.log").FirstOrDefault();
+        if (path is null) return null;
+        var lines = File.ReadAllLines(path);
+        var start = Math.Max(0, lines.Length - tail);
+        var result = new List<JobLogLineDto>();
+        for (var i = start; i < lines.Length; i++)
+            result.Add(ParseLogLine(lines[i], i + 1));
+        return result;
+    }
+
+    /// <summary>Pure decision table for fixing the project row after an ingest
+    /// worker is OBSERVED dead — the only situation where the API may write
+    /// terminal statuses. Guards make the race with a concurrent writer harmless.</summary>
+    public static (string[] Guard, string Status, string? Error)? DecideRowFixup(
+        string? rowStatus, int exitCode, string jobId) => rowStatus switch
+    {
+        "created" => (["created"], "failed",
+            $"worker exited before claiming the project (exit {exitCode}); see job {jobId} logs"),
+        "ingesting" => (["ingesting"], "failed",
+            $"worker terminated unexpectedly (exit {exitCode}); see job {jobId} logs"),
+        "stopping" => (["stopping"], "cancelled", null),
+        _ => null,
+    };
+
+    internal static JobLogLineDto ParseLogLine(string raw, long seq)
+    {
+        // Format: "2026-07-29T12:00:00.000Z [out] text"
+        var firstSpace = raw.IndexOf(' ');
+        if (firstSpace > 0
+            && DateTimeOffset.TryParse(raw[..firstSpace], CultureInfo.InvariantCulture,
+                DateTimeStyles.AssumeUniversal, out var at))
+        {
+            var rest = raw[(firstSpace + 1)..];
+            if (rest.StartsWith('[') && rest.IndexOf(']') is var close and > 0)
+                return new JobLogLineDto(seq, at, rest[1..close],
+                    rest.Length > close + 2 ? rest[(close + 2)..] : "");
+        }
+        return new JobLogLineDto(seq, default, "out", raw);
+    }
+
+    private PipelineJob? ActiveForProjectLocked(Guid projectId) =>
+        _order.LastOrDefault(job => job.ProjectId == projectId && !job.IsTerminal);
+
+    private void Launch(PipelineJob job, WorkerCommand command, IReadOnlyList<string> workerArgs)
+    {
+        job.OpenSink(
+        [
+            $"job {job.Id} kind={job.Kind}" + (job.ProjectId is { } p ? $" project={p}" : ""),
+            $"command: {string.Join(' ', job.Argv)}",
+            $"workdir: {layout.RepoRoot}",
+        ]);
+
+        var info = new ProcessStartInfo
+        {
+            FileName = command.FileName,
+            WorkingDirectory = layout.RepoRoot,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8,
+        };
+        foreach (var argument in command.PrefixArgs) info.ArgumentList.Add(argument);
+        foreach (var argument in workerArgs) info.ArgumentList.Add(argument);
+
+        var process = new Process { StartInfo = info };
+        process.Start();
+        job.Process = process;
+        job.MarkRunning();
+        job.Append("api", $"worker pid {process.Id}");
+        var pumpOut = Task.Run(() => PumpAsync(job, process.StandardOutput, "out"));
+        var pumpErr = Task.Run(() => PumpAsync(job, process.StandardError, "err"));
+        _ = Task.Run(() => SuperviseAsync(job, process, pumpOut, pumpErr));
+    }
+
+    private static async Task PumpAsync(PipelineJob job, StreamReader reader, string stream)
+    {
+        while (await reader.ReadLineAsync() is { } line) job.Append(stream, line);
+    }
+
+    private async Task SuperviseAsync(PipelineJob job, Process process, Task pumpOut, Task pumpErr)
+    {
+        try
+        {
+            await Task.WhenAll(pumpOut, pumpErr);
+            await process.WaitForExitAsync();
+            var exitCode = process.ExitCode;
+
+            string? note = null;
+            if (job.Kind == "ingest" && job.ProjectId is { } projectId)
+                note = await ReconcileIngestRowAsync(job, projectId, exitCode);
+
+            job.MarkExited(exitCode, note);
+            if (job.State == JobState.Failed)
+                log.LogError(
+                    "Job {JobId} ({Kind}) failed with exit {Exit}; log: {LogPath}. Last lines:\n{Tail}",
+                    job.Id, job.Kind, exitCode, job.LogPath,
+                    string.Join("\n", job.Tail(40).Select(line => $"[{line.Stream}] {line.Line}")));
+            else
+                log.LogInformation("Job {JobId} ({Kind}) finished: {State} (exit {Exit})",
+                    job.Id, job.Kind, job.State, exitCode);
+        }
+        catch (Exception exception)
+        {
+            log.LogError(exception, "Job {JobId}: supervision failed", job.Id);
+            job.MarkFailed($"supervision failed: {exception.Message}");
+        }
+        finally
+        {
+            process.Dispose();
+            Evict();
+        }
+    }
+
+    private async Task<string?> ReconcileIngestRowAsync(PipelineJob job, Guid projectId, int exitCode)
+    {
+        try
+        {
+            var status = await db.GetProjectStatusAsync(projectId);
+            var fixup = DecideRowFixup(status, exitCode, job.Id);
+            if (fixup is null) return $"row status after exit: {status ?? "row missing"}";
+
+            var patch = new JsonObject { ["status"] = fixup.Value.Status };
+            if (fixup.Value.Error is not null) patch["error"] = fixup.Value.Error;
+            var updated = await db.PatchProjectGuardedAsync(projectId, fixup.Value.Guard, patch);
+            log.LogWarning("Job {JobId}: reconciled project {ProjectId} row '{From}' -> '{To}' (applied: {Applied})",
+                job.Id, projectId, status, fixup.Value.Status, updated is not null);
+            return updated is not null
+                ? $"row reconciled: {status} -> {fixup.Value.Status}"
+                : $"row reconciliation guard missed (row moved past '{status}')";
+        }
+        catch (PostgrestException exception)
+        {
+            log.LogError("Job {JobId}: row reconciliation failed: {Message}", job.Id, exception.Message);
+            return $"row reconciliation failed: {exception.Message}";
+        }
+    }
+
+    private void Evict()
+    {
+        lock (_gate)
+        {
+            var terminal = _order.Where(job => job.IsTerminal).ToList();
+            var excess = terminal.Count - MaxTerminalJobs;
+            for (var i = 0; i < excess; i++)
+            {
+                _order.Remove(terminal[i]);
+                _jobs.Remove(terminal[i].Id);
+            }
+        }
+    }
+}

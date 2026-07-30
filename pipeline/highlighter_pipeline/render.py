@@ -223,6 +223,34 @@ def _transcode_to_mp4(*, source_path: Path, output_path: Path) -> None:
     )
 
 
+def probe_start_time(path: Path) -> float | None:
+    """The container's first timestamp in seconds, or None when unreadable.
+
+    Archive segments keep the capture run's continuous timeline, so this is
+    a segment's measured position — the difference from the first segment's
+    value places it on the same clock the transcript chunks use."""
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=start_time",
+            "-of",
+            "csv=p=0",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return None
+
+
 def _validate_window(*, start_seconds: float, end_seconds: float) -> None:
     if end_seconds <= start_seconds:
         raise RuntimeError("Clip end_seconds must be greater than start_seconds")

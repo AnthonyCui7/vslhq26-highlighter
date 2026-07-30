@@ -17,9 +17,9 @@
                         <span class="absolute bottom-2 right-2 rounded-[3px] bg-[rgba(20,19,18,0.85)] px-1.5 py-0.5 font-mono text-[10.5px] text-fg">24:36</span>
                     </div>
                     <div class="mt-3 flex items-center gap-2">
-                        <div class="text-sm font-bold">Final cut</div>
-                        <div class="text-[11.5px] text-muted">v2 · from 2:01:44 source</div>
-                        <div @onclick="S.OpenEditorLong" class="ml-auto cursor-pointer rounded-[5px] border border-line2 px-3 py-[5px] text-xs text-soft hover:border-[#4A4638] hover:text-fg active:scale-[0.98]">Open in editor</div>
+                        <div class="min-w-0 truncate text-sm font-bold" title="@SampleData.LongformTitle">@SampleData.LongformTitle</div>
+                        <div class="shrink-0 text-[11.5px] text-muted">v2</div>
+                        <div @onclick="S.OpenEditorLong" class="ml-auto shrink-0 cursor-pointer rounded-[5px] border border-line2 px-3 py-[5px] text-xs text-soft hover:border-[#4A4638] hover:text-fg active:scale-[0.98]">Open in editor</div>
                     </div>
                 </div>
                 <div class="flex min-w-0 flex-1 flex-col">
@@ -36,6 +36,8 @@
                     </div>
                 </div>
             </div>
+
+            <ThumbnailSection />
         }
 
         @* Highlights *@

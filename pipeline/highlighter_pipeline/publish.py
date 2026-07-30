@@ -313,7 +313,8 @@ def _resolve_thumbnail(
     Returns (public URL, cleanup metadata for an uploaded custom file)."""
     if raw.isdigit():
         wanted = int(raw)
-        for row in _read_jsonl(project_dir / "longform_edits.jsonl"):
+        rows = _read_jsonl(project_dir / "longform_edits.jsonl")
+        for row in sorted(rows, key=lambda row: row.get("version") or 0, reverse=True):
             thumbnails = ((row.get("metadata") or {}).get("render") or {}).get("thumbnails")
             for variant in (thumbnails or {}).get("variants", []):
                 if variant.get("index") == wanted and variant.get("url"):

@@ -95,3 +95,35 @@ public class TestResultUrl
         Assert.Null(Publish.ResultUrl(new JsonObject { ["success"] = true }));
     }
 }
+
+public class ResolveThumbnailTests
+{
+    private static string WriteRows(params string[] rows)
+    {
+        var dir = Path.Combine(Path.GetTempPath(), $"pubtest-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        File.WriteAllLines(Path.Combine(dir, "longform_edits.jsonl"), rows);
+        return dir;
+    }
+
+    [Fact]
+    public void NewestVersionVariantsWin()
+    {
+        var dir = WriteRows(
+            """{"version":1,"metadata":{"render":{"thumbnails":{"variants":[{"index":2,"url":"https://old/2.png"}]}}}}""",
+            """{"version":2,"metadata":{"render":{"thumbnails":{"variants":[{"index":2,"url":"https://new/2.png"}]}}}}""");
+        var (url, upload) = Publish.ResolveThumbnail("2", dir, "p", db: null, dryRun: true);
+        Assert.Equal("https://new/2.png", url);
+        Assert.Null(upload);
+    }
+
+    [Fact]
+    public void FallsBackToOlderVersionWithVariants()
+    {
+        var dir = WriteRows(
+            """{"version":1,"metadata":{"render":{"thumbnails":{"variants":[{"index":1,"url":"https://v1/1.png"}]}}}}""",
+            """{"version":2,"metadata":{"render":{}}}""");
+        var (url, _) = Publish.ResolveThumbnail("1", dir, "p", db: null, dryRun: true);
+        Assert.Equal("https://v1/1.png", url);
+    }
+}

@@ -1,0 +1,30 @@
+namespace Highlighter.Api;
+
+/// <summary>Bound from the "Api" configuration section.</summary>
+public sealed class ApiOptions
+{
+    /// <summary>When non-empty, /api/* requests must carry a matching X-Api-Key header.
+    /// Empty (the default) disables the gate — the API binds to localhost.</summary>
+    public string ApiKey { get; set; } = "";
+
+    public string[] CorsOrigins { get; set; } = [];
+}
+
+/// <summary>Bound from the "Pipeline" configuration section.</summary>
+public sealed class PipelineOptions
+{
+    /// <summary>Explicit worker launch command ("dotnet /path/highlighter.dll" or
+    /// "/path/highlighter"). Empty → auto-resolve the built pipeline-dotnet CLI.</summary>
+    public string WorkerCommand { get; set; } = "";
+
+    /// <summary>Monorepo root override. Empty → walk up to the first directory
+    /// containing .git or .env.</summary>
+    public string RepoRoot { get; set; } = "";
+
+    /// <summary>Directory for per-job worker logs. Empty → {repo}/outputs/api/jobs.</summary>
+    public string JobLogRoot { get; set; } = "";
+
+    public int CleanupIntervalMinutes { get; set; } = 15;
+
+    public int CleanupLimit { get; set; } = 50;
+}

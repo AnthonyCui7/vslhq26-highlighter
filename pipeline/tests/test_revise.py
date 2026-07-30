@@ -206,3 +206,49 @@ def test_materialize_fetches_when_candidate_file_is_missing(tmp_path, monkeypatc
     )
     path, source = _materialize(state, 10.0, 60.0)
     assert source["mode"] == "fetched"
+
+
+class TestInheritedRender:
+    def test_newest_version_with_artifacts_wins(self):
+        from highlighter_pipeline.revise import _inherited_render
+
+        rows = [
+            {
+                "version": 1,
+                "metadata": {
+                    "render": {
+                        "title": "Old Title",
+                        "thumbnails": {"variants": [{"index": 1, "url": "https://v1/1.png"}],
+                                       "selected_index": 0},
+                    }
+                },
+            },
+            {"version": 2, "metadata": {"render": {"title": "New Title"}}},
+        ]
+        inherited = _inherited_render(rows)
+        assert inherited["title"] == "New Title"
+        assert inherited["thumbnails"]["variants"][0]["url"] == "https://v1/1.png"
+
+    def test_empty_rows_inherit_nothing(self):
+        from highlighter_pipeline.revise import _inherited_render
+
+        assert _inherited_render([]) == {}
+        assert _inherited_render([{"version": 1, "metadata": {"render": {}}}]) == {}
+
+
+class TestSelectedVariantUrl:
+    def test_selected_index_resolves(self):
+        from highlighter_pipeline.revise import _selected_variant_url
+
+        thumbs = {
+            "variants": [{"url": "https://a"}, {"url": "https://b"}],
+            "selected_index": 1,
+        }
+        assert _selected_variant_url(thumbs) == "https://b"
+
+    def test_missing_or_bad_index_is_none(self):
+        from highlighter_pipeline.revise import _selected_variant_url
+
+        assert _selected_variant_url({"variants": [{"url": "https://a"}]}) is None
+        assert _selected_variant_url({"variants": [], "selected_index": 0}) is None
+        assert _selected_variant_url({"variants": [{}], "selected_index": 0}) is None

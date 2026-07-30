@@ -2,24 +2,27 @@
 
 <div class="anim-fade-up flex min-w-0 flex-1 flex-col bg-[#0D0C0B]" style="animation-delay:90ms">
     <div class="flex min-h-0 flex-1 items-center justify-center p-[18px] [container-type:size]">
-        <div class="relative aspect-[9/16] h-[min(100%,177.7cqw)] overflow-hidden border border-line bg-[repeating-linear-gradient(-45deg,#191817_0_12px,#1D1B19_12px_24px)]">
+        <div class="relative @AspectClasses overflow-hidden border border-line bg-[repeating-linear-gradient(-45deg,#191817_0_12px,#1D1B19_12px_24px)]">
             <div class="absolute inset-0 flex items-center justify-center">
-                <span class="font-mono text-[10px] text-dim">program · 9:16</span>
+                <span class="font-mono text-[10px] text-dim">program · @FormatLabel</span>
             </div>
-            <div class="absolute bottom-[12%] left-[8%] right-[8%] text-center">
-                @if (S.CapStyle == "boxed")
-                {
-                    <span class="anim-fade-up rounded-[3px] bg-ink px-[7px] py-[3px] text-[15px] font-extrabold leading-[1.55] text-fg [box-decoration-break:clone] [-webkit-box-decoration-break:clone]">nobody budgets for the <span class="text-accent">retry storm</span></span>
-                }
-                @if (S.CapStyle == "plain")
-                {
-                    <span class="anim-fade-up text-[15px] font-extrabold leading-[1.55] text-fg [text-shadow:0_1px_3px_#141312,0_0_12px_#141312]">nobody budgets for the <span class="text-accent">retry storm</span></span>
-                }
-                @if (S.CapStyle == "karaoke")
-                {
-                    <span class="anim-fade-up text-[15px] font-extrabold leading-[1.55] text-muted [text-shadow:0_1px_3px_#141312]"><span class="text-accent">nobody budgets</span> for the retry storm</span>
-                }
-            </div>
+            @if (S.ClipCaptionsOn)
+            {
+                <div class="absolute bottom-[12%] left-[8%] right-[8%] text-center">
+                    @if (S.CapStyle == "boxed")
+                    {
+                        <span class="anim-fade-up rounded-[3px] bg-ink px-[7px] py-[3px] text-[15px] font-extrabold leading-[1.55] text-fg [box-decoration-break:clone] [-webkit-box-decoration-break:clone]">nobody budgets for the <span class="text-accent">retry storm</span></span>
+                    }
+                    @if (S.CapStyle == "plain")
+                    {
+                        <span class="anim-fade-up text-[15px] font-extrabold leading-[1.55] text-fg [text-shadow:0_1px_3px_#141312,0_0_12px_#141312]">nobody budgets for the <span class="text-accent">retry storm</span></span>
+                    }
+                    @if (S.CapStyle == "karaoke")
+                    {
+                        <span class="anim-fade-up text-[15px] font-extrabold leading-[1.55] text-muted [text-shadow:0_1px_3px_#141312]"><span class="text-accent">nobody budgets</span> for the retry storm</span>
+                    }
+                </div>
+            }
         </div>
     </div>
     <div class="flex min-w-0 items-center gap-2.5 px-3.5 pb-3 pt-2">
@@ -42,3 +45,19 @@
         </div>
     </div>
 </div>
+
+@code {
+    string AspectClasses => S.ClipFormat switch
+    {
+        "square" => "aspect-square h-[min(100%,100cqw)]",
+        "wide" => "aspect-video w-[min(100%,177.7cqh)]",
+        _ => "aspect-[9/16] h-[min(100%,177.7cqw)]",
+    };
+
+    string FormatLabel => S.ClipFormat switch
+    {
+        "square" => "1:1",
+        "wide" => "16:9",
+        _ => "9:16",
+    };
+}

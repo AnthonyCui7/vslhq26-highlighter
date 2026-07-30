@@ -1,0 +1,181 @@
+using System.Globalization;
+using System.Text.Json.Nodes;
+using Highlighter.Api.Contracts;
+
+namespace Highlighter.Api.Services;
+
+/// <summary>Pure snake_case PostgREST row → DTO mapping, including the derived
+/// fields (progress, duration, embedded counts). No I/O.</summary>
+public static class ProjectShaper
+{
+    public static ProjectSummaryDto Summary(JsonObject row, string? activeJobId = null)
+    {
+        var status = Str(row["status"]) ?? "created";
+        var metadata = row["metadata"] as JsonObject;
+        var ingest = metadata?["ingest"] as JsonObject;
+        var apiRequest = (metadata?["api"] as JsonObject)?["request"] as JsonObject;
+
+        var chunkCount = EmbedCount(row["transcript_chunks"]);
+        var sourceMinutes = Dbl(ingest?["source_minutes"]);
+        var chunkSeconds = Dbl(ingest?["chunk_seconds"]) ?? Dbl(apiRequest?["chunk_seconds"]) ?? 90;
+        var maxChunks = IntOrNull(apiRequest?["max_chunks"]) ?? IntOrNull(ingest?["max_chunks"]) ?? 0;
+
+        return new ProjectSummaryDto(
+            Id: Guid.Parse(Str(row["id"])!),
+            Name: Str(row["name"]) ?? "",
+            SourceType: Str(row["source_type"]) ?? "",
+            SourceUrl: Str(row["source_url"]) ?? "",
+            Status: status,
+            Pipeline: Str(apiRequest?["pipeline"]) ?? Str(ingest?["pipeline"]) ?? "short",
+            Error: Str(row["error"]),
+            MinClipScore: Dbl(row["min_clip_score"]),
+            DurationSeconds: sourceMinutes * 60,
+            ClipCount: EmbedCount(row["clips"]),
+            ChunkCount: chunkCount,
+            LongformCount: EmbedCount(row["longform_edits"]),
+            Processing: status is "created" or "ingesting" or "stopping",
+            Progress: BuildProgress(status, chunkCount, sourceMinutes, chunkSeconds, maxChunks),
+            ActiveJobId: activeJobId,
+            CreatedAt: Ts(row["created_at"]),
+            UpdatedAt: Ts(row["updated_at"]));
+    }
+
+    public static ProjectDetailDto Detail(JsonObject row, bool hasLocalMirror, string? activeJobId = null) =>
+        new(
+            Project: Summary(row, activeJobId),
+            HasLocalMirror: hasLocalMirror,
+            Clips: Rows(row["clips"]).Select(Clip).ToList(),
+            LongformEdits: Rows(row["longform_edits"]).Select(Longform).ToList(),
+            Publications: Rows(row["publications"]).Select(Publication).ToList());
+
+    public static ProgressDto BuildProgress(
+        string status, int chunksStored, double? sourceMinutes, double chunkSeconds, int maxChunks)
+    {
+        var stage = status == "created" ? "queued" : status;
+        int? expected = null;
+        if (sourceMinutes is > 0 && chunkSeconds > 0)
+        {
+            expected = (int)Math.Ceiling(sourceMinutes.Value * 60 / chunkSeconds);
+            if (maxChunks > 0) expected = Math.Min(expected.Value, maxChunks);
+        }
+        else if (maxChunks > 0)
+        {
+            expected = maxChunks;
+        }
+        var percent = status == "ready" ? 1.0
+            : expected is > 0 ? Math.Min(1.0, chunksStored / (double)expected.Value)
+            : (double?)null;
+        return new ProgressDto(stage, percent, chunksStored, expected);
+    }
+
+    public static ClipDto Clip(JsonObject row)
+    {
+        var metadata = row["metadata"] as JsonObject;
+        var render = metadata?["render"] as JsonObject;
+        var start = Dbl(row["start_seconds"]) ?? 0;
+        var end = Dbl(row["end_seconds"]) ?? 0;
+        return new ClipDto(
+            Id: Guid.Parse(Str(row["id"])!),
+            Title: Str(row["title"]) ?? "",
+            Description: Str(row["description"]),
+            StartSeconds: start,
+            EndSeconds: end,
+            DurationSeconds: Math.Round(end - start, 3),
+            Score: Dbl(row["score"]),
+            Status: Str(row["status"]) ?? "detected",
+            Pipeline: Str(metadata?["pipeline"]) ?? "short",
+            VideoUrl: Str(row["video_url"]),
+            VerticalUrl: Str(row["vertical_url"]),
+            CaptionedUrl: Str(row["captioned_url"]),
+            ThumbnailUrl: Str(metadata?["thumbnail_url"]) ?? Str(render?["thumbnail_url"]),
+            FileName: Str(render?["filename"]),
+            CreatedAt: Ts(row["created_at"]));
+    }
+
+    public static LongformEditDto Longform(JsonObject row) =>
+        new(
+            Id: Guid.Parse(Str(row["id"])!),
+            Version: IntOrNull(row["version"]) ?? 1,
+            Status: Str(row["status"]) ?? "rendered",
+            VideoUrl: Str(row["video_url"]),
+            ThumbnailUrl: Str(row["thumbnail_url"]),
+            DurationSeconds: Dbl(row["duration_seconds"]),
+            Segments: Rows(row["segments"])
+                .Select(segment => new LongformSegmentDto(
+                    IntOrNull(segment["chunk_index"]),
+                    Str(segment["title"]),
+                    Dbl(segment["start_seconds"]) ?? 0,
+                    Dbl(segment["end_seconds"]) ?? 0))
+                .ToList(),
+            RevisionRequest: Str((row["revision"] as JsonObject)?["request"]),
+            CreatedAt: Ts(row["created_at"]));
+
+    public static PublicationDto Publication(JsonObject row)
+    {
+        var metadata = row["metadata"] as JsonObject;
+        return new PublicationDto(
+            Id: Guid.Parse(Str(row["id"])!),
+            Target: Str(row["target"]) ?? "",
+            Platform: Str(row["platform"]) ?? "",
+            Url: Str(row["url"]),
+            Title: Str(row["title"]),
+            FileName: Str(metadata?["filename"]),
+            LongformVersion: IntOrNull(metadata?["longform_version"]),
+            CreatedAt: Ts(row["created_at"]));
+    }
+
+    public static TranscriptChunkDto TranscriptChunk(JsonObject row, bool includeWords) =>
+        new(
+            ChunkIndex: IntOrNull(row["chunk_index"]) ?? 0,
+            StartSeconds: Dbl(row["start_seconds"]) ?? 0,
+            EndSeconds: Dbl(row["end_seconds"]) ?? 0,
+            Transcript: Str(row["transcript"]) ?? "",
+            Words: includeWords
+                ? Rows(row["words"])
+                    .Select(word => new WordDto(
+                        Str(word["word"]) ?? "",
+                        Str(word["punctuated_word"]),
+                        Dbl(word["start"]) ?? 0,
+                        Dbl(word["end"]) ?? 0,
+                        Dbl(word["absolute_start"]),
+                        Dbl(word["absolute_end"])))
+                    .ToList()
+                : null);
+
+    /// <summary>An embedded relation is either a count aggregate ([{"count": n}])
+    /// or the full row array — handle both so list and detail share one shaper.</summary>
+    public static int EmbedCount(JsonNode? node)
+    {
+        if (node is not JsonArray array) return 0;
+        if (array is [JsonObject only] && only.Count == 1 && only.ContainsKey("count"))
+            return IntOrNull(only["count"]) ?? 0;
+        return array.Count;
+    }
+
+    private static IEnumerable<JsonObject> Rows(JsonNode? node) =>
+        node is JsonArray array ? array.OfType<JsonObject>() : [];
+
+    private static string? Str(JsonNode? node) =>
+        node is JsonValue value && value.TryGetValue<string>(out var text) ? text : null;
+
+    private static double? Dbl(JsonNode? node)
+    {
+        if (node is not JsonValue value) return null;
+        if (value.TryGetValue<double>(out var asDouble)) return asDouble;
+        if (value.TryGetValue<decimal>(out var asDecimal)) return (double)asDecimal;
+        if (value.TryGetValue<string>(out var text)
+            && double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed))
+            return parsed;
+        return null;
+    }
+
+    private static int? IntOrNull(JsonNode? node) =>
+        Dbl(node) is { } value ? (int)value : null;
+
+    private static DateTimeOffset Ts(JsonNode? node) =>
+        Str(node) is { } text
+        && DateTimeOffset.TryParse(text, CultureInfo.InvariantCulture,
+            DateTimeStyles.AssumeUniversal, out var parsed)
+            ? parsed
+            : default;
+}

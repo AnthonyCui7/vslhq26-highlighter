@@ -69,6 +69,44 @@ public class ProjectRecords
     public void WriteResearch(JsonObject context, string? mode = null) =>
         WriteJson(mode is null ? "research.json" : $"research_{mode}.json", context);
 
+    /// <summary>Replace the recorded row for a long-form version in place.</summary>
+    public void UpdateLongformEdit(int version, JsonObject row) =>
+        RewriteJsonl(
+            "longform_edits.jsonl",
+            old => (int)JsonUtil.DoubleOr(old["version"], 1) == version,
+            row);
+
+    /// <summary>Replace the recorded row for a clip (matched by rendered filename).</summary>
+    public void UpdateClip(string filename, JsonObject row) =>
+        RewriteJsonl(
+            "clips.jsonl",
+            old => JsonUtil.StrOrNull((old["metadata"]?["render"] as JsonObject)?["filename"])
+                == filename,
+            row);
+
+    private void RewriteJsonl(string name, Func<JsonObject, bool> matches, JsonObject row)
+    {
+        lock (_gate)
+        {
+            var path = Path.Combine(ProjectDir, name);
+            var rows = File.Exists(path)
+                ? File.ReadAllLines(path)
+                    .Where(line => line.Trim().Length > 0)
+                    .Select(line => JsonUtil.ParseObject(line))
+                    .ToList()
+                : new List<JsonObject>();
+            var replaced = false;
+            for (var index = 0; index < rows.Count; index++)
+            {
+                if (!matches(rows[index])) continue;
+                rows[index] = row;
+                replaced = true;
+            }
+            if (!replaced) rows.Add(row);
+            File.WriteAllText(path, string.Concat(rows.Select(r => JsonUtil.Dumps(r) + "\n")));
+        }
+    }
+
     private void WriteJson(string name, JsonObject payload)
     {
         lock (_gate)
